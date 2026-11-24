@@ -1,0 +1,90 @@
+name: Build
+
+# Every push and pull request builds and checks the package. A tag like v0.1.1 also publishes it as a GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The TV build needs nightly for -Zbuild-std. Pinned so a new nightly cannot break a release by surprise.
+  NIGHTLY: nightly-2026-11-21
+  # webosbrew's toolchain, the same revision Native Jelly uses. No linux-x86_64 build is published, hence the arm64 runner.
+  NDK_REL: webos-d7ed7ee.6
+  NDK_SHA256: 45a2d12ff557457d92cde4fddaa77a6f1090fca03adc43bb74397e5e0c379501
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages for the checks
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev pkg-config shellcheck
+
+      - name: Checks
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+          shellcheck -S warning -s sh takeover.sh boot.sh debloat.sh install.sh
+          sh tools/debloat-test.sh
+
+      - name: webOS NDK (cached)
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/webos-ndk
+          # relocate-sdk.sh bakes absolute paths into the toolchain, so the path must be the same at restore.
+          key: webos-ndk-${{ env.NDK_REL }}
+
+      - name: webOS NDK (download)
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/webos-ndk
+          f=arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2
+          curl -fL --retry 3 --retry-all-errors -o /tmp/ndk.tar.bz2 "https://github.com/webosbrew/native-toolchain/releases/download/$NDK_REL/$f"
+          echo "$NDK_SHA256  /tmp/ndk.tar.bz2" | sha256sum -c -
+          tar xjf /tmp/ndk.tar.bz2 -C ~/webos-ndk
+          (cd ~/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot && ./relocate-sdk.sh)
+
+      - name: Rust nightly with rust-src
+        run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "${tag%%-*}" = "$ver" ] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"; exit 1; }
+
+      - name: Package
+        run: |
+          make release NIGHTLY="$NIGHTLY"
+          # the precompiled std would emit an ARMv6 barrier that is SIGILL on the TV
+          n=$(~/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot/bin/arm-webos-linux-gnueabi-objdump -d target/arm-unknown-linux-gnueabi/release/tvlauncher | grep -c p15 || true)
+          [ "$n" = 0 ] || { echo "::error::the binary contains $n CP15 instructions"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tvlauncher-webos-arm
+          path: dist/*.tar.gz*
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=--prerelease
+          case "$GITHUB_REF_NAME" in v[1-9]*) [ "${GITHUB_REF_NAME#*-}" = "$GITHUB_REF_NAME" ] && pre="" ;; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 $pre --generate-notes --title "$GITHUB_REF_NAME"
+          fi

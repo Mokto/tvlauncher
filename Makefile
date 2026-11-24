@@ -2,6 +2,7 @@ WEBOS_SDK ?= $(HOME)/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot
 TV        ?= lg-c1
 DEST      ?= /media/developer/tvlauncher
 
+NIGHTLY ?= nightly
 CARGO   = PATH="$(HOME)/.cargo/bin:$$PATH" cargo
 ARM_BIN = target/arm-unknown-linux-gnueabi/release/tvlauncher
 
@@ -9,7 +10,7 @@ ARM_BIN = target/arm-unknown-linux-gnueabi/release/tvlauncher
 # Do not set RUSTFLAGS here, it would replace them.
 arm:
 	WEBOS_SDK=$(WEBOS_SDK) CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABI_LINKER=$(CURDIR)/tools/arm-gcc \
-	  $(CARGO) +nightly build --release --target arm-unknown-linux-gnueabi -Zbuild-std=std,panic_abort
+	  $(CARGO) +$(NIGHTLY) build --release --target arm-unknown-linux-gnueabi -Zbuild-std=std,panic_abort
 
 sim: fixtures/luna/listLaunchPoints.json
 	LAUNCHER_ROOT=$(CURDIR)/fixtures $(CARGO) run --release
