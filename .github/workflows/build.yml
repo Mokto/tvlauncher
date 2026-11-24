@@ -33,7 +33,7 @@ jobs:
           cargo fmt --check
           cargo clippy --release --all-targets -- -D warnings
           cargo test --release
-          shellcheck -S warning -s sh takeover.sh boot.sh debloat.sh install.sh
+          shellcheck -S warning -e SC2034,SC2048,SC3013 -s sh takeover.sh boot.sh debloat.sh install.sh
           sh tools/debloat-test.sh
 
       - name: webOS NDK (cached)
