@@ -4,6 +4,10 @@
 
 Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher is a single native program, written in Rust, that draws straight onto the TV's own SDL2 and OpenGL ES libraries. There is no browser, no Node.js and no web view in the path: the whole thing is a binary under 1 MB that uses under 60 MB of memory. It starts as Home in a fraction of a second, and it has no page to load or script engine to warm up.
 
+![Home screen: a hero with title and description, a Continue watching row and a Recommended on YouTube row, all made-up demo content](docs/home.png)
+
+*A simulator render with generated demo artwork (`tools/demo-fixtures.py`), so it shows no one's posters or thumbnails.*
+
 - **The Android TV layout:** a big hero with the focused item's title, description and backdrop, and rows of cards under it: Pinned apps, Continue watching, Recommended on YouTube, Apps, Inputs.
 - **Your library on Home:** *Continue watching* from your own Jellyfin server, signed in on the TV with Quick Connect (nothing is typed with the remote), and a changing backdrop with title and synopsis behind everything else.
 - **Recommended on YouTube** (unofficial, opt-in), with the YouTube app doing the playback.
