@@ -108,6 +108,13 @@ Four switches under Settings, *Ads and privacy*, **off by default**: *Block ads*
 - It does not block firmware updates or claim to remove all tracking.
 - `sh debloat.sh off` by hand puts everything back, and so does a reboot. `sh tools/debloat-test.sh` runs the script against fake files and commands and checks the stubs, the hosts lines, idempotence and the undo.
 
+## Live TV player (experiment)
+
+The start of IPTV support: a player for a live MPEG-TS stream, with no menu yet. The TV's `curl` reads the stream, [src/ts.rs](src/ts.rs) cuts it into pictures and audio frames (H.264 or H.265, with AAC, AC-3 or E-AC-3), and [src/player.rs](src/player.rs) feeds them to LG's StarfishMediaAPIs, whose picture shows through the launcher's transparent window (an SDL exported window, webOS 5 and later). The calls follow Native Jelly's player. Other audio (MPEG-1 Layer II, common on broadcast channels) is left out, and HLS is not read yet.
+
+- On the TV: `echo <url> > /tmp/tvlauncher-play`, then `pkill -f '^/usr/bin/com.webos.app.home'`. The app manager starts the launcher again, which reads and deletes the file and plays the stream; Back ends it, and Home comes back. The log says what the pipeline answered (`play:` and `smp event` lines).
+- On a desktop: `LAUNCHER_ROOT=/tmp target/release/tvlauncher --play <url>` reads ten seconds of the stream and prints the codecs and how many pictures and audio frames the TV would be fed.
+
 ## Why it runs as LG's Home
 
 A sideloaded native app runs jailed as `prisoner`. The jail has no `/usr/palm/applications`, and luna refuses `listApps` there (`Denied method call "listApps"`). So `takeover.sh on` bind-mounts the binary over `/usr/bin/com.webos.app.home`, and the app manager starts it as Home, as root, outside the jail. The mount is RAM-only: a reboot brings back what was Home before (CleanYourTV's stand-in on this TV).

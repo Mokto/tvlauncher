@@ -12,9 +12,11 @@ mod jellyfin;
 mod lifecycle;
 mod login;
 mod net;
+mod player;
 mod plex;
 mod sdl;
 mod settings;
+mod ts;
 mod youtube;
 
 use app::{App, Background, Jelly};
@@ -51,9 +53,15 @@ fn main() -> ExitCode {
     let shot = (args.len() > 2 && args[1] == "--shot").then(|| args[2].clone());
     let root = std::env::var("LAUNCHER_ROOT").unwrap_or_default();
     let on_tv = root.is_empty();
+    if !on_tv && args.len() > 2 && args[1] == "--play" {
+        return player::probe(&args[2]);
+    }
     if on_tv {
         if let Ok(f) = std::fs::File::create("/tmp/tvlauncher.log") {
-            unsafe { libc::dup2(f.as_raw_fd(), 2) };
+            unsafe {
+                libc::dup2(f.as_raw_fd(), 2);
+                libc::dup2(f.as_raw_fd(), 1)
+            };
         }
         if std::env::var_os("APPID").is_none() {
             std::env::set_var("APPID", "com.webos.app.home");
@@ -70,6 +78,12 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     };
+    if on_tv {
+        if let Ok(url) = std::fs::read_to_string(player::TRIGGER) {
+            let _ = std::fs::remove_file(player::TRIGGER);
+            return player::run(ren, url.trim());
+        }
+    }
 
     let g = Gfx::new(&root, ren, |name, size| font(&root, name, size));
     // Threads wake the loop with this event when they have something for it.

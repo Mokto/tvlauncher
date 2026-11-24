@@ -77,6 +77,24 @@ pub fn curl(
     })
 }
 
+/// A `curl` writing the body of `url` to its stdout for as long as the server sends it (a live stream).
+pub fn curl_stream(url: &str) -> std::io::Result<std::process::Child> {
+    let mut child = Command::new(curl_bin())
+        .args(["-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let c = format!(
+            "url = {}\nsilent\nshow-error\nfail\nlocation\nconnect-timeout = 10\nuser-agent = \"tvlauncher\"\n",
+            quote(url)
+        );
+        stdin.write_all(c.as_bytes())?;
+    }
+    Ok(child)
+}
+
 /// A GET, or a POST of a JSON body, with `headers`, that gives up after `timeout` seconds.
 pub fn send(url: &str, post: Option<&str>, headers: &[(&str, String)], timeout: u64) -> Result<Reply, String> {
     if url.starts_with("https://") {

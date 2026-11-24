@@ -28,6 +28,47 @@ crashes() {
   echo $n
 }
 
+# LG's role for Home's program, plus the bus names LG's media player library registers (those of Native Jelly's
+# role): without them the live TV player cannot start.
+ROLES=/usr/share/ls2/roles
+ROLE=/tmp/tvlauncher-home-role.json
+role_on() {
+  [ -f $ROLES/pub/com.webos.app.home.json ] || return 0
+  cat > $ROLE <<'EOF'
+{
+    "role": {
+        "exeName": "/usr/bin/com.webos.app.home",
+        "type": "privileged",
+        "allowedNames": ["", "com.webos.app.home", "com.webos.media.client.*", "com.webos.rm.client.*", "com.webos.pipeline.*",
+            "com.webos.pipe.avmuteclient.*", "com.webos.vt.*", "com.webos.chromium.media.*", "com.webos.avconnector.*"]
+    },
+    "permissions": [
+        {"service": "com.webos.app.home", "inbound": ["*"], "outbound": ["*"]},
+        {"service": "", "inbound": ["com.webos.service.videosinkmanager", "com.webos.service.tv.display"],
+            "outbound": ["com.webos.service.videosinkmanager", "com.webos.service.tv.display"]},
+        {"service": "com.webos.media.client.*", "inbound": ["com.webos.media"], "outbound": ["com.webos.media"]},
+        {"service": "com.webos.rm.client.*", "inbound": ["com.webos.media"], "outbound": ["com.webos.media"]},
+        {"service": "com.webos.pipeline.*", "inbound": ["com.webos.pipelinectrl.*"], "outbound": ["com.webos.pipelinectrl.*"]},
+        {"service": "com.webos.pipe.avmuteclient.*", "inbound": [], "outbound": ["com.webos.service.avmutemanager"]},
+        {"service": "com.webos.vt.*", "inbound": ["*"], "outbound": ["*"]},
+        {"service": "com.webos.chromium.media.*", "inbound": [], "outbound": ["*"]},
+        {"service": "com.webos.avconnector.*", "inbound": ["com.webos.service.videooutput", "com.webos.service.audio"],
+            "outbound": ["com.webos.service.videooutput", "com.webos.service.audio", "com.webos.service.utp.extinputs"]}
+    ]
+}
+EOF
+  for d in pub prv; do
+    [ -f $ROLES/$d/com.webos.app.home.json ] && mount --bind $ROLE $ROLES/$d/com.webos.app.home.json
+  done
+  ls-control scan-services >/dev/null 2>&1
+}
+role_off() {
+  for d in pub prv; do
+    grep -q "$ROLES/$d/com.webos.app.home.json" /proc/mounts && umount $ROLES/$d/com.webos.app.home.json
+  done
+  ls-control scan-services >/dev/null 2>&1
+}
+
 HOOK=/var/lib/webosbrew/init.d/20-tvlauncher-home
 MADE=$D/made-cytv-disable
 case "$1" in
@@ -68,6 +109,7 @@ on)
   # CleanYourTV's watchdog would see its stand-in gone and put its own Home back
   pkill -f "[c]leanyourtv/watchdog.sh"
   mount --bind "$D/tvlauncher" $EXE || exit 1
+  role_on
   touch $MARK
   rm -f $CRASHES
   (sh "$D/takeover.sh" watch </dev/null >/dev/null 2>&1 &)
@@ -90,6 +132,7 @@ off)
   rm -f $WATCH_PID
   # lazy: the running launcher keeps its file busy until it is stopped below
   umount -l $EXE || { echo "umount $EXE failed"; exit 1; }
+  role_off
   rm -f $MARK
   # LG's own Home needs the services debloat.sh stops
   [ -f "$D/debloat.sh" ] && sh "$D/debloat.sh" off </dev/null >/dev/null 2>&1
