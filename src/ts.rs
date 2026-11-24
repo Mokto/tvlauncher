@@ -192,7 +192,9 @@ fn section(pl: &[u8]) -> Option<&[u8]> {
 /// The PMT PID of the first program.
 fn pat(s: &[u8]) -> Option<u16> {
     s.get(8..s.len().checked_sub(4)?)?
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .find(|e| e[0] != 0 || e[1] != 0)
         .map(|e| u16::from(e[2] & 0x1f) << 8 | u16::from(e[3]))
 }

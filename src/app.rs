@@ -1686,7 +1686,7 @@ impl App {
                 }),
                 None,
             ),
-            Ask::Guide => self.set_tv(None, Some(Some(url(&text)).filter(|_| !text.is_empty()))),
+            Ask::Guide => self.set_tv(None, Some((!text.is_empty()).then(|| url(&text)))),
             _ => {}
         }
         self.close_dialog();
