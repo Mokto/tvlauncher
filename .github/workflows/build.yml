@@ -6,6 +6,12 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # called by release-please.yml after it creates a release (tags made with GITHUB_TOKEN start no workflows)
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -22,8 +28,13 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
+    env:
+      # the release to publish to: the called tag, or the pushed one; empty on a normal push or pull request
+      TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Packages for the checks
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev pkg-config shellcheck
@@ -58,11 +69,11 @@ jobs:
         run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
 
       - name: Version matches the tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.TAG != ''
         run: |
-          tag=${GITHUB_REF_NAME#v}
+          tag=${TAG#v}
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "${tag%%-*}" = "$ver" ] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"; exit 1; }
+          [ "${tag%%-*}" = "$ver" ] || { echo "::error::tag $TAG does not match Cargo.toml version $ver"; exit 1; }
 
       - name: Package
         run: |
@@ -77,14 +88,14 @@ jobs:
           path: dist/*.tar.gz*
 
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=--prerelease
-          case "$GITHUB_REF_NAME" in v[1-9]*) [ "${GITHUB_REF_NAME#*-}" = "$GITHUB_REF_NAME" ] && pre="" ;; esac
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          case "$TAG" in v[1-9]*) [ "${TAG#*-}" = "$TAG" ] && pre="" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 $pre --generate-notes --title "$GITHUB_REF_NAME"
+            gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 $pre --generate-notes --title "$TAG"
           fi
