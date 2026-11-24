@@ -573,7 +573,7 @@ fn fetch_img(root: &str, cfg: &Config, img: &Img, prefix: &str, width: u32) -> O
     }
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= max {
         return s;

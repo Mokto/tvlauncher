@@ -3,6 +3,7 @@ use crate::data::{self, apply_debloat, boot_on, set_boot, Item, Kind, Luna, Pref
 use crate::gfx::*;
 use crate::jellyfin::{self, Watch, DEFAULT_APP};
 use crate::login::{Login, Signed};
+use crate::plex::{self, Tile as PlexTile};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
 use crate::youtube::{self, Tile};
@@ -16,14 +17,15 @@ const HOLD_MS: u32 = 700;
 const FEATURED_MS: u32 = 30_000;
 const PINNED: usize = 0;
 const WATCH: usize = 1;
-const YOUTUBE: usize = 2;
-const APPS: usize = 3;
-const INPUTS: usize = 4;
+const PLEX: usize = 2;
+const YOUTUBE: usize = 3;
+const APPS: usize = 4;
+const INPUTS: usize = 5;
 
 /// The size of a row's cards, as on Android TV: pictures to watch are large, apps and inputs small.
 fn card_size(row: usize) -> (f32, f32) {
     match row {
-        WATCH | YOUTUBE => (384.0, 216.0),
+        WATCH | PLEX | YOUTUBE => (384.0, 216.0),
         _ => (256.0, 144.0),
     }
 }
@@ -46,6 +48,10 @@ enum Opt {
     SignOut,
     RefreshYoutube,
     YoutubeSignOut,
+    RefreshPlex,
+    PlexSignOut,
+    /// Open Plex items in the app with this id.
+    UsePlexApp(String),
     /// Open Jellyfin items in the app with this id.
     UseApp(String),
     Close,
@@ -75,6 +81,13 @@ pub struct Jelly {
     pub cfg: jellyfin::Config,
     pub refresh: Sender<()>,
     pub res: Receiver<Option<Vec<Watch>>>,
+}
+
+/// The signed-in Plex account and its refresh thread.
+struct Px {
+    cfg: plex::Config,
+    refresh: Sender<()>,
+    res: Receiver<Option<Vec<PlexTile>>>,
 }
 
 /// The signed-in YouTube account and its refresh thread.
@@ -116,11 +129,13 @@ pub struct App {
     bg_pending: bool,
     jf_pending: bool,
     yt_pending: bool,
+    px_pending: bool,
     /// Set while an app is being uninstalled; the app list is read again when it ends.
     rm_rx: Option<Receiver<()>>,
     bgl: Background,
     jf: Option<Jelly>,
     yt: Option<Yt>,
+    px: Option<Px>,
     clock: Option<Tex>,
     clock_min: i32,
     loaded_at: u32,
@@ -146,6 +161,7 @@ impl App {
         let rows = vec![
             Row::new("Pinned apps"),
             Row::new("Continue watching"),
+            Row::new("Continue watching on Plex"),
             Row::new("Recommended on YouTube"),
             Row::new("Apps"),
             Row::new("Inputs"),
@@ -176,10 +192,12 @@ impl App {
             bg_pending: false,
             jf_pending: false,
             yt_pending: false,
+            px_pending: false,
             rm_rx: None,
             bgl,
             jf,
             yt: None,
+            px: None,
             clock: None,
             clock_min: -1,
             loaded_at: 0,
@@ -205,6 +223,11 @@ impl App {
         if let Some(cfg) = youtube::Config::load(&app.luna.root) {
             app.rows[YOUTUBE].items = youtube::cached(&app.luna.root).iter().map(Tile::item).collect();
             app.start_youtube(cfg, false);
+        }
+        if let Some(cfg) = plex::Config::load(&app.luna.root) {
+            let plex_app = app.plex_app();
+            app.rows[PLEX].items = plex::cached(&app.luna.root).iter().map(|t| t.item(&plex_app)).collect();
+            app.start_plex(cfg);
         }
         app.load();
         app.pick_home_bg(true);
@@ -245,12 +268,26 @@ impl App {
         self.bg_pending
             || self.jf_pending
             || self.yt_pending
+            || self.px_pending
             || self.rm_rx.is_some()
             || matches!(&self.mode, Mode::Login(l) if l.busy())
     }
 
     fn jf_app(&self) -> String {
         self.prefs.jf_app.clone().unwrap_or_else(|| DEFAULT_APP.into())
+    }
+
+    /// The app that opens Plex items: the one chosen in Settings, else PlxNative, else any Plex app that is installed.
+    fn plex_app(&self) -> String {
+        if let Some(id) = &self.prefs.plex_app {
+            return id.clone();
+        }
+        self.all_apps()
+            .map(|i| i.id.as_str())
+            .find(|id| *id == plex::DEFAULT_APP)
+            .or_else(|| self.all_apps().map(|i| i.id.as_str()).find(|id| id.contains("plex")))
+            .unwrap_or(plex::DEFAULT_APP)
+            .into()
     }
 
     /// Every installed app, hidden or not.
@@ -299,6 +336,28 @@ impl App {
             "Recommended videos from your YouTube account. Unofficial: it uses the sign-in of YouTube's TV app.",
             text(if self.yt.is_some() { "Signed in" } else { "Sign in" }),
         )];
+        let plex_app = self.plex_app();
+        let plex_title = self
+            .all_apps()
+            .find(|i| i.id == plex_app)
+            .map_or_else(|| format!("{plex_app} (not installed)"), |i| i.title.clone());
+        let plex = vec![
+            entry(
+                Act::Plex,
+                "Account",
+                "Where Continue watching on Plex comes from. Sign in with a code you enter at plex.tv/link.",
+                match &self.px {
+                    Some(px) => text(&px.cfg.user),
+                    None => text("Sign in"),
+                },
+            ),
+            entry(
+                Act::PlexApp,
+                "Open videos in",
+                "The app that opens what you pick. PlxNative opens the title itself; other apps only start.",
+                text(&plex_title),
+            ),
+        ];
         let describe = |key: &str| match key {
             "ads" => "Stops the ads on LG's home screen and the servers that deliver them.",
             "tracking" => "Stops the TV from reporting what is on screen.",
@@ -320,6 +379,7 @@ impl App {
         )];
         [
             ("Jellyfin", jellyfin),
+            ("Plex", plex),
             ("YouTube", youtube),
             ("Ads and privacy", privacy),
             ("Startup", startup),
@@ -372,8 +432,33 @@ impl App {
                     self.start_youtube(cfg, true);
                 }
             }
+            Signed::Plex => {
+                if let Some(cfg) = plex::Config::load(&self.luna.root) {
+                    self.start_plex(cfg);
+                }
+            }
         }
         self.close_dialog();
+    }
+
+    fn start_plex(&mut self, cfg: plex::Config) {
+        let (refresh, res) = plex::spawn(self.luna.root.clone(), cfg.clone(), self.wake);
+        self.px_pending = refresh.send(()).is_ok();
+        self.px = Some(Px { cfg, refresh, res });
+    }
+
+    fn sign_out_plex(&mut self) {
+        self.px = None;
+        plex::sign_out(&self.luna.root);
+        self.px_pending = false;
+        self.rows[PLEX].items.clear();
+        self.refocus(None, self.rows[self.cur_row].col);
+    }
+
+    fn refresh_plex(&mut self) {
+        if let Some(px) = &self.px {
+            self.px_pending = px.refresh.send(()).is_ok();
+        }
     }
 
     fn start_youtube(&mut self, cfg: youtube::Config, force: bool) {
@@ -545,6 +630,12 @@ impl App {
         self.set_row(WATCH, items);
     }
 
+    fn apply_plex(&mut self, list: Vec<PlexTile>) {
+        log(&format!("plex: {} items", list.len()));
+        let app = self.plex_app();
+        self.set_row(PLEX, list.iter().map(|t| t.item(&app)).collect());
+    }
+
     fn apply_youtube(&mut self, list: Vec<Tile>) {
         log(&format!("youtube: {} items", list.len()));
         self.set_row(YOUTUBE, list.iter().map(Tile::item).collect());
@@ -620,6 +711,12 @@ impl App {
         if self.rm_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
             self.rm_rx = None;
             self.load();
+        }
+        while let Some(list) = self.px.as_ref().and_then(|p| p.res.try_recv().ok()) {
+            self.px_pending = false;
+            if let Some(list) = list {
+                self.apply_plex(list);
+            }
         }
         while let Some(list) = self.yt.as_ref().and_then(|y| y.res.try_recv().ok()) {
             self.yt_pending = false;
@@ -1012,7 +1109,40 @@ impl App {
             apply_debloat(&self.luna.root);
             return self.show_settings();
         }
-        if act == Act::Youtube {
+        if act == Act::Plex {
+            if let Some(px) = &self.px {
+                let title = format!("Plex: {}", px.cfg.user);
+                let list = vec![
+                    (Opt::RefreshPlex, "Refresh now".to_string()),
+                    (Opt::PlexSignOut, "Sign out".into()),
+                ];
+                self.show_menu(&title, list, 0);
+            } else {
+                let l = Login::plex(&self.g, &self.luna.root, self.wake);
+                self.mode = Mode::Login(Box::new(l));
+            }
+        } else if act == Act::PlexApp {
+            let current = self.plex_app();
+            let mut list: Vec<(Opt, String)> = self
+                .all_apps()
+                .filter(|i| {
+                    let name = format!("{} {}", i.id, i.title).to_lowercase();
+                    i.id == current || ["plex", "plx"].iter().any(|k| name.contains(k))
+                })
+                .map(|i| {
+                    let mark = if i.id == current { "   (current)" } else { "" };
+                    (Opt::UsePlexApp(i.id.clone()), format!("{}{mark}", i.title))
+                })
+                .collect();
+            let sel = list
+                .iter()
+                .position(|(o, _)| matches!(o, Opt::UsePlexApp(id) if *id == current))
+                .unwrap_or(0);
+            if list.is_empty() {
+                list.push((Opt::Close, "No Plex app is installed".into()));
+            }
+            self.show_menu("Open Plex items in", list, sel);
+        } else if act == Act::Youtube {
             if self.yt.is_some() {
                 let list = vec![
                     (Opt::RefreshYoutube, "Refresh now".to_string()),
@@ -1091,6 +1221,16 @@ impl App {
             Opt::SignOut => return self.sign_out(),
             Opt::RefreshYoutube => return self.refresh_youtube(true),
             Opt::YoutubeSignOut => return self.sign_out_youtube(),
+            Opt::RefreshPlex => return self.refresh_plex(),
+            Opt::PlexSignOut => return self.sign_out_plex(),
+            Opt::UsePlexApp(id) => {
+                self.prefs.plex_app = Some(id.clone());
+                self.prefs.save();
+                for it in &mut self.rows[PLEX].items {
+                    it.id = id.clone();
+                }
+                return;
+            }
             Opt::UseApp(id) => {
                 self.prefs.jf_app = Some(id.clone());
                 self.prefs.save();
@@ -1185,6 +1325,7 @@ impl App {
                     self.pick_home_bg(true);
                     self.refresh_jellyfin();
                     self.refresh_youtube(false);
+                    self.refresh_plex();
                     self.loaded_at = now;
                 }
             }
@@ -1298,6 +1439,7 @@ impl App {
         self.pick_home_bg(true);
         self.refresh_jellyfin();
         self.refresh_youtube(false);
+        self.refresh_plex();
     }
 }
 

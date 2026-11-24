@@ -12,6 +12,7 @@ mod jellyfin;
 mod lifecycle;
 mod login;
 mod net;
+mod plex;
 mod sdl;
 mod settings;
 mod youtube;
