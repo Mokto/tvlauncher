@@ -107,6 +107,8 @@ You need a rooted LG with the Homebrew Channel (this was built and tried on a C1
 3. To undo before a reboot: `ssh root@<tv-ip> sh /media/developer/tvlauncher/takeover.sh off`. A reboot also brings LG's Home back.
 4. Happy with it? Open **Settings → Startup → Start as Home** (the cog at the top right of Home).
 
+The package is built by GitHub Actions ([build.yml](.github/workflows/build.yml)): every push runs the checks and builds it, and pushing a tag such as `v0.1.1` (it must match `version` in `Cargo.toml`) publishes it as a release, as a pre-release while the version is 0.x. The workflow needs an arm64 runner because webosbrew publishes its toolchain for Linux only for arm64.
+
 From a source checkout instead (needs the toolchain below): `make deploy on TV=root@<tv-ip>`, and `make release` builds the package. Nothing is changed on the TV outside `/media/developer/tvlauncher` and the one bind mount, except the hook that *Start as Home* adds in `/var/lib/webosbrew/init.d`. `TV` defaults to the SSH alias `lg-c1`.
 
 ## Build, try and undo
