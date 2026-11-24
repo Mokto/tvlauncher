@@ -2,7 +2,7 @@
 
 **An Android TV-style Home screen for rooted LG TVs. Native, not another web wrapper.**
 
-Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher is a single native program, written in Rust, that draws straight onto the TV's own SDL2 and OpenGL ES libraries. There is no browser, no Node.js and no web view in the path: the whole thing is a binary under 1 MB that uses under 60 MB of memory. It starts as Home in a fraction of a second, and it has no page to load or script engine to warm up.
+Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher is a single native program, written in Rust, that draws straight onto the TV's own SDL2 and OpenGL ES libraries. There is no browser, no Node.js and no web view in the path: the whole thing is a binary of about 1.3 MB that uses about 40 MB of memory on Home. It starts as Home in a fraction of a second, and it has no page to load or script engine to warm up.
 
 ![Home screen: a hero with title and description, a Continue watching row and a Recommended on YouTube row, all made-up demo content](docs/home.png)
 
@@ -13,6 +13,7 @@ Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher
 - **Your library on Home:** *Continue watching* from your own Jellyfin server, signed in on the TV with Quick Connect (nothing is typed with the remote), and a changing backdrop with title and synopsis behind everything else.
 - **Continue watching on Plex,** signed in with a code you enter at plex.tv/link. PlxNative opens the title itself.
 - **Recommended on YouTube** (unofficial, opt-in), with the YouTube app doing the playback.
+- **Live TV from your own M3U/Xtream source,** in a TV tab next to Home: a programme guide grid with programme details, Favourites, and a built-in player on the TV's own hardware decoder.
 - **Your apps, your way:** pin, hide, reorder and uninstall from the options menu, opened by holding OK as on LG's own Home.
 - **Optional blocking of LG's ads and telemetry,** four switches, all off by default.
 - **Safe by design:** it changes nothing permanent until you choose *Start as Home* (a reboot puts LG's Home back before that), and three crashes in a minute hand Home back to LG's.
@@ -108,12 +109,27 @@ Four switches under Settings, *Ads and privacy*, **off by default**: *Block ads*
 - It does not block firmware updates or claim to remove all tracking.
 - `sh debloat.sh off` by hand puts everything back, and so does a reboot. `sh tools/debloat-test.sh` runs the script against fake files and commands and checks the stubs, the hosts lines, idempotence and the undo.
 
-## Live TV player (experiment)
+## Live TV
 
-The start of IPTV support: a player for a live MPEG-TS stream, with no menu yet. The TV's `curl` reads the stream, [src/ts.rs](src/ts.rs) cuts it into pictures and audio frames (H.264 or H.265, with AAC, AC-3 or E-AC-3), and [src/player.rs](src/player.rs) feeds them to LG's StarfishMediaAPIs, whose picture shows through the launcher's transparent window (an SDL exported window, webOS 5 and later). The calls follow Native Jelly's player. Other audio (MPEG-1 Layer II, common on broadcast channels) is left out, and HLS is not read yet.
+Settings → *Live TV* → *Channels* takes your own M3U playlist address, or an Xtream Codes login (server, user name, password), typed on the on-screen keyboard. The login is kept in `iptv.json` (mode 600) and only there; no playlist, channel or logo comes with the launcher. Once it is set, **Home** and **TV** tabs appear at the top: Up from the first row reaches them, Left and Right switch tabs (Right again reaches the cog), Back on the TV tab returns to Home.
 
-- On the TV: `echo <url> > /tmp/tvlauncher-play`, then `pkill -f '^/usr/bin/com.webos.app.home'`. The app manager starts the launcher again, which reads and deletes the file and plays the stream; Back ends it, and Home comes back. The log says what the pipeline answered (`play:` and `smp event` lines).
-- On a desktop: `LAUNCHER_ROOT=/tmp target/release/tvlauncher --play <url>` reads ten seconds of the stream and prints the codecs and how many pictures and audio frames the TV would be fed.
+- **The TV tab** is a programme guide: the channels down the left (Favourites first, marked with a yellow dot, then the playlist's order, with their number and logo) and two hours of programmes across, with a line at the current time. Above the grid, the focused programme: title, times, channel, category, episode title and the start of its description. Left and Right move through a channel's programmes (the grid scrolls through the day), Up and Down change channel near the same time, and Back returns to now before it returns to Home. OK on a programme that is on plays the channel; OK on a later one opens its details (the whole description, OK to watch the channel, Back to close). Holding OK offers *Programme details* and *Add to Favourites* or *Remove from Favourites* (kept in `state.json`). Channels the guide does not know show *No programme information* and still play.
+- **Watching:** full screen, with a banner of the channel and its programmes for a few seconds. Up and Down change channel through the whole list, OK shows the banner again, Back returns to the guide. A channel that does not play says why on the banner.
+- **The guide:** an XMLTV file, from Settings → *Live TV* → *Guide*, else the playlist's `url-tvg`/`x-tvg-url`, else the Xtream server's `xmltv.php`. It is read as it downloads (a `.gz` one through the TV's `gzip`), and only the next 24 hours of the playlist's channels are kept (at most 48 programmes each, descriptions cut at 600 characters), so a guide of a hundred megabytes never sits in memory. Channels are matched on `tvg-id` (or Xtream's `epg_channel_id`) without a feed suffix, so iptv-org's `TF1.fr@SD` finds `TF1.fr` in a guide such as xmltvfr.fr's.
+- **Caching:** the channel list (`cache/iptv-channels.json`, fetched again after 12 hours or with *Refresh now*), the guide (`cache/iptv-guide.json`, after 2 hours) and the logos of the channels on screen (`cache/iptv-logo-*`) are kept, so the tab shows at once. *Remove* deletes `iptv.json` and that cache.
+
+**The player** ([src/player.rs](src/player.rs)) is built in, not handed to another app. The TV's `curl` reads the stream, [src/ts.rs](src/ts.rs) cuts the MPEG-TS into pictures and audio frames, and they are fed to LG's StarfishMediaAPIs (`libplayerAPIs`) in buffer mode, as Native Jelly's player does. The picture is in an SDL exported window under the launcher's transparent one (webOS 5 and later). What it took on the C1:
+
+- LG's library registers bus names that Home's role does not allow, and calls `exit()` when refused. `takeover.sh on` bind-mounts a copy of Home's role (`/usr/share/ls2/roles/{pub,prv}/com.webos.app.home.json`) that adds them (the names in Native Jelly's role) and runs `ls-control scan-services`; `off` unmounts it. RAM-only like the other mounts.
+- The media resource manager never gives a decoder to a pipeline whose `appId` is `com.webos.app.home` (`601 Resource Allocation Error` after 20 s), so the pipeline carries `tvlauncher`. The video output then shows it only once `luna://com.webos.media/notifyAppLifeStatus` says that app is in the foreground.
+- Each channel gets a new player object and exported window, and the old object is destroyed after its `UNLOADCOMPLETED`: the video output never shows a second pipeline of the same object.
+- Play is called once 0.7 s is buffered, and the feed stays at most 1.6 s ahead of the clock; fed greedily, the pipeline stops pulling and never starts.
+
+**What plays:** MPEG-TS over HTTP or HTTPS (an Xtream `.ts` address, most `/live/` playlist entries), and live HLS (`.m3u8`) whose segments are MPEG-TS, with H.264 or H.265 video and AAC, AC-3 or E-AC-3 audio. For HLS ([src/hls.rs](src/hls.rs)) the player takes the variant with the most bandwidth, starts three segments before the live edge and reads each new segment into the same demuxer. Streams and playlists are fetched with a browser's User-Agent (some channels refuse others), and relative addresses are resolved against the address after redirects. **Not yet:** encrypted HLS (Pluto TV's AES-128 segments, which also bring audio in a playlist of its own), HLS with MP4 segments or separate audio, switching variants on a slow network, and MPEG-1 Layer II audio, which many broadcast channels use (such a channel plays without sound, or not at all). Films and series in an Xtream playlist are left out.
+
+**Memory:** about 40 MB on Home with a playlist of 21 channels; once a channel has played, LG's player libraries stay loaded, about 83 MB, and about 95 MB while a channel plays, steady over 30 channel changes.
+
+**Testing:** `LAUNCHER_ROOT=/tmp target/release/tvlauncher --play <url>` reads ten seconds of a stream on a desktop and prints the codecs and what the TV would be fed. On the TV, a channel number or a stream address in `/tmp/tvlauncher-play` makes the next start of the launcher play it, and `luna://com.webos.service.networkinput/sendSpecialKey '{"key":"UP"}'` presses a remote key (also `DOWN`, `LEFT`, `RIGHT`, `ENTER`, `BACK`). `luna://com.webos.service.capture/executeOneShot` captures the screen with the video.
 
 ## Why it runs as LG's Home
 
@@ -165,7 +181,7 @@ Without it the app manager restarts the launcher on every Home key. With a file 
 
 - It is built with `-Zbuild-std`, `target-cpu=cortex-a9` and NEON off ([.cargo/config.toml](.cargo/config.toml)), as Native Jelly does. The precompiled std for `arm-unknown-linux-gnueabi` emits the ARMv6 CP15 barrier (`mcr p15`), which is undefined on the C1's Cortex-A53 and raises SIGILL. `objdump -d` of the result must show no `p15`. Do not set `RUSTFLAGS`: it replaces the flags in the config file.
 - The NDK links against glibc 2.12, which has no `getauxval` (std calls it when it starts a thread), so [src/compat.rs](src/compat.rs) supplies one. [tools/arm-gcc](tools/arm-gcc) is the linker: the NDK gcc has no default sysroot.
-- The binary is about 700 KB (the C version was 50 KB, with std statically linked).
+- The binary is about 1.3 MB (the C version was 50 KB, with std statically linked).
 
 ## Testing
 
@@ -177,6 +193,8 @@ Without it the app manager restarts the launcher on every Home key. With a file 
 
 - On the C1 (webOS 6.5.3), with the C version this was ported from: started by the app manager as Home with the GLES2 renderer, launch points and inputs loaded in about 120 ms, RSS about 30 MB, D-pad focus, background crossfade, launching Netflix, switching to HDMI 3, and the Home key coming back with the focus on what was launched.
 - **The Rust port on the C1 (2026-11-24):** it starts as Home (OpenGL ES 2), the remote's arrow, OK and Back keys arrive with the right symbols and `wcode`s (Back 482), OK's release arrives (so hold-OK works), the cog and the Settings entry open, RSS is 30 MB and CPU idle, `curl` is at `/usr/bin/curl` and reaches `youtube.com` over HTTPS, and with all four debloat switches on the services are stopped and the ad hosts are blocked (the TV was left that way by the owner; whether Netflix, YouTube and Jellyfin still play is the owner's to confirm). Not yet seen on the TV: Quick Connect, the Continue watching and YouTube rows, the random backdrops, the HTTPS sign-in, the Home key relaunch, launching an app, and the yellow key.
+- **Live TV on the C1 (2026-11-24),** with generated test streams and a generated playlist and guide on the TV itself (`file://`), keys pressed through `sendSpecialKey` and the screen captured: picture on screen for H.264 + AAC, H.264 + AC-3, H.265 + AAC and a 720p stream (placed full screen from the size the pipeline reports); the banner with now and next; Up changing channel ten times and more; Back to the TV tab and OK playing another channel; the TV tab, its groups and the guide text. **Not checked:** the sound (nobody listened), a real provider's stream over the network, an Xtream login on the TV (a fake Xtream server was checked in the simulator), a gzipped guide, logos over the network, Favourites and the keyboard on the TV (both checked in the simulator), and the remote's own channel keys (Page Up and Page Down are assumed).
+- **Live TV with real channels (2026-11-24):** a public French playlist of 231 channels (HLS) and xmltvfr.fr's guide (72 of them matched) on the C1: the guide grid with logos, scrolling 20 channels in a row, OK playing a channel that is on and Back returning to it in the grid (64 MB with the guide loaded). Of the 231 channels, 143 gave pictures when read on a desktop; the rest are Pluto TV (encrypted segments) or answer errors at the source.
 - Checked without a TV:
   - The desktop simulator renders the same pixels as the C version, apart from the clock, for the Apps and Inputs rows.
   - The ARM binary has no `p15` instruction, its SDL symbols all exist in the TV's SDL libraries (copied from the TV), and its `GLIBC` versions are at most 2.12 (the rest are weak symbols that std looks up at run time).
@@ -188,4 +206,5 @@ Without it the app manager restarts the launcher on every Home key. With a file 
 
 ## Not done
 
+- Live TV: encrypted or MP4-segment HLS, MPEG-1 Layer II audio, programmes that have ended (the guide starts at now), and the Home key while a channel plays (it restarts the launcher, which ends playback; not seen).
 - A screensaver, more Settings. Nothing of the YouTube row has run on the TV, and a signed-in answer has never been seen (see Verified). The debloat has not run on the TV: whether the stubs and the stopped services leave Netflix, YouTube and Jellyfin playback working is unchecked.

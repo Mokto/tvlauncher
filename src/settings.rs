@@ -11,6 +11,9 @@ pub enum Act {
     Youtube,
     Plex,
     PlexApp,
+    /// Where the TV channels come from, and the guide.
+    TvSource,
+    TvGuide,
     /// One group of `debloat.sh`.
     Debloat(&'static str),
     Boot,

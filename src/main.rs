@@ -8,7 +8,10 @@ mod app;
 mod compat;
 mod data;
 mod gfx;
+mod hls;
+mod iptv;
 mod jellyfin;
+mod keyboard;
 mod lifecycle;
 mod login;
 mod net;
@@ -17,6 +20,7 @@ mod plex;
 mod sdl;
 mod settings;
 mod ts;
+mod tv;
 mod youtube;
 
 use app::{App, Background, Jelly};
@@ -78,12 +82,6 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     };
-    if on_tv {
-        if let Ok(url) = std::fs::read_to_string(player::TRIGGER) {
-            let _ = std::fs::remove_file(player::TRIGGER);
-            return player::run(ren, url.trim());
-        }
-    }
 
     let g = Gfx::new(&root, ren, |name, size| font(&root, name, size));
     // Threads wake the loop with this event when they have something for it.
@@ -130,6 +128,10 @@ fn main() -> ExitCode {
         jf,
         wake,
     );
+
+    if on_tv {
+        app.play_file();
+    }
 
     if let Some(file) = shot {
         // After each key, draw until nothing moves and nothing is loading, so a dialog is ready for the next key.

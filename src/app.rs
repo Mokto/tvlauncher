@@ -1,11 +1,14 @@
 //! The launcher's state: rows of cards, focus, the options menu, and one frame of drawing.
 use crate::data::{self, apply_debloat, boot_on, set_boot, Item, Kind, Luna, Prefs, Row, DEBLOAT};
 use crate::gfx::*;
+use crate::iptv::{self, Channel, Got, Guide};
 use crate::jellyfin::{self, Watch, DEFAULT_APP};
+use crate::keyboard::{Prompt, Typed};
 use crate::login::{Login, Signed};
 use crate::plex::{self, Tile as PlexTile};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
+use crate::tv;
 use crate::youtube::{self, Tile};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -54,7 +57,26 @@ enum Opt {
     UsePlexApp(String),
     /// Open Jellyfin items in the app with this id.
     UseApp(String),
+    /// Ask for the address of an M3U playlist, or for an Xtream Codes login.
+    AskM3u,
+    AskXtream,
+    RefreshTv,
+    RemoveTv,
+    /// Add or remove the focused channel (its key) from Favourites.
+    Fav(String),
+    Unfav(String),
+    /// The details of the focused programme.
+    TvDetails,
     Close,
+}
+
+/// What a text prompt is asking for; the Xtream login takes three in a row.
+enum Ask {
+    M3u,
+    XtServer,
+    XtUser(String),
+    XtPass(String, String),
+    Guide,
 }
 
 struct Menu {
@@ -70,6 +92,7 @@ enum Mode {
     Moving(Vec<String>),
     Login(Box<Login>),
     Settings(Box<Page>),
+    Prompt(Box<Prompt>, Ask),
 }
 
 pub struct Background {
@@ -88,6 +111,18 @@ struct Px {
     cfg: plex::Config,
     refresh: Sender<()>,
     res: Receiver<Option<Vec<PlexTile>>>,
+}
+
+/// The live TV source, its channels and guide, the TV tab and the threads that refresh them and fetch logos.
+struct Tv {
+    cfg: iptv::Config,
+    refresh: Sender<bool>,
+    res: Receiver<Got>,
+    list: Vec<Channel>,
+    guide: Guide,
+    page: tv::Page,
+    logo_req: Sender<Vec<String>>,
+    logo_res: Receiver<String>,
 }
 
 /// The signed-in YouTube account and its refresh thread.
@@ -136,6 +171,17 @@ pub struct App {
     jf: Option<Jelly>,
     yt: Option<Yt>,
     px: Option<Px>,
+    tv: Option<Tv>,
+    tv_pending: bool,
+    /// The TV tab is shown instead of Home (only while live TV is set up).
+    on_tv: bool,
+    /// The focus is on the Home and TV tabs at the top.
+    tabs_f: bool,
+    tab_tex: [Option<Tex>; 2],
+    /// Made when the first channel is played, and kept (see `player::Player`).
+    player: Option<crate::player::Player>,
+    /// Why the last channel could not start, shown on the TV tab.
+    tv_note: Option<Tex>,
     clock: Option<Tex>,
     clock_min: i32,
     loaded_at: u32,
@@ -198,6 +244,13 @@ impl App {
             jf,
             yt: None,
             px: None,
+            tv: None,
+            tv_pending: false,
+            on_tv: false,
+            tabs_f: false,
+            tab_tex: [None, None],
+            player: None,
+            tv_note: None,
             clock: None,
             clock_min: -1,
             loaded_at: 0,
@@ -229,9 +282,99 @@ impl App {
             app.rows[PLEX].items = plex::cached(&app.luna.root).iter().map(|t| t.item(&plex_app)).collect();
             app.start_plex(cfg);
         }
+        if let Some(cfg) = iptv::Config::load(&app.luna.root) {
+            app.start_tv(cfg, false);
+        }
         app.load();
         app.pick_home_bg(true);
         app
+    }
+
+    /// Shows the cached channels and guide at once, and asks for fresh ones (`force`, or when they are old).
+    fn start_tv(&mut self, cfg: iptv::Config, force: bool) {
+        let root = self.luna.root.clone();
+        let (refresh, res) = iptv::spawn(root.clone(), cfg.clone(), self.wake);
+        let (logo_req, logo_res) = iptv::logos(root.clone(), self.wake);
+        let list = iptv::cached_channels(&root);
+        let page = tv::Page::new(&self.g, &list, &self.prefs.tv_favs);
+        let _ = logo_req.send(page.logos(&list));
+        self.tv_pending = refresh.send(force).is_ok();
+        self.tv = Some(Tv {
+            cfg,
+            refresh,
+            res,
+            list,
+            guide: iptv::cached_guide(&root),
+            page,
+            logo_req,
+            logo_res,
+        });
+    }
+
+    fn refresh_tv(&mut self, force: bool) {
+        if let Some(tv) = &self.tv {
+            self.tv_pending = tv.refresh.send(force).is_ok();
+        }
+    }
+
+    fn remove_tv(&mut self) {
+        self.tv = None;
+        self.tv_pending = false;
+        self.on_tv = false;
+        self.tabs_f = false;
+        iptv::sign_out(&self.luna.root);
+    }
+
+    /// Builds the TV tab again (new channels or favourites), keeping its focus.
+    fn rebuild_tv(&mut self) {
+        let Some(tv) = &mut self.tv else { return };
+        let mut page = tv::Page::new(&self.g, &tv.list, &self.prefs.tv_favs);
+        page.keep(&tv.page, &tv.list, &tv.guide);
+        tv.page = page;
+        let _ = tv.logo_req.send(tv.page.logos(&tv.list));
+    }
+
+    /// Saves what the TV settings asked for and loads the channels from it.
+    fn set_tv(&mut self, source: Option<iptv::Source>, guide: Option<Option<String>>) {
+        let old = self.tv.as_ref().map(|t| t.cfg.clone());
+        let Some(source) = source.or_else(|| old.as_ref().map(|c| c.source.clone())) else {
+            return;
+        };
+        let cfg = iptv::Config {
+            source,
+            guide: guide.unwrap_or_else(|| old.and_then(|c| c.guide)),
+        };
+        if let Err(e) = cfg.save(&self.luna.root) {
+            log(&format!("iptv.json: {e}"));
+        }
+        iptv::sign_out_cache(&self.luna.root);
+        self.start_tv(cfg, true);
+    }
+
+    /// Plays a channel full screen; back on the TV tab, the focus is on the channel it ended on.
+    fn watch(&mut self, at: usize) {
+        if !self.luna.root.is_empty() {
+            return log("play: the simulator has no player");
+        }
+        let Some(tv) = self.tv.as_mut().filter(|t| at < t.list.len()) else {
+            return;
+        };
+        if self.player.is_none() {
+            match crate::player::Player::new() {
+                Ok(p) => self.player = Some(p),
+                Err(e) => {
+                    log(&format!("play: {e}"));
+                    self.tv_note = self
+                        .g
+                        .text(self.g.f_sub, &format!("The player could not start: {e}"), 1100);
+                    return;
+                }
+            }
+        }
+        if let Some(p) = &mut self.player {
+            let end = p.watch(&self.g, &tv.list, at, &tv.guide);
+            tv.page.focus(end, &tv.list, &tv.guide);
+        }
     }
 
     /// Chooses the picture behind the apps from the saved set: another one than now when `fresh`, else only
@@ -269,6 +412,7 @@ impl App {
             || self.jf_pending
             || self.yt_pending
             || self.px_pending
+            || self.tv_pending
             || self.rm_rx.is_some()
             || matches!(&self.mode, Mode::Login(l) if l.busy())
     }
@@ -358,6 +502,32 @@ impl App {
                 text(&plex_title),
             ),
         ];
+        let host = |url: &str| {
+            let rest = url.split_once("://").map_or(url, |(_, r)| r);
+            rest.split(['/', '?']).next().unwrap_or(rest).to_string()
+        };
+        let tv_cfg = self.tv.as_ref().map(|t| &t.cfg);
+        let tv = vec![
+            entry(
+                Act::TvSource,
+                "Channels",
+                "Your own M3U playlist or Xtream Codes login. They appear in a TV tab.",
+                text(&match tv_cfg.map(|c| &c.source) {
+                    Some(iptv::Source::M3u(url)) => jellyfin::clip(&host(url), 18),
+                    Some(iptv::Source::Xtream { server, .. }) => jellyfin::clip(&host(server), 18),
+                    None => "Set up".into(),
+                }),
+            ),
+            entry(
+                Act::TvGuide,
+                "Guide",
+                "An XMLTV address for what is on now and next, if the channels bring none.",
+                text(&match tv_cfg.and_then(|c| c.guide.as_deref()) {
+                    Some(url) => jellyfin::clip(&host(url), 18),
+                    None => "Automatic".into(),
+                }),
+            ),
+        ];
         let describe = |key: &str| match key {
             "ads" => "Stops the ads on LG's home screen and the servers that deliver them.",
             "tracking" => "Stops the TV from reporting what is on screen.",
@@ -381,6 +551,7 @@ impl App {
             ("Jellyfin", jellyfin),
             ("Plex", plex),
             ("YouTube", youtube),
+            ("Live TV", tv),
             ("Ads and privacy", privacy),
             ("Startup", startup),
         ]
@@ -500,7 +671,7 @@ impl App {
 
     fn focused(&self) -> Option<(usize, usize)> {
         let r = &self.rows[self.cur_row];
-        (!r.items.is_empty() && !self.cog).then_some((self.cur_row, r.col))
+        (!r.items.is_empty() && !self.top() && !self.on_tv).then_some((self.cur_row, r.col))
     }
 
     fn focused_key(&self) -> Option<String> {
@@ -724,6 +895,33 @@ impl App {
                 self.apply_youtube(list);
             }
         }
+        while let Some(got) = self.tv.as_ref().and_then(|t| t.res.try_recv().ok()) {
+            match got {
+                Got::Channels(list) => {
+                    if let Some(tv) = &mut self.tv {
+                        tv.list = list;
+                    }
+                    self.tv_note = None;
+                    self.rebuild_tv();
+                }
+                Got::Guide(guide) => {
+                    if let Some(tv) = &mut self.tv {
+                        tv.guide = guide;
+                        tv.page.forget();
+                    }
+                }
+                Got::Failed(e) => {
+                    self.tv_note = self
+                        .g
+                        .text(self.g.f_sub, &format!("The channels could not be loaded: {e}"), 1100);
+                }
+                Got::Done => self.tv_pending = false,
+            }
+        }
+        while let Some(tv) = &mut self.tv {
+            let Ok(url) = tv.logo_res.try_recv() else { break };
+            tv.page.logo_saved(&url);
+        }
         let focus = self.focused();
         if matches!(self.mode, Mode::Browse)
             && self.featured(focus).is_some()
@@ -764,13 +962,17 @@ impl App {
             anim |= ease(g, f32::from(v), dt, 5.0);
         }
         anim |= ease(&mut self.cog_f, f32::from(self.cog), dt, 14.0);
+        let top = self.top();
+        if let Some(tv) = &mut self.tv {
+            anim |= tv.page.animate(dt);
+        }
         for (r, row) in self.rows.iter_mut().enumerate() {
             anim |= ease(&mut row.scroll, row.col as f32 * (card_size(r).0 + GAP), dt, 12.0);
-            anim |= ease(&mut row.active, f32::from(r == self.cur_row && !self.cog), dt, 10.0);
+            anim |= ease(&mut row.active, f32::from(r == self.cur_row && !top), dt, 10.0);
             for (i, it) in row.items.iter_mut().enumerate() {
                 anim |= ease(
                     &mut it.focus,
-                    f32::from(r == self.cur_row && i == row.col && !self.cog),
+                    f32::from(r == self.cur_row && i == row.col && !top),
                     dt,
                     14.0,
                 );
@@ -798,6 +1000,9 @@ impl App {
             b: self.glow[2] as u8,
             a: 255,
         };
+        if self.on_tv {
+            return self.draw_tv();
+        }
         g.tint(&g.soft, glow, 0.45);
         g.copy(
             &g.soft,
@@ -908,32 +1113,8 @@ impl App {
             g.put(it.hero_sub.as_ref(), MARGIN + dx, 310.0, DIM, self.hero_a);
         }
 
-        let (hour, min) = local_time();
-        if min != self.clock_min {
-            self.clock = g.text(g.f_clock, &format!("{hour:02}:{min:02}"), 0);
-            self.clock_min = min;
-        }
-        let cw = self.clock.as_ref().map_or(0.0, |t| t.w as f32);
-        g.put(self.clock.as_ref(), W - MARGIN - cw, 56.0, TEXT, 1.0);
-        let ch = self.clock.as_ref().map_or(40.0, |t| t.h as f32);
-        let (cx, cy) = (W - MARGIN - cw - 76.0, 56.0 + ch / 2.0);
-        g.rounded(cx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, self.cog_f);
-        let gc = rgb(
-            (f32::from(DIM.r) * (1.0 - self.cog_f)) as u8,
-            (f32::from(DIM.g) * (1.0 - self.cog_f)) as u8,
-            (f32::from(DIM.b) * (1.0 - self.cog_f)) as u8,
-        );
-        g.tint(&g.gear, gc, 1.0);
-        g.copy(
-            &g.gear,
-            None,
-            FRect {
-                x: cx - 22.0,
-                y: cy - 22.0,
-                w: 44.0,
-                h: 44.0,
-            },
-        );
+        self.draw_top();
+        let g = &self.g;
 
         let held = self
             .ok_down
@@ -953,6 +1134,7 @@ impl App {
         let next = tops.get(i + 1).copied().unwrap_or(tops[i]);
         let scroll_px = tops[i] + (next - tops[i]) * (self.row_scroll - i as f32).clamp(0.0, 1.0);
         let mut pos = 0;
+        let top = self.top();
         for (r, row) in self.rows.iter_mut().enumerate() {
             for it in &mut row.items {
                 it.rect.w = 0.0;
@@ -994,7 +1176,7 @@ impl App {
                 for (i, it) in row.items.iter_mut().enumerate() {
                     let size = card_size(r);
                     let x = MARGIN + i as f32 * (size.0 + GAP) - row.scroll;
-                    let own = if r == self.cur_row && i == row.col && !self.cog {
+                    let own = if r == self.cur_row && i == row.col && !top {
                         2
                     } else {
                         i32::from(it.focus > 0.01)
@@ -1014,6 +1196,83 @@ impl App {
             Mode::Menu(m) => draw_menu(g, m),
             Mode::Login(l) => l.draw(g),
             Mode::Settings(p) => p.draw(g),
+            Mode::Prompt(p, _) => p.draw(g),
+            _ => {}
+        }
+    }
+
+    /// The clock, the cog and, once live TV is set up, the Home and TV tabs.
+    fn draw_top(&mut self) {
+        if self.tv.is_some() && self.tab_tex[0].is_none() {
+            self.tab_tex = [self.g.text(self.g.f_row, "Home", 0), self.g.text(self.g.f_row, "TV", 0)];
+        }
+        let g = &self.g;
+        let (hour, min) = local_time();
+        if min != self.clock_min {
+            self.clock = g.text(g.f_clock, &format!("{hour:02}:{min:02}"), 0);
+            self.clock_min = min;
+        }
+        let cw = self.clock.as_ref().map_or(0.0, |t| t.w as f32);
+        g.put(self.clock.as_ref(), W - MARGIN - cw, 56.0, TEXT, 1.0);
+        let ch = self.clock.as_ref().map_or(40.0, |t| t.h as f32);
+        let (cx, cy) = (W - MARGIN - cw - 76.0, 56.0 + ch / 2.0);
+        g.rounded(cx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, self.cog_f);
+        let gc = rgb(
+            (f32::from(DIM.r) * (1.0 - self.cog_f)) as u8,
+            (f32::from(DIM.g) * (1.0 - self.cog_f)) as u8,
+            (f32::from(DIM.b) * (1.0 - self.cog_f)) as u8,
+        );
+        g.tint(&g.gear, gc, 1.0);
+        g.copy(
+            &g.gear,
+            None,
+            FRect {
+                x: cx - 22.0,
+                y: cy - 22.0,
+                w: 44.0,
+                h: 44.0,
+            },
+        );
+
+        if self.tv.is_none() {
+            return;
+        }
+        let widths: Vec<f32> = self
+            .tab_tex
+            .iter()
+            .map(|t| t.as_ref().map_or(0.0, |t| t.w as f32) + 64.0)
+            .collect();
+        let mut x = (W - widths.iter().sum::<f32>() - 16.0) / 2.0;
+        for (i, t) in self.tab_tex.iter().enumerate() {
+            let current = usize::from(self.on_tv) == i;
+            let th = t.as_ref().map_or(0.0, |t| t.h as f32);
+            let colour = if current && self.tabs_f {
+                g.rounded(x, cy - 32.0, widths[i], 64.0, 32.0, WHITE, 1.0);
+                BLACK
+            } else if current {
+                g.rounded(x + 32.0, cy + th / 2.0 + 4.0, widths[i] - 64.0, 4.0, 2.0, TEXT, 1.0);
+                TEXT
+            } else {
+                DIM
+            };
+            g.put(t.as_ref(), x + 32.0, cy - th / 2.0, colour, 1.0);
+            x += widths[i] + 16.0;
+        }
+    }
+
+    fn draw_tv(&mut self) {
+        self.draw_top();
+        let active = !self.top() && matches!(self.mode, Mode::Browse);
+        if let Some(tv) = &mut self.tv {
+            tv.page.draw(&self.g, &tv.list, &tv.guide, active);
+        }
+        let g = &self.g;
+        g.put(self.tv_note.as_ref(), MARGIN, H - 80.0, YELLOW, 1.0);
+        match &self.mode {
+            Mode::Menu(m) => draw_menu(g, m),
+            Mode::Settings(p) => p.draw(g),
+            Mode::Prompt(p, _) => p.draw(g),
+            Mode::Login(l) => l.draw(g),
             _ => {}
         }
     }
@@ -1036,9 +1295,48 @@ impl App {
             }
             n += dy;
         }
-        // Up from the top row reaches the cog.
+        // Up from the top row reaches the tabs, or the cog when there are none.
         if dy < 0 && self.cur_row == self.first_row() {
+            self.focus_top();
+        }
+    }
+
+    /// The focus is on the bar at the top: the tabs or the cog.
+    fn top(&self) -> bool {
+        self.cog || self.tabs_f
+    }
+
+    fn focus_top(&mut self) {
+        if self.tv.is_some() {
+            self.tabs_f = true;
+        } else {
             self.cog = true;
+        }
+    }
+
+    /// The keys while the focus is on the top bar: Left and Right go between Home, TV and the cog.
+    fn top_key(&mut self, dx: i32, dy: i32, ok: bool) {
+        if self.cog {
+            if ok {
+                self.open_settings();
+            } else if dy > 0 {
+                self.cog = false;
+            } else if dx < 0 && self.tv.is_some() {
+                self.cog = false;
+                self.tabs_f = true;
+            }
+            return;
+        }
+        if dy > 0 || ok {
+            self.tabs_f = false;
+            return;
+        }
+        let to = i32::from(self.on_tv) + dx;
+        if to > 1 {
+            self.tabs_f = false;
+            self.cog = true;
+        } else if to >= 0 {
+            self.on_tv = to == 1;
         }
     }
 
@@ -1067,6 +1365,18 @@ impl App {
     }
 
     fn open_menu(&mut self) {
+        if self.on_tv {
+            let Some(tv) = &self.tv else { return };
+            let Some(i) = tv.page.channel() else { return };
+            let (name, key) = (tv.list[i].name.clone(), tv.list[i].key());
+            let mut list = vec![(Opt::TvDetails, "Programme details".to_string())];
+            list.push(if self.prefs.tv_favs.contains(&key) {
+                (Opt::Unfav(key), "Remove from Favourites".to_string())
+            } else {
+                (Opt::Fav(key), "Add to Favourites".to_string())
+            });
+            return self.show_menu(&name, list, 0);
+        }
         let Some((r, c)) = self.focused() else { return };
         let it = &self.rows[r].items[c];
         if it.kind != Kind::App {
@@ -1108,6 +1418,30 @@ impl App {
             self.prefs.save();
             apply_debloat(&self.luna.root);
             return self.show_settings();
+        }
+        if act == Act::TvSource {
+            let mut list = vec![
+                (Opt::AskM3u, "M3U playlist address".to_string()),
+                (Opt::AskXtream, "Xtream Codes login".into()),
+            ];
+            if self.tv.is_some() {
+                list.push((Opt::RefreshTv, "Refresh now".into()));
+                list.push((Opt::RemoveTv, "Remove".into()));
+            }
+            return self.show_menu("Live TV channels", list, 0);
+        }
+        if act == Act::TvGuide {
+            if self.tv.is_none() {
+                return self.show_menu("Set up the channels first", vec![(Opt::Close, "OK".into())], 0);
+            }
+            let now = self.tv.as_ref().and_then(|t| t.cfg.guide.clone()).unwrap_or_default();
+            return self.ask(
+                Ask::Guide,
+                "Guide",
+                "The address of an XMLTV guide (.xml or .xml.gz). Leave it empty to use the one the channels bring.",
+                "http://example.com/guide.xml",
+                &now,
+            );
         }
         if act == Act::Plex {
             if let Some(px) = &self.px {
@@ -1239,6 +1573,49 @@ impl App {
                 }
                 return;
             }
+            Opt::AskM3u => {
+                let now = match self.tv.as_ref().map(|t| &t.cfg.source) {
+                    Some(iptv::Source::M3u(url)) => url.clone(),
+                    _ => String::new(),
+                };
+                return self.ask(
+                    Ask::M3u,
+                    "M3U playlist",
+                    "The address of your playlist. It is kept on this TV only.",
+                    "http://example.com/playlist.m3u",
+                    &now,
+                );
+            }
+            Opt::AskXtream => {
+                let now = match self.tv.as_ref().map(|t| &t.cfg.source) {
+                    Some(iptv::Source::Xtream { server, .. }) => server.clone(),
+                    _ => String::new(),
+                };
+                return self.ask(
+                    Ask::XtServer,
+                    "Xtream Codes login (1 of 3)",
+                    "The server's address, with its port.",
+                    "http://example.com:8080",
+                    &now,
+                );
+            }
+            Opt::RefreshTv => return self.refresh_tv(true),
+            Opt::RemoveTv => return self.remove_tv(),
+            Opt::Fav(k) => {
+                self.prefs.tv_favs.push(k.clone());
+                self.prefs.save();
+                return self.rebuild_tv();
+            }
+            Opt::TvDetails => {
+                if let Some(tv) = &mut self.tv {
+                    tv.page.open_details(&tv.list, &tv.guide);
+                }
+            }
+            Opt::Unfav(k) => {
+                self.prefs.tv_favs.retain(|f| f != k);
+                self.prefs.save();
+                return self.rebuild_tv();
+            }
             Opt::AskUninstall => {
                 let title = format!("Uninstall {}?", self.rows[self.cur_row].items[col].title);
                 let list = vec![(Opt::Uninstall, "Uninstall".to_string()), (Opt::Close, "Cancel".into())];
@@ -1259,6 +1636,60 @@ impl App {
         self.prefs.save();
         self.rebuild_apps();
         self.refocus(None, col);
+    }
+
+    fn ask(&mut self, ask: Ask, title: &str, body: &str, hint: &str, text: &str) {
+        let secret = matches!(ask, Ask::XtPass(..));
+        let p = Prompt::new(&self.g, title, body, hint, text, secret);
+        self.mode = Mode::Prompt(Box::new(p), ask);
+    }
+
+    /// A prompt was answered: the next one of the Xtream login, or the change saved.
+    fn answered(&mut self, ask: Ask, text: String) {
+        let url = |t: &str| {
+            if t.contains("://") {
+                t.to_string()
+            } else {
+                format!("http://{t}")
+            }
+        };
+        match ask {
+            Ask::M3u if !text.is_empty() => self.set_tv(Some(iptv::Source::M3u(url(&text))), None),
+            Ask::XtServer if !text.is_empty() => {
+                let user = match self.tv.as_ref().map(|t| &t.cfg.source) {
+                    Some(iptv::Source::Xtream { user, .. }) => user.clone(),
+                    _ => String::new(),
+                };
+                let server = url(&text).trim_end_matches('/').to_string();
+                return self.ask(
+                    Ask::XtUser(server),
+                    "Xtream Codes login (2 of 3)",
+                    "Your user name.",
+                    "user name",
+                    &user,
+                );
+            }
+            Ask::XtUser(server) if !text.is_empty() => {
+                return self.ask(
+                    Ask::XtPass(server, text),
+                    "Xtream Codes login (3 of 3)",
+                    "Your password. It is kept on this TV only.",
+                    "password",
+                    "",
+                );
+            }
+            Ask::XtPass(server, user) if !text.is_empty() => self.set_tv(
+                Some(iptv::Source::Xtream {
+                    server,
+                    user,
+                    pass: text,
+                }),
+                None,
+            ),
+            Ask::Guide => self.set_tv(None, Some(Some(url(&text)).filter(|_| !text.is_empty()))),
+            _ => {}
+        }
+        self.close_dialog();
     }
 
     fn move_key(&mut self, dx: i32, ok: bool, back: bool) {
@@ -1326,6 +1757,7 @@ impl App {
                     self.refresh_jellyfin();
                     self.refresh_youtube(false);
                     self.refresh_plex();
+                    self.refresh_tv(false);
                     self.loaded_at = now;
                 }
             }
@@ -1346,12 +1778,34 @@ impl App {
         }
         match &mut self.mode {
             Mode::Browse => {
+                let details = self.tv.as_ref().is_some_and(|t| self.on_tv && t.page.details);
+                // The programme details: Back closes them, OK (below) watches the channel.
+                if details && (back || options || dx != 0 || dy != 0) {
+                    if let (true, Some(tv)) = (back, &mut self.tv) {
+                        tv.page.details = false;
+                    }
+                    return true;
+                }
+                if back && self.on_tv && !self.top() {
+                    if let Some(tv) = &mut self.tv {
+                        if tv.page.rewind(&tv.list, &tv.guide) {
+                            return true;
+                        }
+                    }
+                }
+                if back && self.on_tv {
+                    self.on_tv = false;
+                    self.tabs_f = false;
+                    return true;
+                }
                 if back {
                     // BACK on the TV: Home has nowhere to go back to.
                     return self.luna.root.is_empty();
                 }
-                if self.cog && ok {
-                    self.open_settings();
+                if self.top() {
+                    self.top_key(dx, dy, ok);
+                } else if self.on_tv {
+                    self.tv_key(dx, dy, ok, options);
                 } else if options {
                     self.open_menu();
                 } else if ok {
@@ -1386,8 +1840,79 @@ impl App {
                 let out = p.key(dx, dy, ok, back);
                 self.settings_out(out);
             }
+            Mode::Prompt(p, _) => match p.key(&self.g, sym, ok, back, dx, dy) {
+                Typed::Stay => {}
+                Typed::Cancel => self.close_dialog(),
+                Typed::Done(text) => {
+                    if let Mode::Prompt(_, ask) = std::mem::replace(&mut self.mode, Mode::Browse) {
+                        self.answered(ask, text);
+                    }
+                }
+            },
         }
         true
+    }
+
+    /// The keys on the TV tab. OK waits for its release: a tap plays the channel (or shows a later programme's
+    /// details), a hold opens the options.
+    fn tv_key(&mut self, dx: i32, dy: i32, ok: bool, options: bool) {
+        let Some(tv) = &mut self.tv else { return };
+        if options {
+            return self.open_menu();
+        }
+        if ok && tv.page.channel().is_some() {
+            self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
+            return;
+        }
+        let row = tv.page.row();
+        match tv.page.key(&tv.list, &tv.guide, dx, dy) {
+            tv::Out::Top => self.tabs_f = true,
+            tv::Out::Ok(i) => self.watch(i),
+            tv::Out::Stay => {}
+        }
+        if let Some(tv) = &self.tv {
+            if tv.page.row() != row {
+                let _ = tv.logo_req.send(tv.page.logos(&tv.list));
+            }
+        }
+    }
+
+    /// For testing without the remote: plays what `player::TRIGGER` names, a channel number or a stream address.
+    pub fn play_file(&mut self) {
+        let Ok(what) = std::fs::read_to_string(crate::player::TRIGGER) else {
+            return;
+        };
+        let _ = std::fs::remove_file(crate::player::TRIGGER);
+        let what = what.trim();
+        if let Ok(n) = what.parse::<usize>() {
+            self.on_tv = true;
+            if let Some(tv) = &mut self.tv {
+                while tv.list.is_empty() {
+                    match tv.res.recv_timeout(std::time::Duration::from_secs(30)) {
+                        Ok(Got::Channels(list)) => tv.list = list,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            self.rebuild_tv();
+            return self.watch(n.saturating_sub(1));
+        }
+        let ch = Channel {
+            name: "Test".into(),
+            group: String::new(),
+            url: what.into(),
+            logo: None,
+            epg: String::new(),
+        };
+        if self.player.is_none() {
+            self.player = crate::player::Player::new()
+                .map_err(|e| log(&format!("play: {e}")))
+                .ok();
+        }
+        if let Some(p) = &mut self.player {
+            p.watch(&self.g, &[ch], 0, &Guide::new());
+        }
     }
 
     fn menu_choose(&mut self) {
@@ -1413,6 +1938,15 @@ impl App {
 
     /// OK was released: a tap on an app launches it (a hold already opened its options).
     fn ok_up(&mut self) {
+        if self.on_tv {
+            if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
+                let out = self.tv.as_mut().map(|t| t.page.tap(&t.list, &t.guide));
+                if let Some(tv::Out::Ok(i)) = out {
+                    self.watch(i);
+                }
+            }
+            return;
+        }
         if self.ok_down.take().is_some() && matches!(self.mode, Mode::Browse) {
             if let Some((r, c)) = self.focused() {
                 self.activate(r, c);
@@ -1430,6 +1964,9 @@ impl App {
         self.in_settings = false;
         self.ok_down = None;
         self.cog = false;
+        self.tabs_f = false;
+        self.on_tv = false;
+        self.refresh_tv(false);
         self.load();
         for r in &mut self.rows {
             r.col = 0;

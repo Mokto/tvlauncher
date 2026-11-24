@@ -2,17 +2,22 @@
 //! StarfishMediaAPIs (libplayerAPIs) in buffer-feed mode. On webOS 5 and later the picture goes to an SDL
 //! exported window under the UI, named in the Load payload. The call shapes are those of Native Jelly's
 //! `src/starfish.c` (GPL-3.0), which plays this way on webOS 6.
+use crate::gfx::*;
+use crate::hls;
+use crate::iptv::{now_next, Channel, Guide};
 use crate::net::curl_stream;
 use crate::sdl::*;
 use crate::ts::{Au, Codec, Demux, Out};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::Read;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// On the TV, a URL in this file makes the next start of the launcher play it instead of showing Home.
+/// On the TV, a channel number or a stream address in this file makes the next start of the launcher play it
+/// (for testing without the remote).
 pub const TRIGGER: &str = "/tmp/tvlauncher-play";
 const AHEAD_NS: i64 = 1_600_000_000;
 /// The pipeline's app id. The media resource manager never gives a decoder to com.webos.app.home.
@@ -24,15 +29,47 @@ enum Msg {
     End(String),
 }
 
-/// Reads `url` on a thread. The bounded channel holds the stream back while the pipeline is full.
-fn read(url: &str) -> Receiver<Msg> {
+/// The thread reading a stream; dropping it stops the stream's `curl`.
+struct Reader {
+    rx: Receiver<Msg>,
+    curl: Arc<Curl>,
+}
+
+#[derive(Default)]
+struct Curl {
+    pid: AtomicU32,
+    stop: AtomicBool,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.curl.stop.store(true, Ordering::SeqCst);
+        let pid = self.curl.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+    }
+}
+
+/// Reads `url` on a thread: one MPEG-TS stream, or the segments of an HLS one in turn, through one demuxer.
+/// The bounded channel holds the stream back while the pipeline is full.
+fn read(url: &str) -> Reader {
     let (tx, rx) = sync_channel(256);
-    let url = url.to_string();
+    let curl = Arc::new(Curl::default());
+    let (url, shared) = (url.to_string(), curl.clone());
     std::thread::spawn(move || {
-        let run = || -> Result<(), String> {
-            let mut child = curl_stream(&url).map_err(|e| format!("curl: {e}"))?;
+        let mut demux = Demux::default();
+        // Reads one address to its end: Ok(false) once nobody listens any more.
+        let mut pump = |url: &str| -> Result<bool, String> {
+            let mut child = curl_stream(url).map_err(|e| format!("curl: {e}"))?;
+            shared.pid.store(child.id(), Ordering::SeqCst);
+            if shared.stop.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
             let mut stdout = child.stdout.take().ok_or("curl: no stdout")?;
-            let (mut demux, mut buf, mut out) = (Demux::default(), vec![0; 64 * 1024], Vec::new());
+            let (mut buf, mut out) = (vec![0; 64 * 1024], Vec::new());
             loop {
                 let n = stdout.read(&mut buf).map_err(|e| e.to_string())?;
                 if n == 0 {
@@ -41,7 +78,13 @@ fn read(url: &str) -> Receiver<Msg> {
                         let _ = e.read_to_string(&mut err);
                     }
                     let _ = child.wait();
-                    return Err(format!("the stream ended {}", err.trim()));
+                    let err = err.trim().trim_start_matches("curl: ");
+                    let stopped = shared.stop.load(Ordering::SeqCst);
+                    return if err.is_empty() || stopped {
+                        Ok(!stopped)
+                    } else {
+                        Err(err.to_string())
+                    };
                 }
                 demux.push(&buf[..n], &mut out);
                 for o in out.drain(..) {
@@ -51,21 +94,89 @@ fn read(url: &str) -> Receiver<Msg> {
                     };
                     if tx.send(m).is_err() {
                         let _ = child.kill();
-                        return Ok(());
+                        let _ = child.wait();
+                        return Ok(false);
                     }
                 }
             }
         };
-        if let Err(e) = run() {
+        let r = if hls::is_hls(&url) {
+            read_hls(&url, &shared.stop, &mut pump)
+        } else {
+            pump(&url).and_then(|more| if more { Err("The stream ended.".into()) } else { Ok(()) })
+        };
+        if let Err(e) = r {
             let _ = tx.send(Msg::End(e));
         }
     });
-    rx
+    Reader { rx, curl }
+}
+
+/// A live HLS stream: the variant with the most bandwidth, from three segments before the live edge, then
+/// each new segment as the playlist lists it.
+// ponytail: no switching between variants on a slow network, and a gap or a discontinuity (an inserted
+// advert) jumps the timestamps, which the feed throttle then waits out.
+fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<bool, String>) -> Result<(), String> {
+    let mut url = url.to_string();
+    let (mut next, mut masters, mut failed) = (None::<u64>, 0, 0);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let t = Instant::now();
+        let reply = crate::net::curl(&url, crate::net::BROWSER_UA, &[], None, 10)?;
+        if reply.status != 200 {
+            return Err(format!("The playlist answered HTTP {}.", reply.status));
+        }
+        url = reply.url;
+        match hls::parse(&url, &String::from_utf8_lossy(&reply.body))? {
+            hls::Playlist::Master(v) => {
+                masters += 1;
+                url = v
+                    .into_iter()
+                    .max_by_key(|v| v.0)
+                    .ok_or("The playlist has no stream.")?
+                    .1;
+                if masters > 3 {
+                    return Err("The playlist leads nowhere.".into());
+                }
+            }
+            hls::Playlist::Media {
+                seq,
+                target_s,
+                segs,
+                end,
+            } => {
+                let last = seq + segs.len() as u64;
+                let from = next.unwrap_or(last.saturating_sub(3)).max(seq);
+                for (n, seg) in (seq..).zip(&segs).skip((from - seq) as usize) {
+                    match pump(seg) {
+                        Ok(true) => failed = 0,
+                        Ok(false) => return Ok(()),
+                        Err(e) if failed < 3 => {
+                            failed += 1;
+                            log(&format!("play: segment {n} skipped: {e}"));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    next = Some(n + 1);
+                }
+                if end && next.unwrap_or(0) >= last {
+                    return Err("The stream ended.".into());
+                }
+                let wait = Duration::from_millis(target_s.clamp(1, 10) * 500);
+                if let Some(rest) = wait.checked_sub(t.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+            }
+        }
+    }
 }
 
 /// `--play <url>` on a desktop: reads ten seconds of the stream and says what the TV would be fed.
 pub fn probe(url: &str) -> ExitCode {
     let rx = read(url);
+    let rx = &rx.rx;
     let end = Instant::now() + Duration::from_secs(10);
     let (mut n, mut keys, mut last) = ([0u32; 2], 0, [0i64; 2]);
     while let Some(left) = end.checked_duration_since(Instant::now()) {
@@ -94,24 +205,17 @@ pub fn probe(url: &str) -> ExitCode {
     }
 }
 
-pub fn run(ren: *mut Opaque, url: &str) -> ExitCode {
-    log("play: start");
-    match play(ren, url) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            log(&format!("play: {e}"));
-            ExitCode::FAILURE
-        }
-    }
-}
-
 type Obj = *mut c_void;
 type EventFn = extern "C" fn(c_int, i64, *const c_char);
 
 /// One StarfishMediaAPIs object. Its size is not published, so it is built in place in a generous buffer
 /// that is never freed (the C++ side may still call back into it after Unload).
+#[derive(Clone, Copy)]
 struct Smp {
     obj: Obj,
+    ctor: unsafe extern "C" fn(Obj, *const c_char),
+    dtor: unsafe extern "C" fn(Obj),
+    foreground: unsafe extern "C" fn(Obj),
     load: unsafe extern "C" fn(Obj, *const c_char, EventFn) -> c_int,
     // Returns a std::string through the hidden pointer in the first argument.
     feed: unsafe extern "C" fn(*mut c_void, Obj, *const c_char),
@@ -139,6 +243,12 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &CStr) -> Result<T, String> {
 }
 
 static EVENTS: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
+/// The pipeline's last error (event 18), for the session to show.
+static ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Set by UNLOADCOMPLETED (event 23): the object may be destroyed.
+static UNLOADED: AtomicBool = AtomicBool::new(false);
+/// The picture's size, from the video info (event 4), as width << 16 | height.
+static SIZE: AtomicU32 = AtomicU32::new(0);
 
 /// The pipeline's events, from its own threads: the first few of each type go to the log.
 extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
@@ -157,6 +267,26 @@ extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
         };
         log(&format!("smp event {kind} {num} {s}"));
     }
+    if kind == 23 {
+        UNLOADED.store(true, Ordering::SeqCst);
+    }
+    if kind == 4 && !s.is_null() {
+        let info = unsafe { CStr::from_ptr(s) }.to_string_lossy();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&info) {
+            let (w, h) = (v["video"]["width"].as_u64(), v["video"]["height"].as_u64());
+            if let (Some(w @ 1..=8192), Some(h @ 1..=8192)) = (w, h) {
+                SIZE.store((w as u32) << 16 | h as u32, Ordering::SeqCst);
+            }
+        }
+    }
+    if kind == 18 {
+        let s = if s.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+        };
+        *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("The TV's player failed: {s} ({num})."));
+    }
 }
 
 impl Smp {
@@ -169,22 +299,45 @@ impl Smp {
                     CStr::from_ptr(libc::dlerror()).to_string_lossy()
                 ));
             }
-            let ctor: unsafe extern "C" fn(Obj, *const c_char) = sym(lib, c"_ZN17StarfishMediaAPIsC1EPKc")?;
-            let foreground: unsafe extern "C" fn(Obj) = sym(lib, c"_ZN17StarfishMediaAPIs16notifyForegroundEv")?;
-            let smp = Smp {
-                obj: Box::into_raw(Box::new(Storage([0; 65536]))).cast(),
+            Ok(Smp {
+                obj: std::ptr::null_mut(),
+                ctor: sym(lib, c"_ZN17StarfishMediaAPIsC1EPKc")?,
+                dtor: sym(lib, c"_ZN17StarfishMediaAPIsD1Ev")?,
+                foreground: sym(lib, c"_ZN17StarfishMediaAPIs16notifyForegroundEv")?,
                 load: sym(lib, c"_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_E")?,
                 feed: sym(lib, c"_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc")?,
                 play: sym(lib, c"_ZN17StarfishMediaAPIs4PlayEv")?,
                 unload: sym(lib, c"_ZN17StarfishMediaAPIs6UnloadEv")?,
                 loaded: sym(lib, c"_ZN17StarfishMediaAPIs15isLoadCompletedEv")?,
                 delete: sym(libc::RTLD_DEFAULT, c"_ZdlPv")?,
-            };
-            // A null id registers on the media server's pre-authorised namespace.
-            ctor(smp.obj, std::ptr::null());
-            foreground(smp.obj);
-            Ok(smp)
+            })
         }
+    }
+
+    /// A new object for one Load. Its memory is never freed (a late callback may still reach it).
+    fn fresh(&self) -> Smp {
+        let mut s = *self;
+        s.obj = Box::into_raw(Box::new(Storage([0; 65536]))).cast();
+        UNLOADED.store(false, Ordering::SeqCst);
+        unsafe {
+            // A null id registers on the media server's pre-authorised namespace.
+            (s.ctor)(s.obj, std::ptr::null());
+            (s.foreground)(s.obj);
+        }
+        s
+    }
+
+    /// Unloads, and destroys the object once the pipeline says the unload is complete; else leaves it.
+    fn retire(&self) {
+        unsafe { (self.unload)(self.obj) };
+        let t = Instant::now();
+        while !UNLOADED.load(Ordering::SeqCst) {
+            if t.elapsed() > Duration::from_secs(3) {
+                return log("play: no UNLOADCOMPLETED; the object is left");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { (self.dtor)(self.obj) };
     }
 
     fn feed(&self, au: &Au) -> Fed {
@@ -236,176 +389,352 @@ fn payload(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> Strin
     )
 }
 
-/// True when Back (or Escape) was pressed or the app was told to quit. Also keeps the window serviced.
-fn back_pressed() -> bool {
+enum Key {
+    Back,
+    Step(i64),
+    Show,
+}
+
+const K_PAGEUP: i32 = 0x4000_004b;
+const K_PAGEDOWN: i32 = 0x4000_004e;
+
+/// The remote, while a channel plays: Back (or Home, or quitting) leaves, Up and Down change channel, OK shows
+/// the banner. A quit is put back for the main loop.
+fn key() -> Option<Key> {
     let mut e = Event::new(0);
-    let mut back = false;
     while unsafe { SDL_PollEvent(&mut e) } != 0 {
-        back |= e.kind() == QUIT || e.kind() == KEYDOWN && (e.key_wcode() == WCODE_BACK || e.key_sym() == K_ESCAPE);
+        if e.kind() == QUIT {
+            unsafe { SDL_PushEvent(&mut Event::new(QUIT)) };
+            return Some(Key::Back);
+        }
+        if e.kind() != KEYDOWN {
+            continue;
+        }
+        let (sym, wcode) = (e.key_sym(), e.key_wcode());
+        if sym == K_ESCAPE || wcode == WCODE_BACK {
+            return Some(Key::Back);
+        }
+        match sym {
+            K_UP | K_PAGEUP => return Some(Key::Step(1)),
+            K_DOWN | K_PAGEDOWN => return Some(Key::Step(-1)),
+            K_RETURN | K_KP_ENTER => return Some(Key::Show),
+            _ => {}
+        }
     }
-    back
+    crate::lifecycle::RELAUNCH.load(Ordering::SeqCst).then_some(Key::Back)
 }
 
-/// A fully transparent frame, so the video plane under the UI shows.
-fn clear(ren: *mut Opaque) {
+/// A fully transparent frame, so the video plane under the UI shows, with the banner over it.
+fn frame(g: &Gfx, banner: &Banner) {
     unsafe {
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
-        SDL_RenderClear(ren);
-        SDL_RenderPresent(ren);
+        SDL_SetRenderDrawColor(g.ren, 0, 0, 0, 0);
+        SDL_RenderClear(g.ren);
+    }
+    banner.draw(g);
+    unsafe { SDL_RenderPresent(g.ren) };
+}
+
+fn hm(t: i64) -> String {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&(t as libc::time_t), &mut tm);
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
 }
 
-fn play(ren: *mut Opaque, url: &str) -> Result<(), String> {
-    let rx = read(url);
-    let (video, audio) = loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(Msg::Streams(Some(v), a)) => break (v, a),
-            Ok(Msg::Streams(None, _)) => return Err("no H.264 or H.265 video in the stream".into()),
-            Ok(Msg::End(e)) => return Err(e),
-            Ok(Msg::Au(_)) => {}
-            Err(_) => return Err("no programme table within 15 s".into()),
-        }
-    };
-    log(&format!("play: video {video:?}, audio {audio:?}"));
+/// The channel's name and what is on, at the bottom of the picture for a few seconds.
+struct Banner {
+    name: Option<Tex>,
+    now: Option<Tex>,
+    next: Option<Tex>,
+    status: Option<Tex>,
+    show: Option<(i64, i64)>,
+    until: Instant,
+}
 
-    let (create, place) = unsafe {
-        let create: unsafe extern "C" fn(c_int) -> *const c_char =
-            sym(libc::RTLD_DEFAULT, c"SDL_webOSCreateExportedWindow")?;
-        let place: unsafe extern "C" fn(*const c_char, *mut Rect, *mut Rect) -> c_int =
-            sym(libc::RTLD_DEFAULT, c"SDL_webOSSetExportedWindow")?;
-        (create, place)
-    };
-    let id = unsafe { create(0) };
-    if id.is_null() {
-        return Err("SDL_webOSCreateExportedWindow gave no window".into());
+impl Banner {
+    fn new(g: &Gfx, ch: &Channel, number: usize, guide: &Guide) -> Banner {
+        let t = crate::youtube::now() as i64;
+        let (on, next) = now_next(guide, &ch.epg, t);
+        Banner {
+            name: g.text(g.f_row, &format!("{number}   {}", ch.name), 0),
+            now: on.and_then(|s| {
+                g.text(
+                    g.f_sub,
+                    &format!("{} - {}   {}", hm(s.start), hm(s.stop), s.title),
+                    1500,
+                )
+            }),
+            next: next.and_then(|s| g.text(g.f_sub, &format!("Next   {}   {}", hm(s.start), s.title), 1500)),
+            status: g.text(g.f_sub, "Tuning...", 0),
+            show: on.map(|s| (s.start, s.stop)),
+            until: Instant::now() + Duration::from_secs(6),
+        }
     }
-    let window = unsafe { CStr::from_ptr(id) }.to_owned();
-    log(&format!("play: exported window {}", window.to_string_lossy()));
 
-    clear(ren);
-    let smp = Smp::new()?;
-    let p = cstr(&payload(APP, &window.to_string_lossy(), video, audio));
-    if unsafe { (smp.load)(smp.obj, p.as_ptr(), on_event) } & 0xff == 0 {
-        return Err("Load refused".into());
+    fn say(&mut self, g: &Gfx, s: Option<&str>) {
+        self.status = s.and_then(|s| g.text(g.f_sub, s, 1500));
+        self.until = Instant::now() + Duration::from_secs(6);
     }
-    // The media server only connects the decoder to the screen for an app it believes is in front, and
-    // the app manager never reports Home as such.
-    let _ = std::process::Command::new("/usr/bin/luna-send")
-        .args(["-n", "1", "-w", "3000", "luna://com.webos.media/notifyAppLifeStatus"])
-        .arg(format!(
-            r#"{{"appId":"{APP}","status":"foreground","windowType":"card"}}"#
-        ))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status();
-    let t = Instant::now();
-    while unsafe { (smp.loaded)(smp.obj) } & 0xff == 0 {
-        if t.elapsed() > Duration::from_secs(10) || back_pressed() {
-            unsafe { (smp.unload)(smp.obj) };
-            return Err("Load did not complete within 10 s".into());
-        }
-        clear(ren);
-    }
-    log(&format!("play: loaded in {} ms", t.elapsed().as_millis()));
-    // ponytail: the source rect assumes 1080p; a 720p stream may need its size from the SPS.
-    let rv = unsafe {
-        place(
-            window.as_ptr(),
-            &mut Rect {
-                x: 0,
-                y: 0,
-                w: 1920,
-                h: 1080,
-            },
-            &mut Rect {
-                x: 0,
-                y: 0,
-                w: 1920,
-                h: 1080,
-            },
-        )
-    };
-    log(&format!("play: window placed ({rv})"));
 
-    let (mut pending, mut fed, mut refused, mut ended) = (None::<Au>, [0u64; 2], 0, false);
-    let (mut last, mut tick, mut started) = ([0i64; 2], Instant::now(), None::<Instant>);
-    let result = 'run: loop {
-        if tick.elapsed() > Duration::from_secs(5) {
-            tick = Instant::now();
-            log(&format!(
-                "play: fed {}/{} up to {}/{} ms, waiting: {}",
-                fed[1],
-                fed[0],
-                last[1] / 1_000_000,
-                last[0] / 1_000_000,
-                pending
-                    .as_ref()
-                    .map_or("-", |a| if a.video { "video" } else { "audio" })
-            ));
+    fn draw(&self, g: &Gfx) {
+        if self.status.is_none() && Instant::now() > self.until {
+            return;
         }
-        if back_pressed() {
-            break Ok(());
+        let (x, w, h) = (MARGIN, W - 2.0 * MARGIN, 230.0);
+        let y = H - h - 64.0;
+        g.rounded(x, y, w, h, 28.0, PANEL, 0.94);
+        g.put(self.name.as_ref(), x + 48.0, y + 32.0, TEXT, 1.0);
+        if let Some(s) = &self.status {
+            g.put(Some(s), x + 48.0, y + 100.0, DIM, 1.0);
+            return;
         }
-        while !ended {
-            let au = match pending.take() {
-                Some(a) => a,
-                None => match rx.try_recv() {
-                    Ok(Msg::Au(a)) => a,
-                    Ok(Msg::Streams(..)) => continue,
-                    Ok(Msg::End(e)) => {
-                        log(&format!("play: {e}"));
-                        ended = true;
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break 'run Err("the reader stopped".into()),
-                },
-            };
-            // Native Jelly's throttle: never more than AHEAD_NS past the playhead (zero until Play), or the
-            // pipeline stops pulling and the clock never starts.
-            let playhead = started.map_or(0, |t| t.elapsed().as_nanos() as i64);
-            if au.pts_ns > playhead + AHEAD_NS {
-                pending = Some(au);
-                break;
+        g.put(self.now.as_ref(), x + 48.0, y + 92.0, TEXT, 1.0);
+        if let Some((a, b)) = self.show {
+            let f = ((crate::youtube::now() as i64 - a) as f32 / (b - a).max(1) as f32).clamp(0.0, 1.0);
+            g.rounded(x + 48.0, y + 140.0, 520.0, 6.0, 3.0, BLACK, 0.5);
+            g.rounded(x + 48.0, y + 140.0, (520.0 * f).max(6.0), 6.0, 3.0, WHITE, 1.0);
+        }
+        g.put(self.next.as_ref(), x + 48.0, y + 162.0, DIM, 1.0);
+    }
+}
+
+enum End {
+    Exit,
+    Step(i64),
+}
+
+/// LG's player, loaded once. Each channel gets an object and an exported window of its own, as in Native Jelly:
+/// the video output never shows a second pipeline on the same object or window.
+pub struct Player {
+    smp: Smp,
+    create: unsafe extern "C" fn(c_int) -> *const c_char,
+    place: unsafe extern "C" fn(*const c_char, *mut Rect, *mut Rect) -> c_int,
+    destroy: unsafe extern "C" fn(*const c_char),
+}
+
+/// An exported window, destroyed when dropped.
+struct Window<'a>(std::ffi::CString, &'a Player);
+
+impl Drop for Window<'_> {
+    fn drop(&mut self) {
+        unsafe { (self.1.destroy)(self.0.as_ptr()) };
+    }
+}
+
+impl Player {
+    pub fn new() -> Result<Player, String> {
+        unsafe {
+            Ok(Player {
+                create: sym(libc::RTLD_DEFAULT, c"SDL_webOSCreateExportedWindow")?,
+                place: sym(libc::RTLD_DEFAULT, c"SDL_webOSSetExportedWindow")?,
+                destroy: sym(libc::RTLD_DEFAULT, c"SDL_webOSDestroyExportedWindow")?,
+                smp: Smp::new()?,
+            })
+        }
+    }
+
+    fn window(&self) -> Result<Window<'_>, String> {
+        let id = unsafe { (self.create)(0) };
+        if id.is_null() {
+            return Err("The TV gave no video window.".into());
+        }
+        Ok(Window(unsafe { CStr::from_ptr(id) }.to_owned(), self))
+    }
+
+    /// Plays `list[at]` full screen until Back or Home; Up and Down change channel. Gives the channel it ended on.
+    pub fn watch(&mut self, g: &Gfx, list: &[Channel], mut at: usize, guide: &Guide) -> usize {
+        loop {
+            let mut banner = Banner::new(g, &list[at], at + 1, guide);
+            match self.session(g, &list[at], &mut banner) {
+                End::Exit => return at,
+                End::Step(d) => at = (at as i64 + d).rem_euclid(list.len() as i64) as usize,
             }
-            match smp.feed(&au) {
-                Fed::Ok => {
-                    last[au.video as usize] = au.pts_ns;
-                    let n = &mut fed[au.video as usize];
-                    *n += 1;
-                    if *n == 1 || *n % 500 == 0 {
-                        let lane = if au.video { "video" } else { "audio" };
-                        log(&format!("play: fed {n} {lane}, pts {} ms", au.pts_ns / 1_000_000));
-                    }
+        }
+    }
+
+    /// Shows why a channel does not play until the viewer leaves or changes channel.
+    fn fail(&self, g: &Gfx, banner: &mut Banner, why: &str) -> End {
+        log(&format!("play: {why}"));
+        banner.say(g, Some(why));
+        loop {
+            match key() {
+                Some(Key::Back) => return End::Exit,
+                Some(Key::Step(d)) => return End::Step(d),
+                _ => frame(g, banner),
+            }
+        }
+    }
+
+    fn session(&mut self, g: &Gfx, ch: &Channel, banner: &mut Banner) -> End {
+        log(&format!("play: {}", ch.name));
+        let reader = read(&ch.url);
+        let t = Instant::now();
+        let (video, audio) = loop {
+            match key() {
+                Some(Key::Back) => return End::Exit,
+                Some(Key::Step(d)) => return End::Step(d),
+                _ => {}
+            }
+            match reader.rx.recv_timeout(Duration::from_millis(16)) {
+                Ok(Msg::Streams(Some(v), a)) => break (v, a),
+                Ok(Msg::Streams(None, _)) => {
+                    return self.fail(g, banner, "This channel has no H.264 or H.265 picture.")
                 }
-                Fed::Full => {
+                Ok(Msg::End(e)) => return self.fail(g, banner, &e),
+                Ok(Msg::Au(_)) | Err(_) => {}
+            }
+            if t.elapsed() > Duration::from_secs(15) {
+                return self.fail(
+                    g,
+                    banner,
+                    "This channel did not send an MPEG-TS stream within 15 seconds.",
+                );
+            }
+            frame(g, banner);
+        };
+        log(&format!("play: video {video:?}, audio {audio:?}"));
+        *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let window = match self.window() {
+            Ok(w) => w,
+            Err(e) => return self.fail(g, banner, &e),
+        };
+        let smp = &self.smp.fresh();
+        let p = cstr(&payload(APP, &window.0.to_string_lossy(), video, audio));
+        if unsafe { (smp.load)(smp.obj, p.as_ptr(), on_event) } & 0xff == 0 {
+            return self.fail(g, banner, "The TV's player refused the channel.");
+        }
+        // The media server only connects the decoder to the screen for an app it believes is in front, and
+        // the app manager never reports Home as such.
+        let _ = std::process::Command::new("/usr/bin/luna-send")
+            .args(["-n", "1", "-w", "3000", "luna://com.webos.media/notifyAppLifeStatus"])
+            .arg(format!(
+                r#"{{"appId":"{APP}","status":"foreground","windowType":"card"}}"#
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        let t = Instant::now();
+        while unsafe { (smp.loaded)(smp.obj) } & 0xff == 0 {
+            let k = key();
+            let err = ERROR.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if t.elapsed() > Duration::from_secs(10) || err.is_some() || matches!(k, Some(Key::Back | Key::Step(_))) {
+                smp.retire();
+                return match k {
+                    Some(Key::Back) => End::Exit,
+                    Some(Key::Step(d)) => End::Step(d),
+                    _ => self.fail(g, banner, &err.unwrap_or("The TV's player did not start.".into())),
+                };
+            }
+            frame(g, banner);
+        }
+        log(&format!("play: loaded in {} ms", t.elapsed().as_millis()));
+        // Placed as 1080p until the pipeline says the picture's size, then again.
+        SIZE.store(1920 << 16 | 1080, Ordering::SeqCst);
+        let place = |size: u32| {
+            let mut src = Rect {
+                x: 0,
+                y: 0,
+                w: (size >> 16) as i32,
+                h: (size & 0xffff) as i32,
+            };
+            let mut dst = Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            };
+            let rv = unsafe { (self.place)(window.0.as_ptr(), &mut src, &mut dst) };
+            log(&format!("play: window placed for {}x{} ({rv})", src.w, src.h));
+            size
+        };
+        let mut placed = place(SIZE.load(Ordering::SeqCst));
+
+        let (mut pending, mut fed, mut refused) = (None::<Au>, [0u64; 2], 0);
+        let (mut last, mut tick, mut started) = ([0i64; 2], Instant::now(), None::<Instant>);
+        let end = loop {
+            if tick.elapsed() > Duration::from_secs(10) {
+                tick = Instant::now();
+                log(&format!(
+                    "play: fed {}/{} up to {}/{} ms",
+                    fed[1],
+                    fed[0],
+                    last[1] / 1_000_000,
+                    last[0] / 1_000_000
+                ));
+            }
+            match key() {
+                Some(Key::Back) => break End::Exit,
+                Some(Key::Step(d)) => break End::Step(d),
+                Some(Key::Show) => banner.say(g, None),
+                None => {}
+            }
+            if let Some(e) = ERROR.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                smp.retire();
+                return self.fail(g, banner, &e);
+            }
+            loop {
+                let au = match pending.take() {
+                    Some(a) => a,
+                    None => match reader.rx.try_recv() {
+                        Ok(Msg::Au(a)) => a,
+                        Ok(Msg::Streams(..)) => continue,
+                        Ok(Msg::End(e)) => {
+                            smp.retire();
+                            return self.fail(g, banner, &e);
+                        }
+                        Err(_) => break,
+                    },
+                };
+                // Native Jelly's throttle: never more than AHEAD_NS past the playhead (zero until Play), or the
+                // pipeline stops pulling and the clock never starts.
+                let playhead = started.map_or(0, |t| t.elapsed().as_nanos() as i64);
+                if au.pts_ns > playhead + AHEAD_NS {
                     pending = Some(au);
                     break;
                 }
-                Fed::Refused(r) => {
-                    refused += 1;
-                    if refused <= 5 {
-                        log(&format!("play: Feed answered {r:?}"));
+                match smp.feed(&au) {
+                    Fed::Ok => {
+                        last[au.video as usize] = au.pts_ns;
+                        fed[au.video as usize] += 1;
+                    }
+                    Fed::Full => {
+                        pending = Some(au);
+                        break;
+                    }
+                    Fed::Refused(r) => {
+                        refused += 1;
+                        if refused <= 5 {
+                            log(&format!("play: Feed answered {r:?}"));
+                        }
                     }
                 }
             }
-        }
-        // Like Native Jelly: Play once the decoder has some of each lane, not on an empty pipeline.
-        if started.is_none() && last[1] >= 700_000_000 && (audio.is_none() || last[0] >= 300_000_000) {
-            started = Some(Instant::now());
-            let ok = unsafe { (smp.play)(smp.obj) } & 0xff;
-            log(&format!("play: Play {ok}"));
-        }
-        clear(ren);
-    };
-    unsafe { (smp.unload)(smp.obj) };
-    log(&format!(
-        "play: stopped after {} pictures and {} audio frames",
-        fed[1], fed[0]
-    ));
-    result
+            // Like Native Jelly: Play once the decoder has some of each lane, not on an empty pipeline.
+            if started.is_none() && last[1] >= 700_000_000 && (audio.is_none() || last[0] >= 300_000_000) {
+                started = Some(Instant::now());
+                let ok = unsafe { (smp.play)(smp.obj) } & 0xff;
+                log(&format!("play: Play {ok}"));
+                banner.say(g, None);
+            }
+            let size = SIZE.load(Ordering::SeqCst);
+            if size != placed {
+                placed = place(size);
+            }
+            frame(g, banner);
+            if started.is_none() && t.elapsed() > Duration::from_secs(20) {
+                smp.retire();
+                return self.fail(g, banner, "The channel sent no pictures.");
+            }
+        };
+        smp.retire();
+        log(&format!(
+            "play: stopped after {} pictures and {} audio frames",
+            fed[1], fed[0]
+        ));
+        end
+    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

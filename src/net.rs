@@ -6,7 +6,13 @@ use std::process::{Command, Stdio};
 pub struct Reply {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The address that answered, after redirects.
+    pub url: String,
 }
+
+/// Live streams are fetched as a browser: some channels refuse other agents (and some a bare `Mozilla/5.0`).
+pub const BROWSER_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// A curl config value: quoted, with the escapes curl reads.
 fn quote(s: &str) -> String {
@@ -20,7 +26,7 @@ fn quote(s: &str) -> String {
 /// after the body, on a line of its own.
 fn curl_config(url: &str, ua: &str, headers: &[(&str, String)], body: Option<&str>, timeout: u64) -> String {
     let mut c = format!(
-        "url = {}\nsilent\nshow-error\nlocation\nconnect-timeout = {}\nmax-time = {timeout}\nuser-agent = {}\nwrite-out = \"\\n%{{http_code}}\"\n",
+        "url = {}\nsilent\nshow-error\nlocation\nconnect-timeout = {}\nmax-time = {timeout}\nuser-agent = {}\nwrite-out = \"\\n%{{url_effective}}\\n%{{http_code}}\"\n",
         quote(url),
         timeout.min(10),
         quote(ua)
@@ -71,9 +77,12 @@ pub fn curl(
         .and_then(|i| std::str::from_utf8(&out.stdout[i..]).ok())
         .and_then(|s| s.parse().ok())
         .ok_or("curl gave no status")?;
+    let rest = &out.stdout[..n - 4];
+    let cut = rest.iter().rposition(|&b| b == b'\n').ok_or("curl gave no address")?;
     Ok(Reply {
         status,
-        body: out.stdout[..n.saturating_sub(4)].to_vec(),
+        url: String::from_utf8_lossy(&rest[cut + 1..]).into_owned(),
+        body: rest[..cut].to_vec(),
     })
 }
 
@@ -87,8 +96,9 @@ pub fn curl_stream(url: &str) -> std::io::Result<std::process::Child> {
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let c = format!(
-            "url = {}\nsilent\nshow-error\nfail\nlocation\nconnect-timeout = 10\nuser-agent = \"tvlauncher\"\n",
-            quote(url)
+            "url = {}\nsilent\nshow-error\nfail\nlocation\nconnect-timeout = 10\nuser-agent = {}\n",
+            quote(url),
+            quote(BROWSER_UA)
         );
         stdin.write_all(c.as_bytes())?;
     }
@@ -118,6 +128,7 @@ pub fn send(url: &str, post: Option<&str>, headers: &[(&str, String)], timeout: 
         .map_err(|e| e.to_string())?;
     Ok(Reply {
         status: r.status_code as u16,
+        url: r.url.clone(),
         body: r.into_bytes(),
     })
 }
@@ -159,6 +170,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.status, r.body.as_slice()), (201, &b"hi\nthere\n"[..]));
+        assert_eq!(r.url, format!("http://127.0.0.1:{port}/p"));
         let req = t.join().unwrap();
         assert!(req.starts_with("POST /p "), "{req}");
         assert!(req.contains("X-T: 1"));

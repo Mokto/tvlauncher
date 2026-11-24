@@ -5,3 +5,5 @@ jellyfin.json
 youtube.json
 .DS_Store
 dist/
+plex.json
+iptv.json

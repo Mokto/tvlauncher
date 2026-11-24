@@ -379,6 +379,8 @@ pub struct Prefs {
     pub plex_app: Option<String>,
     /// Groups of LG's ads and telemetry kept off while this is Home (see `debloat.sh`).
     pub debloat: Vec<String>,
+    /// Channels in the TV tab's Favourites, by `iptv::Channel::key`.
+    pub tv_favs: Vec<String>,
 }
 
 /// The groups `debloat.sh` knows, with what each stops.
@@ -411,13 +413,14 @@ impl Prefs {
             jf_app: v["jfApp"].as_str().map(String::from),
             plex_app: v["plexApp"].as_str().map(String::from),
             debloat: list("debloat"),
+            tv_favs: list("tvFavs"),
             path,
         }
     }
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)
