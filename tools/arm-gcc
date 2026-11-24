@@ -1,0 +1,4 @@
+#!/bin/sh
+# The NDK gcc has no default sysroot; this is the linker cargo uses for the TV build.
+sdk=${WEBOS_SDK:-$HOME/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot}
+exec "$sdk/bin/arm-webos-linux-gnueabi-gcc" --sysroot="$sdk/arm-webos-linux-gnueabi/sysroot" "$@"

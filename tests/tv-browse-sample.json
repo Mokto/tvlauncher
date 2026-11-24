@@ -1,0 +1,527 @@
+{
+ "responseContext": {
+  "serviceTrackingParams": [
+   {
+    "service": "GFEEDBACK",
+    "params": [
+     {
+      "key": "logged_in",
+      "value": "1"
+     }
+    ]
+   }
+  ]
+ },
+ "contents": {
+  "tvBrowseRenderer": {
+   "content": {
+    "tvSurfaceContentRenderer": {
+     "content": {
+      "sectionListRenderer": {
+       "contents": [
+        {
+         "shelfRenderer": {
+          "content": {
+           "horizontalListRenderer": {
+            "items": [
+             {
+              "tileRenderer": {
+               "style": "TILE_STYLE_YTLR_DEFAULT",
+               "header": {
+                "tileHeaderRenderer": {
+                 "thumbnail": {
+                  "thumbnails": [
+                   {
+                    "url": "https://i.ytimg.com/vi/fcnDmrtj6Sk/hq720.jpg?sqp=-oaymwEVCIAFEOgCSFDyq4qpAwcVAACIQhgB&rs=AOn4CLCRZdNcjJj0r_Twi1ThookpvipMwg",
+                    "width": 640,
+                    "height": 360
+                   }
+                  ]
+                 },
+                 "thumbnailOverlays": [
+                  {
+                   "thumbnailOverlayTimeStatusRenderer": {
+                    "text": {
+                     "simpleText": "4:01"
+                    },
+                    "style": "DEFAULT",
+                    "icon": {
+                     "iconType": "AUDIO"
+                    }
+                   }
+                  }
+                 ]
+                }
+               },
+               "metadata": {
+                "tileMetadataRenderer": {
+                 "title": {
+                  "simpleText": "Dai Dai"
+                 },
+                 "lines": [
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "Shakira"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "badge": {
+                        "metadataBadgeRenderer": {
+                         "style": "BADGE_STYLE_TYPE_SIMPLE",
+                         "label": "4K"
+                        }
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "1.4bn views"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "\u2022"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "6 months ago"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  }
+                 ]
+                }
+               },
+               "onSelectCommand": {
+                "watchEndpoint": {
+                 "videoId": "fcnDmrtj6Sk",
+                 "playlistId": "RDfcnDmrtj6Sk",
+                 "params": "wAEBuAUB"
+                }
+               },
+               "contentId": "fcnDmrtj6Sk",
+               "contentType": "TILE_CONTENT_TYPE_VIDEO"
+              }
+             },
+             {
+              "tileRenderer": {
+               "style": "TILE_STYLE_YTLR_DEFAULT",
+               "header": {
+                "tileHeaderRenderer": {
+                 "thumbnail": {
+                  "thumbnails": [
+                   {
+                    "url": "https://music.youtube.com/image/mixart?r=EMACGLQBMhMIBxoLTThVbkJBZzNLZFUoATAAYggKBgoECgJlbg&k=FALLBACK_16X9_MIX",
+                    "width": 320,
+                    "height": 180
+                   },
+                   {
+                    "url": "https://music.youtube.com/image/mixart?r=ELwDGPoBMhMIBxoLTThVbkJBZzNLZFUoATAAYggKBgoECgJlbg&k=FALLBACK_16X9_MIX",
+                    "width": 444,
+                    "height": 250
+                   },
+                   {
+                    "url": "https://music.youtube.com/image/mixart?r=EIAFGOgCMhMIBxoLTThVbkJBZzNLZFUoATAAYggKBgoECgJlbg&k=FALLBACK_16X9_MIX",
+                    "width": 640,
+                    "height": 360
+                   },
+                   {
+                    "url": "https://music.youtube.com/image/mixart?r=EMAHGJwEMhMIBxoLTThVbkJBZzNLZFUoATAAYggKBgoECgJlbg&k=FALLBACK_16X9_MIX",
+                    "width": 960,
+                    "height": 540
+                   }
+                  ]
+                 },
+                 "thumbnailOverlays": [
+                  {
+                   "thumbnailOverlayTimeStatusRenderer": {
+                    "text": {
+                     "runs": [
+                      {
+                       "text": "Mix"
+                      }
+                     ]
+                    },
+                    "style": "DEFAULT",
+                    "icon": {
+                     "iconType": "MIX"
+                    }
+                   }
+                  },
+                  {
+                   "thumbnailOverlayStackingEffectRenderer": {
+                    "upperStackColor": 4284045123,
+                    "lowerStackColor": 4287400304
+                   }
+                  }
+                 ]
+                }
+               },
+               "metadata": {
+                "tileMetadataRenderer": {
+                 "title": {
+                  "simpleText": "New Release Mix"
+                 },
+                 "lines": [
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "Tommy Cash, Bulin 47, Akmalov and more"
+                       }
+                      }
+                     }
+                    ],
+                    "wrap": true
+                   }
+                  }
+                 ]
+                }
+               },
+               "onSelectCommand": {
+                "browseEndpoint": {
+                 "browseId": "VLRDTMAK5uy_lr0LWzGrq6FU9GIxWvFHTRPQD2LHMqlFA",
+                 "params": "ggMNWgtNOFVuQkFnM0tkVQ%3D%3D",
+                 "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                   "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                  }
+                 },
+                 "pageAnimation": {
+                  "preloadPageConfig": {
+                   "backgroundScrimConfig": {
+                    "scrimStyle": "SCRIM_STYLE_DEFAULT"
+                   }
+                  }
+                 }
+                }
+               },
+               "contentId": "RDTMAK5uy_lr0LWzGrq6FU9GIxWvFHTRPQD2LHMqlFA",
+               "contentType": "TILE_CONTENT_TYPE_PLAYLIST"
+              }
+             },
+             {
+              "tileRenderer": {
+               "style": "TILE_STYLE_YTLR_DEFAULT",
+               "header": {
+                "tileHeaderRenderer": {
+                 "thumbnail": {
+                  "thumbnails": [
+                   {
+                    "url": "https://i.ytimg.com/vi/kupoawwfMf8/hq720.jpg?sqp=-oaymwEVCIAFEOgCSFDyq4qpAwcVAACIQhgB&rs=AOn4CLDN52KtfjFP3J2HPJBX_0b9A1Skhg",
+                    "width": 640,
+                    "height": 360
+                   }
+                  ]
+                 },
+                 "thumbnailOverlays": [
+                  {
+                   "thumbnailOverlayTimeStatusRenderer": {
+                    "text": {
+                     "simpleText": "2:53"
+                    },
+                    "style": "DEFAULT",
+                    "icon": {
+                     "iconType": "AUDIO"
+                    }
+                   }
+                  }
+                 ]
+                }
+               },
+               "metadata": {
+                "tileMetadataRenderer": {
+                 "title": {
+                  "simpleText": "King's Game (Tinka and the King's Game)"
+                 },
+                 "lines": [
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "Hjalmer"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "6.7m views"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "\u2022"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "7 years ago"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  }
+                 ]
+                }
+               },
+               "onSelectCommand": {
+                "reelWatchEndpoint": {
+                 "videoId": "aaaaaaaaaaa"
+                }
+               },
+               "contentId": "aaaaaaaaaaa",
+               "contentType": "TILE_CONTENT_TYPE_VIDEO"
+              }
+             }
+            ]
+           }
+          }
+         }
+        },
+        {
+         "shelfRenderer": {
+          "content": {
+           "horizontalListRenderer": {
+            "items": [
+             {
+              "tileRenderer": {
+               "style": "TILE_STYLE_YTLR_DEFAULT",
+               "header": {
+                "tileHeaderRenderer": {
+                 "thumbnail": {
+                  "thumbnails": [
+                   {
+                    "url": "https://i.ytimg.com/vi/fcnDmrtj6Sk/hq720.jpg?sqp=-oaymwEVCIAFEOgCSFDyq4qpAwcVAACIQhgB&rs=AOn4CLCRZdNcjJj0r_Twi1ThookpvipMwg",
+                    "width": 640,
+                    "height": 360
+                   }
+                  ]
+                 },
+                 "thumbnailOverlays": [
+                  {
+                   "thumbnailOverlayTimeStatusRenderer": {
+                    "text": {
+                     "simpleText": "4:01"
+                    },
+                    "style": "DEFAULT",
+                    "icon": {
+                     "iconType": "AUDIO"
+                    }
+                   }
+                  }
+                 ]
+                }
+               },
+               "metadata": {
+                "tileMetadataRenderer": {
+                 "title": {
+                  "simpleText": "Dai Dai"
+                 },
+                 "lines": [
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "Shakira"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "badge": {
+                        "metadataBadgeRenderer": {
+                         "style": "BADGE_STYLE_TYPE_SIMPLE",
+                         "label": "4K"
+                        }
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "1.4bn views"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "\u2022"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "6 months ago"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  }
+                 ]
+                }
+               },
+               "onSelectCommand": {
+                "watchEndpoint": {
+                 "videoId": "fcnDmrtj6Sk",
+                 "playlistId": "RDfcnDmrtj6Sk",
+                 "params": "wAEBuAUB"
+                }
+               },
+               "contentId": "fcnDmrtj6Sk",
+               "contentType": "TILE_CONTENT_TYPE_VIDEO"
+              }
+             },
+             {
+              "tileRenderer": {
+               "style": "TILE_STYLE_YTLR_DEFAULT",
+               "header": {
+                "tileHeaderRenderer": {
+                 "thumbnail": {
+                  "thumbnails": [
+                   {
+                    "url": "https://i.ytimg.com/vi/aAkMkVFwAoo/hq720.jpg?sqp=-oaymwEVCIAFEOgCSFDyq4qpAwcVAACIQhgB&rs=AOn4CLBrkRaHtS5iIXIvlmPXCzGXWLYvKA",
+                    "width": 640,
+                    "height": 360
+                   }
+                  ]
+                 },
+                 "thumbnailOverlays": [
+                  {
+                   "thumbnailOverlayTimeStatusRenderer": {
+                    "text": {
+                     "simpleText": "4:03"
+                    },
+                    "style": "DEFAULT",
+                    "icon": {
+                     "iconType": "AUDIO"
+                    }
+                   }
+                  },
+                  {
+                   "thumbnailOverlayResumePlaybackRenderer": {
+                    "percentDurationWatched": 42
+                   }
+                  }
+                 ]
+                }
+               },
+               "metadata": {
+                "tileMetadataRenderer": {
+                 "title": {
+                  "simpleText": "All I Want for Christmas Is You (Make My Wish Come True Edition)"
+                 },
+                 "lines": [
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "Mariah Carey"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "lineRenderer": {
+                    "items": [
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "962m views"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "\u2022"
+                       }
+                      }
+                     },
+                     {
+                      "lineItemRenderer": {
+                       "text": {
+                        "simpleText": "6 years ago"
+                       }
+                      }
+                     }
+                    ]
+                   }
+                  }
+                 ]
+                }
+               },
+               "onSelectCommand": {
+                "watchEndpoint": {
+                 "videoId": "kJQP7kiw5Fk",
+                 "playlistId": "RDaAkMkVFwAoo",
+                 "params": "wAEBuAUB"
+                }
+               },
+               "contentId": "kJQP7kiw5Fk",
+               "contentType": "TILE_CONTENT_TYPE_VIDEO"
+              }
+             }
+            ]
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  }
+ }
+}

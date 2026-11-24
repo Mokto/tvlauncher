@@ -1,0 +1,6 @@
+# The precompiled std for this target emits the ARMv6 CP15 barrier, which is undefined on the C1's
+# Cortex-A53 and raises SIGILL. cortex-a9 (ARMv7-A) emits `dmb`; `make` also rebuilds std with
+# -Zbuild-std so the flags apply to it. NEON is off because some dependencies need unstable intrinsics for it.
+# RUSTFLAGS in the environment replaces this list, so never set it for the ARM build.
+[target.arm-unknown-linux-gnueabi]
+rustflags = ["-C", "target-cpu=cortex-a9", "-C", "target-feature=-neon"]

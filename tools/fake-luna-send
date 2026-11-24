@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stands in for /usr/bin/luna-send in tools/qemu-smoke.sh: answers from the pulled fixtures, and plays a
+# registerApp session (registered, a relaunch, then close).
+for a; do case "$a" in luna://*) uri=$a ;; esac; done
+echo "$uri" >> /tmp/luna-calls
+case "$uri" in
+*/registerApp)
+  echo '{"returnValue":true,"event":"registered"}'
+  sleep 3
+  echo '{"event":"relaunch","parameters":{}}'
+  sleep 3
+  echo '{"event":"close"}'
+  sleep 30
+  ;;
+*) cat "/fx/luna/${uri##*/}.json" 2>/dev/null ;;
+esac

@@ -1,0 +1,6 @@
+build/
+fixtures/
+target/
+jellyfin.json
+youtube.json
+.DS_Store

@@ -1,0 +1,18 @@
+[package]
+name = "tvlauncher"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "An Android TV-style Home for rooted LG webOS TVs."
+
+[dependencies]
+libc = "0.2"
+minreq = { version = "2", default-features = false }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
