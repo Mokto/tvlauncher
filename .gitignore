@@ -4,3 +4,4 @@ target/
 jellyfin.json
 youtube.json
 .DS_Store
+dist/

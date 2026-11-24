@@ -100,14 +100,14 @@ A sideloaded native app runs jailed as `prisoner`. The jail has no `/usr/palm/ap
 
 ## Install on your TV
 
-You need a rooted LG with the Homebrew Channel (this was built and tried on a C1 with webOS 6.5.3, nothing else), SSH access as root with a key, and the build tools below. Then, from this directory:
+You need a rooted LG with the Homebrew Channel (this was built and tried on a C1 with webOS 6.5.3, nothing else) and SSH access to it as root with a key. No toolchain is needed:
 
-```sh
-make deploy TV=root@<tv-ip>     # build and copy to /media/developer/tvlauncher
-make on TV=root@<tv-ip>         # try it as Home; `make off` or a reboot puts LG's Home back
-```
+1. Download `tvlauncher-<version>-webos-arm.tar.gz` from the [Releases](https://github.com/Mokto/tvlauncher/releases) page and unpack it.
+2. Run `./install.sh root@<tv-ip> on`. It copies the files to `/media/developer/tvlauncher` and makes the launcher Home until the next reboot. Without `on` it only installs; run it again, or `ssh root@<tv-ip> sh /media/developer/tvlauncher/takeover.sh on`, to start. Running it again later updates and restarts.
+3. To undo before a reboot: `ssh root@<tv-ip> sh /media/developer/tvlauncher/takeover.sh off`. A reboot also brings LG's Home back.
+4. Happy with it? Open **Settings → Startup → Start as Home** (the cog at the top right of Home).
 
-Open **Settings → Startup → Start as Home** (or `make boot`) once you want it at every boot. Nothing is changed on the TV outside `/media/developer/tvlauncher` and the one bind mount, except that option's hook in `/var/lib/webosbrew/init.d`. `TV` defaults to the SSH alias `lg-c1`.
+From a source checkout instead (needs the toolchain below): `make deploy on TV=root@<tv-ip>`, and `make release` builds the package. Nothing is changed on the TV outside `/media/developer/tvlauncher` and the one bind mount, except the hook that *Start as Home* adds in `/var/lib/webosbrew/init.d`. `TV` defaults to the SSH alias `lg-c1`.
 
 ## Build, try and undo
 

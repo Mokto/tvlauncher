@@ -41,4 +41,13 @@ boot: ; ssh $(TV) sh $(DEST)/takeover.sh boot on
 unboot: ; ssh $(TV) sh $(DEST)/takeover.sh boot off
 off: ; ssh $(TV) sh $(DEST)/takeover.sh off
 
-.PHONY: arm sim shot deploy qemu on off boot unboot
+# A package for people without the toolchain: the prebuilt binary, the scripts and install.sh.
+VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+PKG     = tvlauncher-$(VERSION)-webos-arm
+release: arm
+	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)
+	cp $(ARM_BIN) takeover.sh debloat.sh boot.sh install.sh LICENSE README.md dist/$(PKG)/
+	tar -C dist -czf dist/$(PKG).tar.gz $(PKG)
+	cd dist && shasum -a 256 $(PKG).tar.gz > $(PKG).tar.gz.sha256 && cat $(PKG).tar.gz.sha256
+
+.PHONY: arm sim shot deploy release qemu on off boot unboot
