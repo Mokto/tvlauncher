@@ -9,6 +9,7 @@ Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher
 *A simulator render with generated demo artwork (`tools/demo-fixtures.py`), so it shows no one's posters or thumbnails.*
 
 - **The Android TV layout:** a big hero with the focused item's title, description and backdrop, and rows of cards under it: Pinned apps, Continue watching, Recommended on YouTube, Apps, Inputs.
+- **Movement that feels native:** focus, scrolling and background changes are animated frame by frame on the GPU, with smooth easing and crossfades. Moving around feels like the TV's own interface, with no page redraws, layout reflows or script pauses to cause stutter.
 - **Your library on Home:** *Continue watching* from your own Jellyfin server, signed in on the TV with Quick Connect (nothing is typed with the remote), and a changing backdrop with title and synopsis behind everything else.
 - **Recommended on YouTube** (unofficial, opt-in), with the YouTube app doing the playback.
 - **Your apps, your way:** pin, hide, reorder and uninstall from the options menu, opened by holding OK as on LG's own Home.
