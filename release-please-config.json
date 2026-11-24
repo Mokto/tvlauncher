@@ -3,5 +3,10 @@
   "release-type": "rust",
   "bump-minor-pre-major": true,
   "prerelease": true,
-  "packages": { ".": { "package-name": "tvlauncher" } }
+  "packages": {
+    ".": {
+      "package-name": "tvlauncher"
+    }
+  },
+  "include-component-in-tag": false
 }
