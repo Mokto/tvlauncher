@@ -8,9 +8,10 @@ Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher
 
 *A simulator render with generated demo artwork (`tools/demo-fixtures.py`), so it shows no one's posters or thumbnails.*
 
-- **The Android TV layout:** a big hero with the focused item's title, description and backdrop, and rows of cards under it: Pinned apps, Continue watching, Recommended on YouTube, Apps, Inputs.
+- **The Android TV layout:** a big hero with the focused item's title, description and backdrop, and rows of cards under it: Pinned apps, Continue watching, Continue watching on Plex, Recommended on YouTube, Apps, Inputs.
 - **Movement that feels native:** focus, scrolling and background changes are animated frame by frame on the GPU, with smooth easing and crossfades. Moving around feels like the TV's own interface, with no page redraws, layout reflows or script pauses to cause stutter.
 - **Your library on Home:** *Continue watching* from your own Jellyfin server, signed in on the TV with Quick Connect (nothing is typed with the remote), and a changing backdrop with title and synopsis behind everything else.
+- **Continue watching on Plex,** signed in with a code you enter at plex.tv/link. PlxNative opens the title itself.
 - **Recommended on YouTube** (unofficial, opt-in), with the YouTube app doing the playback.
 - **Your apps, your way:** pin, hide, reorder and uninstall from the options menu, opened by holding OK as on LG's own Home.
 - **Optional blocking of LG's ads and telemetry,** four switches, all off by default.
@@ -22,10 +23,11 @@ Built and tried on an LG C1 (webOS 6.5.3). It is early software: expect rough ed
 
 Rust, with `serde_json`, `libc` and `minreq` as the only dependencies. [src/sdl.rs](src/sdl.rs) declares the SDL calls by hand because LG's SDL fork shifts the key symbol in `SDL_KeyboardEvent`, which a stock-SDL binding would read wrongly. Everything is drawn by the app: cards, text, focus animations, the on-screen keyboard and the settings page. HTTPS goes through the TV's own `curl`, so there is no TLS stack in the binary. The details are in the sections below.
 
-It shows a hero area with the focused card's name, description and background image, and up to five rows:
+It shows a hero area with the focused card's name, description and background image, and up to six rows:
 
 - **Pinned apps**: the apps you pinned (hold OK on an app, *Pin to Home*), in the order you give them. A pinned app is shown here instead of in Apps. The row is absent until something is pinned.
 - **Continue watching**: Jellyfin's resume and next-up items, with a picture and a progress bar. See [Jellyfin](#jellyfin).
+- **Continue watching on Plex**: the Continue Watching hub of your Plex servers. See [Plex](#plex).
 - **Recommended on YouTube**: see [YouTube](#youtube-recommendations).
 - **Apps**, from `listLaunchPoints`. All the other apps. Hold OK on one to pin, hide or reorder it. See [Hiding and moving apps](#hiding-and-moving-apps).
 - **Inputs**, from `getAllInputStatus`.
@@ -54,6 +56,18 @@ Sign in on the TV, from the **cog** at the top right of Home (press Up from the 
 - The list (Jellyfin's resume and next-up items) and its pictures are cached in `/media/developer/tvlauncher/cache` and shown at once; a background thread refreshes them on every start, on coming back to the front and on the Home key. The launcher never wakes the tower: when the server is asleep the refresh times out after 6 s and the cached row stays.
 - Opening an item starts the chosen app with `{"itemId", "userId", "serverId"}` as launch parameters. Native Jelly's `feat/deep-link-launch` branch (see its `docs/deep-link.md`) turns that into the item's detail page; a build without it, or another app, just opens the app (whether Moonfin reads these parameters is unchecked). The detail page never starts playback itself, and the user must already be signed in inside that app.
 - The simulator signs in the same way and writes `fixtures/media/developer/tvlauncher/jellyfin.json`, which is ignored by Git.
+
+## Plex
+
+A **Continue watching on Plex** row with what your Plex account is in the middle of, from its own servers.
+
+1. Cog → **Plex** → **Account**. The dialog shows a code. On a phone or computer, open **plex.tv/link**, sign in and enter it (this is Plex's own PIN sign-in, the one Plex's TV apps use). Nothing is typed with the remote.
+2. The launcher asks plex.tv for the account's servers (its own first, then shared ones, at most three), then asks each for its Continue Watching hub (`/hubs/continueWatching/items`, or `/library/onDeck` on an older server). Movies and episodes are kept, newest first, 15 at most, with a picture and a progress bar. Each server is tried on the home network over plain HTTP first, then over Plex's HTTPS names; relays are never used.
+3. OK on a card (or a tap) launches the app chosen under **Open videos in** with Plex's launch link, `{"plex": {"server": "<machineIdentifier>", "ratingKey": "<key>", "action": "open"}}`, which [PlxNative documents](https://github.com/plxnative/plx-native/blob/main/docs/launch-links.md) for launchers like this. It lands on the title's page. The launcher closes the app first and then starts it, because on webOS 6 an app that is already running never reads new launch parameters. The official Plex app has no documented link, so it only starts.
+
+- The token is saved in `/media/developer/tvlauncher/plex.json` (mode 600), with the id this TV gave itself. The list and pictures are cached (`cache/plex.json`, `cache/plex-*.img`), so the row shows at once and also when the server is asleep: like Jellyfin, the launcher never wakes it. **Sign out** deletes the login and the cache here; the token stays valid at Plex until you remove the device under *Authorized devices* in your account settings on plex.tv.
+- **Open videos in** lists the installed apps whose id or name contains "plex" or "plx". The default is PlxNative (`com.beb.plxnative`) when it is installed, else any Plex app.
+- HTTPS goes through the TV's `curl`, like Jellyfin and YouTube. The row is refreshed whenever Home starts or comes to the front.
 
 ## Hiding and moving apps
 
@@ -167,4 +181,4 @@ Without it the app manager restarts the launcher on every Home key. With a file 
 
 ## Not done
 
-- Plex rows (Plex is being retired, so Jellyfin only), a screensaver, more Settings. Nothing of the YouTube row has run on the TV, and a signed-in answer has never been seen (see Verified). The debloat has not run on the TV: whether the stubs and the stopped services leave Netflix, YouTube and Jellyfin playback working is unchecked.
+- A screensaver, more Settings. Nothing of the YouTube row has run on the TV, and a signed-in answer has never been seen (see Verified). The debloat has not run on the TV: whether the stubs and the stopped services leave Netflix, YouTube and Jellyfin playback working is unchecked.

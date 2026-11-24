@@ -51,6 +51,8 @@ pub struct Item {
     pub cover: bool,
     /// LG's flag: the app can be uninstalled (not a system app).
     pub removable: bool,
+    /// Close the app before launching it, for an app that only reads its launch parameters at start.
+    pub restart: bool,
     pub hidden: bool,
     pub moving: bool,
     pub tv_index: usize,
@@ -91,6 +93,7 @@ impl Item {
             tv_index: 0,
             icon_tried: false,
             removable: false,
+            restart: false,
             icon: None,
             icon_src: None,
             label: None,
@@ -241,22 +244,28 @@ impl Luna {
         }
         // The app manager starts Home afresh on the Home key, so the focus survives in a file.
         let _ = std::fs::write(FOCUS_FILE, &it.key);
-        let child = Command::new("/usr/bin/luna-send")
-            .args([
-                "-n",
-                "1",
-                "-w",
-                "5000",
-                "luna://com.webos.applicationManager/launch",
-                &req.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(mut c) = child {
-            std::thread::spawn(move || drop(c.wait()));
-        }
+        let close = it.restart.then(|| json!({ "id": it.id }).to_string());
+        let req = req.to_string();
+        std::thread::spawn(move || {
+            let call = |method: &str, body: &str| {
+                drop(
+                    Command::new("/usr/bin/luna-send")
+                        .args(["-n", "1", "-w", "5000"])
+                        .arg(format!("luna://com.webos.applicationManager/{method}"))
+                        .arg(body)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status(),
+                )
+            };
+            if let Some(body) = close {
+                call("closeByAppId", &body);
+                // PlxNative measured 600 ms as enough for the close to finish.
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }
+            call("launch", &req);
+        });
     }
 }
 
@@ -367,6 +376,7 @@ pub struct Prefs {
     pub jf_server: Option<String>,
     /// The app that opens a Jellyfin item.
     pub jf_app: Option<String>,
+    pub plex_app: Option<String>,
     /// Groups of LG's ads and telemetry kept off while this is Home (see `debloat.sh`).
     pub debloat: Vec<String>,
 }
@@ -399,6 +409,7 @@ impl Prefs {
             pinned: list("pinned"),
             jf_server: v["jfServer"].as_str().map(String::from),
             jf_app: v["jfApp"].as_str().map(String::from),
+            plex_app: v["plexApp"].as_str().map(String::from),
             debloat: list("debloat"),
             path,
         }
@@ -406,7 +417,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "debloat": self.debloat })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

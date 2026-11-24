@@ -3,7 +3,7 @@
 use crate::gfx::*;
 use crate::jellyfin::{self, Config, Qc};
 use crate::sdl::*;
-use crate::youtube;
+use crate::{plex, youtube};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -83,6 +83,15 @@ pub enum Signed {
     Jellyfin(Config),
     /// The tokens are saved in `youtube.json`.
     Youtube,
+    /// The token is saved in `plex.json`.
+    Plex,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Provider {
+    Jellyfin,
+    Youtube,
+    Plex,
 }
 
 #[derive(PartialEq)]
@@ -94,7 +103,7 @@ enum Step {
 }
 
 pub struct Login {
-    youtube: bool,
+    provider: Provider,
     step: Step,
     root: String,
     wake: u32,
@@ -130,7 +139,7 @@ impl Login {
     fn blank(g: &Gfx, root: &str, wake: u32, server: Option<String>) -> Login {
         let cancel = Arc::new(AtomicBool::new(false));
         Login {
-            youtube: false,
+            provider: Provider::Jellyfin,
             step: Step::Searching,
             root: root.to_string(),
             wake,
@@ -153,8 +162,16 @@ impl Login {
 
     pub fn youtube(g: &Gfx, root: &str, wake: u32) -> Login {
         let mut l = Login::blank(g, root, wake, None);
-        l.youtube = true;
+        l.provider = Provider::Youtube;
         l.title = g.text(g.f_label, "Sign in to YouTube", 0);
+        l.start(g, None, false);
+        l
+    }
+
+    pub fn plex(g: &Gfx, root: &str, wake: u32) -> Login {
+        let mut l = Login::blank(g, root, wake, None);
+        l.provider = Provider::Plex;
+        l.title = g.text(g.f_label, "Sign in to Plex", 0);
         l.start(g, None, false);
         l
     }
@@ -162,10 +179,18 @@ impl Login {
     fn start(&mut self, g: &Gfx, server: Option<String>, discover: bool) {
         self.cancel.store(true, Ordering::SeqCst);
         self.cancel = Arc::new(AtomicBool::new(false));
-        if self.youtube {
-            self.rx = youtube::device_flow(self.root.clone(), self.wake, self.cancel.clone());
-            self.step = Step::Searching;
-            return self.say(g, "Asking YouTube for a code...", None, None);
+        match self.provider {
+            Provider::Youtube => {
+                self.rx = youtube::device_flow(self.root.clone(), self.wake, self.cancel.clone());
+                self.step = Step::Searching;
+                return self.say(g, "Asking YouTube for a code...", None, None);
+            }
+            Provider::Plex => {
+                self.rx = plex::pin_flow(self.root.clone(), self.wake, self.cancel.clone());
+                self.step = Step::Searching;
+                return self.say(g, "Asking Plex for a code...", None, None);
+            }
+            Provider::Jellyfin => {}
         }
         self.rx = jellyfin::quick_connect(
             self.root.clone(),
@@ -194,7 +219,7 @@ impl Login {
     pub fn poll(&mut self, g: &Gfx) -> Option<Signed> {
         while let Ok(q) = self.rx.try_recv() {
             match q {
-                Qc::Code { code, server } if self.youtube => {
+                Qc::Code { code, server } if self.provider != Provider::Jellyfin => {
                     self.step = Step::Code;
                     let body = format!("On your phone or computer, go to {server} and enter this code:");
                     self.say(g, &body, Some(&code), Some("Waiting for you to enter it"));
@@ -219,6 +244,7 @@ impl Login {
                     self.say(g, &e, None, Some("OK to try again   Back to close"));
                 }
                 Qc::Done(cfg) => return Some(Signed::Jellyfin(cfg)),
+                Qc::Linked if self.provider == Provider::Plex => return Some(Signed::Plex),
                 Qc::Linked => return Some(Signed::Youtube),
             }
         }

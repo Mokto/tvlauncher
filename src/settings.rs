@@ -9,6 +9,8 @@ pub enum Act {
     Jellyfin,
     JfApp,
     Youtube,
+    Plex,
+    PlexApp,
     /// One group of `debloat.sh`.
     Debloat(&'static str),
     Boot,

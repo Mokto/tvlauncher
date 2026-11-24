@@ -27,7 +27,7 @@ const MAX_ITEMS: usize = 20;
 /// The feed is asked for at most this often, however often Home comes to the front.
 const MIN_AGE: u64 = 30 * 60;
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
@@ -187,12 +187,12 @@ fn scrape_client() -> Result<(String, String), String> {
     find_client(&String::from_utf8_lossy(&js)).ok_or_else(|| "the TV app's sign-in client was not found".to_string())
 }
 
-fn device_id() -> String {
+pub(crate) fn device_id() -> String {
     let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{:016x}{:08x}", t as u64 ^ 0x9e37_79b9_7f4a_7c15, std::process::id())
 }
 
-fn sleep_unless(cancel: &AtomicBool, secs: u64) -> bool {
+pub(crate) fn sleep_unless(cancel: &AtomicBool, secs: u64) -> bool {
     for _ in 0..secs * 4 {
         if cancel.load(Ordering::SeqCst) {
             return false;

@@ -80,6 +80,26 @@ for i, (title, sub, text, prog) in enumerate(watching):
     )
 json.dump({"items": items}, open(f"{OUT}/watching.json", "w"))
 
+plex = [
+    ("Salt Road", "S3 · E2 — Low Tide", "Two rival smugglers are forced to share a boat when the coast guard closes the harbour.", 0.33),
+    ("Paper Lanterns", "2022", "A retired lantern maker is asked to light one last festival.", 0.7),
+    ("Deep Field", "S1 · E6 — Signal", "The observatory picks up something that repeats every eleven minutes.", 0.1),
+]
+pitems = []
+for i, (title, sub, text, prog) in enumerate(plex):
+    pitems.append(
+        {
+            "server": "demoserver",
+            "ratingKey": str(300 + i),
+            "title": title,
+            "sub": f"{sub}\n{text}",
+            "progress": prog,
+            "card": save(art(20 + i, 640, 360), f"plex-c-demo-{300 + i}-1.img"),
+            "bg": save(art(20 + i, 1920, 1080), f"plex-b-demo-{300 + i}-1.img"),
+        }
+    )
+json.dump({"items": pitems}, open(f"{OUT}/plex.json", "w"))
+
 tube = [
     ("Slow Morning Coffee, Rain on the Window", "Quiet Hours", "1.2M views · 3 weeks ago"),
     ("Why Old Bridges Still Stand", "Structure Lab", "480K views · 5 days ago"),
@@ -107,6 +127,7 @@ json.dump(
 )
 for name, body in {
     "jellyfin.json": {"server": "http://127.0.0.1:9", "serverId": "demo", "userId": "demo", "user": "demo", "token": "demo"},
+    "plex.json": {"token": "demo", "clientId": "demo", "user": "demo"},
     "youtube.json": {"clientId": "demo", "clientSecret": "demo", "refreshToken": "demo", "accessToken": "demo", "expiresAt": 9999999999},
 }.items():
     fd = os.open(f"{ROOT}{DIR}/{name}", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
