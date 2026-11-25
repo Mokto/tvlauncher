@@ -605,6 +605,7 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
         return ExitCode::from(1);
     };
     let g = Gfx::new(root, ren, |name, size| crate::font(root, name, size));
+    set_font_root(root);
     let mut p = match Player::new() {
         Ok(p) => p,
         Err(e) => {

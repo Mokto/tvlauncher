@@ -4,6 +4,7 @@ use super::super::*;
 use crate::ff::demux::{Bitmap, SubEv, SubWhat};
 use crate::film::{self, Item, TICKS};
 use crate::subs::Cue;
+use std::ffi::c_int;
 
 pub enum Fk {
     Back,
@@ -278,9 +279,128 @@ impl Shown {
     }
 }
 
-/// A subtitle as one picture per line, so each can be centred.
+/// A subtitle as one picture per line, so each can be centred. A line the UI font has no glyphs for (Chinese,
+/// Arabic, ...) is drawn with another font of the TV that has them.
 pub fn lines(g: &Gfx, text: &str) -> Vec<Tex> {
-    text.lines().filter_map(|l| g.text(g.f_row, l, 0)).collect()
+    text.lines().filter_map(|l| g.text(font_for(g, l), l, 1700)).collect()
+}
+
+// ---- fonts for scripts the UI font lacks --------------------------------------------------------------------------
+
+struct Fonts {
+    /// The font files of the TV, and the ones opened so far.
+    files: Vec<std::path::PathBuf>,
+    open: Vec<(usize, *mut Opaque)>,
+}
+
+// The fonts are only touched by the main thread of the player process; the lock is for the static.
+unsafe impl Send for Fonts {}
+
+static FONTS: std::sync::Mutex<Option<Fonts>> = std::sync::Mutex::new(None);
+static FONT_ROOT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Where the TV's fonts are looked for (`<root>/usr/share/fonts`).
+pub fn set_font_root(root: &str) {
+    *FONT_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root.to_string();
+    let f = crate::font(root, "LG_Smart_UI-SemiBold.ttf", SUB_SIZE);
+    MAIN.store(f, Ordering::SeqCst);
+}
+
+/// Subtitles are bigger than the UI's text: they are read from the sofa.
+const SUB_SIZE: c_int = 44;
+static MAIN: std::sync::atomic::AtomicPtr<Opaque> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The font of subtitles: the UI font at `SUB_SIZE`, or the UI's row font where there is none (a desktop shot).
+fn main_font(g: &Gfx) -> *mut Opaque {
+    let f = MAIN.load(Ordering::SeqCst);
+    if f.is_null() {
+        g.f_row
+    } else {
+        f
+    }
+}
+
+/// `TTF_GlyphIsProvided`, looked up at run time: a library that lacks it only costs the fallback.
+fn glyph_fn() -> Option<unsafe extern "C" fn(*mut Opaque, u16) -> c_int> {
+    static F: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let p = (*F.get_or_init(|| {
+        let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"TTF_GlyphIsProvided".as_ptr()) };
+        (!p.is_null()).then_some(p as usize)
+    }))?;
+    Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut Opaque, u16) -> c_int>(p) })
+}
+
+fn font_files(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if p.is_dir() && depth < 3 {
+            font_files(&p, depth + 1, out);
+        } else if (name.ends_with(".ttf") || name.ends_with(".otf") || name.ends_with(".ttc"))
+            && !name.starts_with("LG_Smart_UI")
+            && !["Bold", "Italic", "Light", "Thin", "Black"]
+                .iter()
+                .any(|w| name.contains(w))
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// How many of `chars` the font has.
+fn coverage(f: *mut Opaque, has: unsafe extern "C" fn(*mut Opaque, u16) -> c_int, chars: &[u16]) -> usize {
+    chars.iter().filter(|c| unsafe { has(f, **c) } != 0).count()
+}
+
+/// The font to draw `line` with: the UI font when it has every glyph, else the font of the TV with the most.
+fn font_for(g: &Gfx, line: &str) -> *mut Opaque {
+    let main = main_font(g);
+    let Some(has) = glyph_fn() else { return main };
+    let chars: Vec<u16> = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .filter_map(|c| u16::try_from(c as u32).ok())
+        .collect();
+    let base = coverage(main, has, &chars);
+    if base == chars.len() {
+        return main;
+    }
+    let mut guard = FONTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fonts = guard.get_or_insert_with(|| {
+        let root = FONT_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut files = vec![];
+        font_files(std::path::Path::new(&format!("{root}/usr/share/fonts")), 0, &mut files);
+        files.truncate(40);
+        Fonts { files, open: vec![] }
+    });
+    let (mut best, mut best_n) = (main, base);
+    for i in 0..fonts.files.len() {
+        let cached = fonts.open.iter().find(|o| o.0 == i).map(|o| o.1);
+        let f = match cached {
+            Some(f) => f,
+            None => {
+                let f = unsafe { TTF_OpenFont(cstr(&fonts.files[i].to_string_lossy()).as_ptr(), SUB_SIZE) };
+                fonts.open.push((i, f));
+                f
+            }
+        };
+        if f.is_null() {
+            continue;
+        }
+        let n = coverage(f, has, &chars);
+        if n > best_n {
+            (best, best_n) = (f, n);
+        }
+        if best_n == chars.len() {
+            break;
+        }
+    }
+    best
 }
 
 // ---- the track menu -----------------------------------------------------------------------------------------------
