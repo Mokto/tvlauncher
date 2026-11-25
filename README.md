@@ -2,7 +2,7 @@
 
 **An Android TV-style Home screen for rooted LG TVs. Native, not another web wrapper.**
 
-Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher is a single native program, written in Rust, that draws straight onto the TV's own SDL2 and OpenGL ES libraries. There is no browser, no Node.js and no web view in the path: the whole thing is a binary of about 1.6 MB that uses about 40 MB of memory on Home. It starts as Home in a fraction of a second, and it has no page to load or script engine to warm up.
+Most custom launchers for webOS are web pages in LG's browser engine. tvlauncher is a single native program, written in Rust, that draws straight onto the TV's own SDL2 and OpenGL ES libraries. There is no browser, no Node.js and no web view in the path: the whole thing is a binary of about 1.8 MB (plus 1.5 MB of FFmpeg libraries for the film player) that uses about 40 MB of memory on Home. It starts as Home in a fraction of a second, and it has no page to load or script engine to warm up.
 
 ![Home screen: a hero with title and description, a Continue watching row and a Recommended on YouTube row, all made-up demo content](docs/home.png)
 
@@ -71,17 +71,6 @@ Each film, series or collection library of the signed-in user gets a tab after H
 
 Tabs appear at the top once there is more than Home: the Jellyfin libraries, the Plex ones, then **Live TV** when live TV is set up. Up from the first row reaches them, Left and Right switch tabs (Right past the last one reaches the cog), and Back on a tab returns to its start and then to Home. Settings → **Tabs** lists them with a switch each; OK on one offers *Hide* or *Show*, *Rename*, *Move left* and *Move right*. *Rename* takes a name on the on-screen keyboard; an empty one puts the library's own name back. The order, the hidden tabs and the names given are kept in `state.json`, by library id, so renaming a library on the server keeps its place.
 
-### Playing in the launcher (experimental)
-
-Settings → *Jellyfin* → **Play in the launcher** (off by default) makes OK on a title, in a library tab or in Continue watching, play it with the launcher's own player instead of opening the Jellyfin app. A series plays its next episode (else its first); a collection, or anything the player cannot start, still opens in the app.
-
-- **A process of its own.** The launcher starts itself as `tvlauncher --film <item id>` and waits. That process opens its own window and LG's player, so a crash during a film takes down only the player: Home keeps running, and its memory is freed when the film ends. Back ends the film and brings Home back; the Home key does too (the launcher registers with the app manager the first time it plays something, so the key arrives as a message, and it stops the player first so the server hears where you stopped).
-- **No transcoding on the TV, and none on the server for most films.** The server remuxes the title to MPEG-TS HLS (`/Videos/<id>/master.m3u8`, H.264 and H.265 copied as they are, audio the TV cannot decode converted to AC-3), which the player already reads for Live TV. The server's CPU cost is a repackaging, not an encode, but a codec the TV cannot decode (AV1, VP9) is transcoded by the server.
-- **Controls:** OK pauses and resumes; Left and Right seek by 10 seconds (the rewind and fast-forward buttons by 30); a seek restarts the stream at the new place, so it takes a moment. Up shows the bar. **Down opens the track menu**: text subtitles (SRT, which Jellyfin converts every text track to) and audio tracks. A new audio track restarts the stream.
-- **Resume and progress:** a film resumes from its saved place (between 30 seconds in and 95 %); the server is told when it starts, every 10 seconds, on pause and when it stops, so it shows in Continue watching and gets its watched mark.
-- **Not there:** picture subtitles (PGS, VobSub: the server would have to burn them into the video), Dolby Vision (the server may fall back to HDR10), playing the next episode by itself, the chapter list. Plex titles still open in PlxNative.
-- **Testing:** `cargo test --release` covers the item parsing, the series resolution (against a small local server), the stream address, the progress reports and the subtitle parser. `tvlauncher --film-shot out.bmp` (and `--film-menu-shot`) draw the controls and the track menu on a desktop. On the TV, writing `film:<item id>` to `/tmp/tvlauncher-spawn` starts a film from SSH, and `/tmp/tvlauncher-player.log` is the player's log.
-
 ## Plex
 
 A **Continue watching on Plex** row with what your Plex account is in the middle of, from its own servers.
@@ -95,6 +84,21 @@ A **Continue watching on Plex** row with what your Plex account is in the middle
 - **Continue watching**, a switch under Settings → *Plex*, hides the row from Home (on by default); the library tabs stay.
 - HTTPS goes through the TV's `curl`, like Jellyfin and YouTube. The row is refreshed whenever Home starts or comes to the front.
 - **Library tabs:** the film and show libraries of the account's own servers get tabs too, shown exactly like [Jellyfin's](#library-tabs) (shared servers are left out: they would add tabs nobody asked for and fetch whole libraries over the internet). The lists come from `/library/sections` and each section's `/all`, over the address the server answered on, and the pictures from the server's `/photo/:/transcode`. They are cached as `cache/plib-*`; `cache/plib-views.json` also holds the server's address and token for the pictures, so it is mode 600. Tabs keep the library's name; when Jellyfin and Plex both have a *Movies*, rename one in Settings → **Tabs**. OK opens the title in PlxNative with the launch link above. When a server doesn't answer, its tabs stay with the cached lists. Sign-out deletes them.
+
+## Playing films
+
+Settings → *Player* → **Play in the launcher** (off by default; it shows once Jellyfin or Plex is signed in) makes OK on a title, in a library tab or in Continue watching, play it with the launcher's own player instead of opening Native Jelly or PlxNative. A series plays its next episode (else its first); a collection, and anything the player cannot start, still opens in the app.
+
+- **A process of its own.** The launcher starts itself as `tvlauncher --film <item>` and waits. That process opens its own window and LG's player, so a crash during a film takes down only the player: Home keeps running, and the player's memory is freed when the film ends. Back ends the film and brings Home back; the Home key does too (the launcher registers with the app manager the first time it plays something, so the key arrives as a message, and it stops the player first so the server hears where you stopped).
+- **The file is played as it is.** The player reads the Matroska or MP4 file of the title over HTTP with the TV's `curl` (byte ranges: it needs a server that does ranges, as Jellyfin and Plex do), cuts it into H.264 or H.265 pictures and audio frames with FFmpeg, and feeds LG's decoder the same way it does for a channel. Nothing is transcoded: the server only sends the file. FFmpeg is three libraries in `lib/` (about 1.5 MB, LGPL, see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)), loaded at run time; without them every film is converted by the server, as below.
+- **Audio:** AAC, AC-3 and E-AC-3 (Atmos included) go to the TV as they are. TrueHD, FLAC, ALAC, Vorbis and PCM are decoded and sent as AC-3 (5.1 at most; 7.1 is folded into 5.1), which costs the TV about 14 % of one core for TrueHD 7.1 in Native Jelly's measurement. The audio menu (Down) lists every track.
+- **Subtitles:** text tracks (SRT, ASS, MOV text, WebVTT) are shown without their styling (a line placed at the top stays at the top), picture tracks (PGS from Blu-rays, DVD VobSub, DVB) are drawn as the bitmaps they are, and subtitle files beside the video (which only the server has) are fetched. ASS styling (fonts, colours, positions, karaoke) is not drawn.
+- **Dolby Vision and HDR10:** a Dolby Vision profile 5 or 8 stream is declared to LG's player as Dolby Vision on a TV that reports support; HDR10 needs nothing. A profile 7 disc (a UHD Blu-ray remux) plays its HDR10 picture: the enhancement layer and the Dolby metadata are dropped.
+- **What the server converts:** a file the TV cannot decode as it is (10-bit H.264, VP9 and AV1 films, DTS or Opus audio, a server without byte ranges, FFmpeg missing) is played through the server's HLS transcode, the way Live TV reads a channel. The server copies H.264 and H.265 and converts the audio to AC-3, so the cost on the server is usually small, but an AV1 or VP9 picture is a real transcode. Picking a DTS track in the audio menu moves the film to the server from there; picture subtitles are not available in that mode.
+- **Controls:** OK pauses and resumes; Left and Right seek by 10 seconds (the rewind and fast-forward buttons by 30); Up shows the bar; Down opens the track menu. A seek starts the player again at the new place, on the keyframe at or before it, so it takes about a second and can land a few seconds early.
+- **Resume and progress:** a film resumes from its saved place (between 30 seconds in and 95 %). The server is told when it starts, every 10 seconds, on pause and when it stops (Jellyfin's session reports; Plex's timeline, with a watched mark at the end), so it shows in Continue watching.
+- **Not there:** chapters, skipping intros, playing the next episode by itself, thumbnails while seeking, passing DTS through to a sound bar (the TV cannot decode DTS, and the passthrough Native Jelly has is not built), HDR10+ metadata, 3D.
+- **Checked without a TV:** `cargo test --release` covers the NAL and ADTS framing, the audio mix, the subtitle parsers, the queue, the title parsing for both servers and the stream addresses. `tvlauncher --direct <url> [seconds [audio [subtitle]]]` reads a file the way the player does and counts what comes out, which is how Matroska and MP4 files with H.264, H.265, AC-3, E-AC-3, AAC, FLAC and TrueHD audio and SRT and ASS subtitles were tried against a local server. `--film-shot out.bmp` and `--film-menu-shot` draw the controls and the track menu. What only the TV can show, and has not been checked: that LG's decoder accepts these streams, seeking, Dolby Vision, picture subtitles, and the Home key during a film. On the TV, writing `film:<item>` (a Jellyfin id, or `plex:<server>:<rating key>`) to `/tmp/tvlauncher-spawn` starts a film from SSH, and `/tmp/tvlauncher-player.log` is the player's log.
 
 ## Hiding and moving apps
 
@@ -207,7 +211,7 @@ Without it the app manager restarts the launcher on every Home key. With a file 
 
 - It is built with `-Zbuild-std`, `target-cpu=cortex-a9` and NEON off ([.cargo/config.toml](.cargo/config.toml)), as Native Jelly does. The precompiled std for `arm-unknown-linux-gnueabi` emits the ARMv6 CP15 barrier (`mcr p15`), which is undefined on the C1's Cortex-A53 and raises SIGILL. `objdump -d` of the result must show no `p15`. Do not set `RUSTFLAGS`: it replaces the flags in the config file.
 - The NDK links against glibc 2.12, which has no `getauxval` (std calls it when it starts a thread), so [src/compat.rs](src/compat.rs) supplies one. [tools/arm-gcc](tools/arm-gcc) is the linker: the NDK gcc has no default sysroot.
-- The binary is about 1.6 MB (the C version was 50 KB, with std statically linked).
+- The binary is about 1.8 MB (the C version was 50 KB, with std statically linked).
 
 ## Testing
 

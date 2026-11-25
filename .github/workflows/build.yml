@@ -65,6 +65,17 @@ jobs:
           tar xjf /tmp/ndk.tar.bz2 -C ~/webos-ndk
           (cd ~/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot && ./relocate-sdk.sh)
 
+      - name: FFmpeg for the TV (cached)
+        id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-arm
+          key: ffmpeg-arm-${{ hashFiles('tools/build-ffmpeg.sh') }}
+
+      - name: FFmpeg for the TV (build)
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: sh tools/build-ffmpeg.sh arm
+
       - name: Rust nightly with rust-src
         run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
 
@@ -85,7 +96,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tvlauncher-webos-arm
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/ffmpeg-*.tar.xz
 
       - name: Publish the release
         if: env.TAG != ''
@@ -95,7 +108,7 @@ jobs:
           pre=--prerelease
           case "$TAG" in v[1-9]*) [ "${TAG#*-}" = "$TAG" ] && pre="" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+            gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/ffmpeg-*.tar.xz --clobber
           else
-            gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 $pre --generate-notes --title "$TAG"
+            gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/ffmpeg-*.tar.xz $pre --generate-notes --title "$TAG"
           fi

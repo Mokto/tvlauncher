@@ -258,8 +258,8 @@ table! {
     fn av_dict_get(*const AVDictionary, *const c_char, *const AVDictionaryEntry, c_int) -> *const AVDictionaryEntry;
 }
 
-/// Where the libraries are looked for: `FFMPEG_DIR`, then `lib/` beside the program (the package), then the
-/// desktop build `build/ffmpeg-host` (`tools/build-ffmpeg.sh host`).
+/// Where the libraries are looked for: `FFMPEG_DIR`, then `lib/` beside the program and in the install folder (the
+/// package), then the desktop build `build/ffmpeg-host` (`tools/build-ffmpeg.sh host`).
 fn dirs() -> Vec<PathBuf> {
     let mut v = vec![];
     if let Some(d) = std::env::var_os("FFMPEG_DIR") {
@@ -271,6 +271,8 @@ fn dirs() -> Vec<PathBuf> {
     {
         v.push(d);
     }
+    // The program runs as a bind mount over LG's Home program, so its own path says nothing of where it came from.
+    v.push(PathBuf::from(format!("{}/lib", crate::data::DIR)));
     v.push(PathBuf::from("build/ffmpeg-host"));
     v
 }

@@ -1139,7 +1139,8 @@ unsafe fn run(
                     base = Some(pts);
                     alive = q.push(Feed::Base(pts));
                 }
-                if let (Some(b), true) = (base, alive && !au_buf.is_empty()) {
+                // Pictures that come before the keyframe on screen lean on frames that were skipped.
+                if let (Some(b), true) = (base, alive && !au_buf.is_empty() && pts >= base.unwrap_or(0)) {
                     videos += 1;
                     alive = q.push(Feed::Au(Au {
                         video: true,
@@ -1245,6 +1246,13 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
         Ok(a) => a,
         Err(e) => return println!("refused: {e}"),
     };
+    if std::env::var_os("FF_INTERRUPT").is_some() {
+        // A run cut off in the middle (a seek while reading), then another from somewhere else.
+        let first = d.start(0, a, None);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(first);
+        println!("first run cut");
+    }
     let run = d.start(at_s * 1_000_000_000, a, sub.map(|s| s as i32));
     let t = std::time::Instant::now();
     let (mut v, mut au, mut keys, mut subs, mut last_v, mut last_a) = (0, 0, 0, 0, 0i64, 0i64);

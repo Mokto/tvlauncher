@@ -24,10 +24,19 @@ shot: fixtures/luna/listLaunchPoints.json
 fixtures/luna/listLaunchPoints.json:
 	sh tools/pull-fixtures.sh $(TV)
 
-deploy: arm
-	ssh $(TV) 'mkdir -p $(DEST) && rm -f $(DEST)/tvlauncher.new'
+# The FFmpeg libraries of the film player (LGPL, built from FFmpeg's own source; see tools/build-ffmpeg.sh).
+FFMPEG_ARM = build/ffmpeg-arm/libavformat-plx.so.63
+$(FFMPEG_ARM):
+	sh tools/build-ffmpeg.sh arm
+
+ffmpeg-host:
+	sh tools/build-ffmpeg.sh host
+
+deploy: arm $(FFMPEG_ARM)
+	ssh $(TV) 'mkdir -p $(DEST)/lib && rm -f $(DEST)/tvlauncher.new'
 	scp $(ARM_BIN) $(TV):$(DEST)/tvlauncher.new
 	scp takeover.sh debloat.sh boot.sh $(TV):$(DEST)/
+	scp build/ffmpeg-arm/*.so.* $(TV):$(DEST)/lib/
 	ssh $(TV) 'chmod 755 $(DEST)/tvlauncher.new && mv $(DEST)/tvlauncher.new $(DEST)/tvlauncher'
 
 # The ARM build under QEMU, without a TV (needs Docker).
@@ -45,10 +54,12 @@ off: ; ssh $(TV) sh $(DEST)/takeover.sh off
 # A package for people without the toolchain: the prebuilt binary, the scripts and install.sh.
 VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 PKG     = tvlauncher-$(VERSION)-webos-arm
-release: arm
-	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)
-	cp $(ARM_BIN) takeover.sh debloat.sh boot.sh install.sh LICENSE README.md dist/$(PKG)/
+release: arm $(FFMPEG_ARM)
+	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)/lib
+	cp $(ARM_BIN) takeover.sh debloat.sh boot.sh install.sh LICENSE README.md THIRD-PARTY-NOTICES.md dist/$(PKG)/
+	cp build/ffmpeg-arm/*.so.* dist/$(PKG)/lib/
+	cp build/ffmpeg-*.tar.xz dist/ 2>/dev/null || true
 	tar -C dist -czf dist/$(PKG).tar.gz $(PKG)
 	cd dist && shasum -a 256 $(PKG).tar.gz > $(PKG).tar.gz.sha256 && cat $(PKG).tar.gz.sha256
 
-.PHONY: arm sim shot deploy release qemu on off boot unboot
+.PHONY: arm sim shot deploy release qemu on off boot unboot ffmpeg-host
