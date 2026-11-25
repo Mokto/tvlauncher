@@ -28,9 +28,9 @@ http.createServer((req, res) => {
   const u = req.url.split('?')[0];
   const json = (o) => { const b = JSON.stringify(o); res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b); };
   let m;
-  if ((m = /^\/Users\/u1\/Items\/(\w+)$/.exec(u)) && fs.existsSync(fileOf(m[1]))) return json(Object.assign(item(m[1], m[1] === 'm1' ? 'The Test Film' : 'Test ' + m[1]), over(m[1])));
+  if ((m = /^\/Users\/u1\/Items\/([\w-]+)$/.exec(u)) && fs.existsSync(fileOf(m[1]))) return json(Object.assign(item(m[1], m[1] === 'm1' ? 'The Test Film' : 'Test ' + m[1]), over(m[1])));
   if (/^\/MediaSegments\/\w+$/.test(u)) return json({ Items: [{ Type: 'Intro', StartTicks: 20000000, EndTicks: 80000000 }, { Type: 'Outro', StartTicks: 270000000, EndTicks: 300000000 }] });
-  if (/^\/Videos\/\w+\/Trickplay\/320\/0\.jpg$/.test(u)) {
+  if (/^\/Videos\/[\w-]+\/Trickplay\/320\/0\.jpg$/.test(u)) {
     const b = fs.readFileSync(path.join(dir, 'tile.jpg')); console.log('TILE', u);
     res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': b.length }); return res.end(b);
   }
@@ -41,11 +41,11 @@ http.createServer((req, res) => {
     const b = '1\n00:00:08,000 --> 00:00:12,000\nSidecar subtitle\n';
     res.writeHead(200, { 'Content-Length': b.length }); return res.end(b);
   }
-  if ((m = /^\/Videos\/(\w+)\/stream$/.exec(u)) && fs.existsSync(fileOf(m[1]))) {
+  if ((m = /^\/Videos\/([\w-]+)\/stream$/.exec(u)) && fs.existsSync(fileOf(m[1]))) {
     const file = fileOf(m[1]);
-    const st = fs.statSync(file); const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
-    if (!m) { res.writeHead(200, { 'Content-Length': st.size, 'Accept-Ranges': 'bytes' }); return fs.createReadStream(file).pipe(res); }
-    const a = +m[1], b = m[2] ? Math.min(+m[2], st.size - 1) : st.size - 1;
+    const st = fs.statSync(file); const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
+    if (!rg) { res.writeHead(200, { 'Content-Length': st.size, 'Accept-Ranges': 'bytes' }); return fs.createReadStream(file).pipe(res); }
+    const a = +rg[1], b = rg[2] ? Math.min(+rg[2], st.size - 1) : st.size - 1;
     console.log('RANGE', a, b);
     res.writeHead(206, { 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Content-Length': b - a + 1 });
     return fs.createReadStream(file, { start: a, end: b }).pipe(res);

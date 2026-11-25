@@ -3,6 +3,7 @@ use crate::sdl::{log, Event, SDL_PushEvent};
 use std::ffi::{c_int, CStr};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const CRASH_FILE: &CStr = c"/tmp/tvlauncher-crashes";
@@ -78,7 +79,7 @@ pub fn register(wake: u32) {
         let Ok(mut child) = child else {
             return log("register: luna-send did not start");
         };
-        let mut registered = false;
+        let mut registered: Option<Instant> = None;
         for line in BufReader::new(child.stdout.take().expect("piped"))
             .lines()
             .map_while(Result::ok)
@@ -88,15 +89,19 @@ pub fn register(wake: u32) {
                 return;
             }
             if line.contains("\"registered\"") {
-                registered = true;
+                registered = Some(Instant::now());
             } else if line.contains("\"relaunch\"") {
+                // The app manager answers the registration itself with a relaunch (seen on the TV): not the Home key.
+                if registered.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    continue;
+                }
                 RELAUNCH.store(true, Ordering::SeqCst);
                 unsafe { SDL_PushEvent(&mut Event::new(wake)) };
             } else if line.contains("\"close\"") {
                 std::process::exit(0);
             }
         }
-        if registered {
+        if registered.is_some() {
             log("register: the app manager went away");
             std::process::exit(0);
         }

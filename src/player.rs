@@ -812,7 +812,11 @@ pub fn child(url: &str) -> ExitCode {
 pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
     let exe = std::env::current_exe().unwrap_or_default();
     let t = Instant::now();
-    let mut child = match std::process::Command::new(&exe).args(args).spawn() {
+    // Its own app id: while the player's window carries Home's id the app manager takes Home to be in front already and
+    // the Home key does nothing (checked on the TV); with another id the key launches Home, which arrives as a relaunch.
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env("APPID", "tvlauncher.player");
+    let mut child = match cmd.args(args).spawn() {
         Ok(c) => c,
         Err(e) => {
             log(&format!("player: {}: {e}", exe.display()));
@@ -825,6 +829,7 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
         args.first().unwrap_or(&"")
     ));
     // Only a registered Home hears the Home key (as a relaunch) while another window is in front.
+    crate::lifecycle::RELAUNCH.store(false, Ordering::SeqCst);
     crate::lifecycle::register(wake);
     let mut asked: Option<Instant> = None;
     let status = loop {

@@ -29,7 +29,7 @@ mkdir -p "$OUT"
 tv() { ssh -o ConnectTimeout=8 $TVJUMP root@"$TVHOST" "$@" </dev/null; }
 # shellcheck disable=SC2086
 send() { scp -q $TVJUMP "$@"; }
-luna() { tv "luna-send -n 1 -w ${3:-4000} luna://$1 '$2'"; }
+luna() { tv "luna-send -n 1 -w ${3:-4000} luna://$1 '$2' </dev/null"; }
 
 status() {
   tv 'luna-send -n 1 -w 3000 luna://com.webos.service.tvpower/power/getPowerState "{}" </dev/null; luna-send -n 1 -w 3000 luna://com.webos.applicationManager/getForegroundAppInfo "{}" </dev/null; for p in $(pidof com.webos.app.home); do tr "\0" " " </proc/$p/cmdline | cut -c1-60; grep VmRSS /proc/$p/status; done; df -h /media/developer | tail -1; head -3 /tmp/tvlauncher.log; ls '"$DEST"'/lib'
@@ -112,11 +112,16 @@ fake() {
 }
 
 state() {
+  # merges the JSON into the TV's own state.json (kept once as state.json.bak) and restarts the launcher to read it
   if [ "$1" = restore ]; then
     tv "[ -f /media/developer/state.json.bak ] && mv /media/developer/state.json.bak $DEST/state.json; true"
   else
-    tv "[ -f /media/developer/state.json.bak ] || cp $DEST/state.json /media/developer/state.json.bak 2>/dev/null; printf '%s' '$1' > $DEST/state.json"
+    printf '%s' "$1" > "$OUT/patch.json"
+    send "$OUT/patch.json" root@"$TVHOST":/tmp/tvtest-patch.json
+    tv "[ -f /media/developer/state.json.bak ] || cp $DEST/state.json /media/developer/state.json.bak 2>/dev/null; python -c 'import json; d = json.load(open(\"/media/developer/state.json.bak\")); d.update(json.load(open(\"/tmp/tvtest-patch.json\"))); json.dump(d, open(\"$DEST/state.json\", \"w\"))'"
   fi
+  tv "rm -f /tmp/tvlauncher-crashes; sh $DEST/takeover.sh off; sh $DEST/takeover.sh on" >/dev/null
+  sleep 6
 }
 
 shot() {
@@ -158,7 +163,7 @@ real() {
   id=$(python3 -c "import json; d=json.load(open('$OUT/catalog.json'))['$1']; print(d['id'], d['source'], d['name'])")
   set -- $id
   echo "== $1 ($3 ...)"
-  tv "$DEST/tvlauncher --direct '$(f server)/Videos/$1/stream?static=true&MediaSourceId=$2&api_key=$(f token)' 0 2>&1 | cut -c1-230"
+  tv "timeout -t ${SECS:-25} $DEST/tvlauncher --direct '$(f server)/Videos/$1/stream?static=true&MediaSourceId=$2&api_key=$(f token)' 0 2>&1 | cut -c1-230"
 }
 
 reset() { node_off fake-media; node_off range-server; fake off; state restore; }

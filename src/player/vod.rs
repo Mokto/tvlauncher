@@ -540,6 +540,7 @@ impl Player {
                 }
                 (Some(Fk::Toggle | Fk::Pause), false) if clock.running() || paused => {
                     paused = !paused;
+                    log(&format!("film: {} at {} s", if paused { "paused" } else { "resumed" }, pos / TICKS));
                     if paused {
                         unsafe { (smp.pause)(smp.obj) };
                         clock.hold();
@@ -563,6 +564,7 @@ impl Player {
                 _ => {}
             }
             if let Some((to, _)) = seek.filter(|s| s.1.elapsed() > Duration::from_millis(600)) {
+                log(&format!("film: seek from {} s to {to} s", pos / TICKS));
                 smp.retire();
                 return Vod::Seek(to * TICKS);
             }
