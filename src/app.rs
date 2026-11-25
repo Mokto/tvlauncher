@@ -167,6 +167,8 @@ pub struct App {
     px_pending: bool,
     /// Set while an app is being uninstalled; the app list is read again when it ends.
     rm_rx: Option<Receiver<()>>,
+    /// First paint on the TV: apps and inputs are fetched on a thread.
+    luna_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>,
     bgl: Background,
     jf: Option<Jelly>,
     yt: Option<Yt>,
@@ -240,6 +242,7 @@ impl App {
             yt_pending: false,
             px_pending: false,
             rm_rx: None,
+            luna_rx: None,
             bgl,
             jf,
             yt: None,
@@ -285,7 +288,14 @@ impl App {
         if let Some(cfg) = iptv::Config::load(&app.luna.root) {
             app.start_tv(cfg, false);
         }
-        app.load();
+        if app.luna.root.is_empty() {
+            app.luna_rx = Some(data::fetch_launch_lists(app.luna.clone()));
+            app.loaded_at = unsafe { SDL_GetTicks() };
+            app.refocus(None, 0);
+            app.settle();
+        } else {
+            app.load();
+        }
         app.pick_home_bg(true);
         app
     }
@@ -718,11 +728,15 @@ impl App {
     }
 
     fn load(&mut self) {
-        self.rows[APPS].items = data::apps(&self.luna);
+        self.apply_launch_lists(data::launch_lists(&self.luna));
+    }
+
+    fn apply_launch_lists(&mut self, (apps, inputs): (Vec<Item>, Vec<Item>)) {
+        self.rows[APPS].items = apps;
         self.rows[PINNED].items.clear();
         self.pool.clear();
         self.rebuild_apps();
-        self.rows[INPUTS].items = data::inputs(&self.luna);
+        self.rows[INPUTS].items = inputs;
         self.hero_key = None;
         self.refocus(None, self.rows[self.cur_row].col);
         for r in &mut self.rows {
@@ -739,6 +753,7 @@ impl App {
             }
         }
         self.settle();
+        self.loaded_at = unsafe { SDL_GetTicks() };
         log(&format!(
             "{} watching, {} apps, {} inputs",
             self.rows[WATCH].items.len(),
@@ -882,6 +897,12 @@ impl App {
         if self.rm_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
             self.rm_rx = None;
             self.load();
+        }
+        if let Some(rx) = &self.luna_rx {
+            if let Ok(bytes) = rx.try_recv() {
+                self.luna_rx = None;
+                self.apply_launch_lists(data::lists_from_bytes(&bytes.0, &bytes.1));
+            }
         }
         while let Some(list) = self.px.as_ref().and_then(|p| p.res.try_recv().ok()) {
             self.px_pending = false;

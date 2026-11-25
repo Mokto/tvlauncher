@@ -167,29 +167,33 @@ pub fn set_boot(root: &str, on: bool) {
     }
 }
 
+#[derive(Clone)]
 pub struct Luna {
     pub root: String,
 }
 
+const APPS_URI: &str = "luna://com.webos.applicationManager/listLaunchPoints";
+const INPUTS_URI: &str = "luna://com.webos.service.eim/getAllInputStatus";
+
 impl Luna {
-    /// No shell is involved, so ids and params need no quoting.
-    pub fn call(&self, uri: &str) -> Option<Value> {
-        let out = if self.root.is_empty() {
-            let o = Command::new("/usr/bin/luna-send")
+    /// Raw reply from a luna call, or a fixture file in the simulator.
+    pub fn fetch(&self, uri: &str) -> Vec<u8> {
+        if self.root.is_empty() {
+            Command::new("/usr/bin/luna-send")
                 .args(["-n", "1", "-w", "5000", uri, "{}"])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
-                .ok()?;
-            o.stdout
+                .map(|o| o.stdout)
+                .unwrap_or_default()
         } else {
-            std::fs::read(format!("{}/luna/{}.json", self.root, uri.rsplit('/').next()?)).ok()?
-        };
-        let v = serde_json::from_slice(&out).ok();
-        if v.is_none() {
-            crate::sdl::log(&format!("{uri}: no reply"));
+            std::fs::read(format!(
+                "{}/luna/{}.json",
+                self.root,
+                uri.rsplit('/').next().unwrap_or("")
+            ))
+            .unwrap_or_default()
         }
-        v
     }
 
     /// Asks the app installer to remove an app, then waits (up to 60 s) until it is gone from the launch points.
@@ -294,8 +298,46 @@ fn id_of(o: &Value) -> String {
     s(o, "id").unwrap_or_default()
 }
 
-pub fn apps(luna: &Luna) -> Vec<Item> {
-    let j = luna.call("luna://com.webos.applicationManager/listLaunchPoints");
+/// Apps and inputs from the bus. On the TV the two luna calls run together.
+pub fn launch_lists(luna: &Luna) -> (Vec<Item>, Vec<Item>) {
+    if !luna.root.is_empty() {
+        return lists_from_bytes(&luna.fetch(APPS_URI), &luna.fetch(INPUTS_URI));
+    }
+    let luna2 = luna.clone();
+    let (apps, inputs) = std::thread::scope(|s| {
+        let t1 = s.spawn(|| luna.fetch(APPS_URI));
+        let t2 = s.spawn(|| luna2.fetch(INPUTS_URI));
+        (t1.join().unwrap_or_default(), t2.join().unwrap_or_default())
+    });
+    lists_from_bytes(&apps, &inputs)
+}
+
+/// Turns raw luna replies into items on the main thread (items carry SDL textures).
+pub fn lists_from_bytes(apps: &[u8], inputs: &[u8]) -> (Vec<Item>, Vec<Item>) {
+    (apps_from_bytes(apps), inputs_from_bytes(inputs))
+}
+
+/// Starts fetching apps and inputs on a thread; the bytes are parsed when they arrive.
+pub fn fetch_launch_lists(luna: Luna) -> std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if luna.root.is_empty() {
+            let luna2 = luna.clone();
+            let (apps, inputs) = std::thread::scope(|s| {
+                let t1 = s.spawn(move || luna.fetch(APPS_URI));
+                let t2 = s.spawn(move || luna2.fetch(INPUTS_URI));
+                (t1.join().unwrap_or_default(), t2.join().unwrap_or_default())
+            });
+            let _ = tx.send((apps, inputs));
+        } else {
+            let _ = tx.send((luna.fetch(APPS_URI), luna.fetch(INPUTS_URI)));
+        }
+    });
+    rx
+}
+
+fn apps_from_bytes(out: &[u8]) -> Vec<Item> {
+    let j = serde_json::from_slice::<Value>(out).ok();
     let Some(points) = j.as_ref().and_then(|j| j["launchPoints"].as_array()) else {
         return vec![];
     };
@@ -324,8 +366,8 @@ pub fn apps(luna: &Luna) -> Vec<Item> {
         .collect()
 }
 
-pub fn inputs(luna: &Luna) -> Vec<Item> {
-    let j = luna.call("luna://com.webos.service.eim/getAllInputStatus");
+fn inputs_from_bytes(out: &[u8]) -> Vec<Item> {
+    let j = serde_json::from_slice::<Value>(out).ok();
     let Some(devices) = j.as_ref().and_then(|j| j["devices"].as_array()) else {
         return vec![];
     };

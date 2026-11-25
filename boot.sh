@@ -9,9 +9,12 @@ D=/media/developer/tvlauncher
   # run-parts waits for this script, and Home can only be switched once the app manager answers
   for i in $(seq 1 60); do
     luna-send -n 1 -w 3000 luna://com.webos.applicationManager/listLaunchPoints '{}' </dev/null 2>/dev/null | grep -q launchPoints && break
-    sleep 2
+    sleep 1
   done
-  sleep 5
+  for i in $(seq 1 15); do
+    luna-send -n 1 -w 1000 luna://com.webos.applicationManager/getForegroundAppInfo '{}' </dev/null 2>/dev/null | grep -q appId && break
+    sleep 1
+  done
   BOOT=1 sh $D/takeover.sh on
 ) </dev/null >/tmp/tvlauncher-boot.log 2>&1 &
 exit 0
