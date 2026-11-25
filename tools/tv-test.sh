@@ -14,6 +14,10 @@
 #   sh tools/tv-test.sh catalog          sorts the real Jellyfin library by what each title tests (build/tv-test/catalog.json)
 #   sh tools/tv-test.sh real <feature>   `--direct` against the real server's smallest title with that feature
 #   sh tools/tv-test.sh reset            stops the fake servers and restores jellyfin.json and state.json
+# Playing a real title (`play film:<id>` with `fake off`) reports progress and a play to the server: Jellyfin keeps a
+# resume point and a play count, Plex a view offset. Undo them afterwards (Jellyfin: DELETE /Users/<id>/PlayedItems/<item>;
+# Plex: /:/unscrobble?key=<rating key>&identifier=com.plexapp.plugins.library). `film:<id>@<seconds>` starts part way in.
+# `reset` also leaves the launcher running with the settings it was last started with: restart it (takeover.sh off, on).
 # The TV is `lg-c1` (an ssh alias); away from home set TVJUMP="-J <jump host>" and TVHOST=<the TV's address>. Keys, the
 # player and the screenshots take over a TV somebody may be watching: ask first.
 set -eu
