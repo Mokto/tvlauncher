@@ -192,6 +192,8 @@ pub fn plex_trick(conn: &Conn, o: &Value, part: &Value) -> Option<Trick> {
 
 const BIF_MAGIC: [u8; 8] = [0x89, b'B', b'I', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
 pub const BIF_HEAD: usize = 64;
+#[cfg(test)]
+pub const BIF_MAGIC_FOR_TESTS: [u8; 8] = BIF_MAGIC;
 
 /// The image count and the timestamp unit in milliseconds, from a BIF header.
 pub fn bif_header(h: &[u8]) -> Option<(usize, u32)> {

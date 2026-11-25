@@ -204,6 +204,68 @@ impl Source for Bif {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A BIF of `n` copies of a 32 x 18 JPEG, one per 2 s, served with byte ranges.
+    fn bif_server(n: usize) -> String {
+        let jpg = include_bytes!("test-thumb.jpg");
+        let mut body = crate::film::extras::BIF_MAGIC_FOR_TESTS.to_vec();
+        body.extend(0u32.to_le_bytes());
+        body.extend((n as u32).to_le_bytes());
+        body.extend(2000u32.to_le_bytes());
+        body.resize(crate::film::extras::BIF_HEAD, 0);
+        let first = crate::film::extras::BIF_HEAD + (n + 1) * 8;
+        for i in 0..=n {
+            body.extend((if i < n { i as u32 } else { u32::MAX }).to_le_bytes());
+            body.extend(((first + i * jpg.len()) as u32).to_le_bytes());
+        }
+        for _ in 0..n {
+            body.extend(jpg);
+        }
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/bif", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let mut c = c.unwrap();
+                let mut buf = [0u8; 2048];
+                let k = c.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..k]).to_lowercase();
+                let r = req
+                    .split("range: bytes=")
+                    .nth(1)
+                    .and_then(|r| r.split("\r\n").next())
+                    .unwrap_or("0-0");
+                let (a, b) = r.split_once('-').unwrap();
+                let (a, b) = (
+                    a.parse::<usize>().unwrap(),
+                    b.parse::<usize>().unwrap().min(body.len() - 1),
+                );
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    b - a + 1
+                );
+                let _ = c.write_all(&body[a..=b]);
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_bif_gives_the_picture_for_a_time() {
+        let mut bif = Bif {
+            url: bif_server(3),
+            index: None,
+        };
+        for ms in [0, 2_500, 99_000] {
+            let s = bif.get(ms).unwrap();
+            assert_eq!(s.size(), (32, 18), "at {ms}");
+        }
+        assert_eq!(bif.index.as_ref().map(|i| i.0.len()), Some(4));
+    }
+
     #[test]
     fn a_thumbnail_is_found_on_its_sheet() {
         assert_eq!(super::cell(0, (10, 10)), (0, 0, 0));
