@@ -413,8 +413,13 @@ fn payload_base(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> 
         codec.push_str(&format!(r#","audio":"{}""#, a.payload_name()));
     }
     format!(
-        r#"{{"args":[{{"mediaTransportType":"BUFFERSTREAM","option":{{"appId":"{app}","windowId":"{window}","externalStreamingInfo":{{"contents":{{"codec":{{{codec}}},"esInfo":{{"pauseAtDecodeTime":false,"ptsToDecode":0,"seperatedPTS":true}},"format":"RAW","provider":"tvlauncher"}},"streamQualityInfo":true,"audioSync":true,"restartStreaming":false,"bufferingCtrInfo":{{"bufferMaxLevel":0,"bufferMinLevel":0,"preBufferByte":0,"qBufferLevelAudio":0,"qBufferLevelVideo":0,"srcBufferLevelAudio":{{"minimum":1,"maximum":1048576}},"srcBufferLevelVideo":{{"minimum":1,"maximum":8388608}}}}}},"needAudio":{},"queryPosition":false,"lowDelayMode":false,"transmission":{{"contentsType":"LIVE"}},"adaptiveStreaming":{{"audioOnly":false,"maxWidth":{w},"maxHeight":{h},"maxFrameRate":60}}}}}}]}}"#,
-        audio.is_some()
+        r#"{{"args":[{{"mediaTransportType":"BUFFERSTREAM","option":{{"appId":"{app}","windowId":"{window}","externalStreamingInfo":{{"contents":{{"codec":{{{codec}}},"esInfo":{{"pauseAtDecodeTime":false,"ptsToDecode":0,"seperatedPTS":true}},"format":"RAW","provider":"tvlauncher"{pcm}}},"streamQualityInfo":true,"audioSync":true,"restartStreaming":false,"bufferingCtrInfo":{{"bufferMaxLevel":0,"bufferMinLevel":0,"preBufferByte":0,"qBufferLevelAudio":0,"qBufferLevelVideo":0,"srcBufferLevelAudio":{{"minimum":1,"maximum":1048576}},"srcBufferLevelVideo":{{"minimum":1,"maximum":8388608}}}}}},"needAudio":{},"queryPosition":false,"lowDelayMode":false,"transmission":{{"contentsType":"LIVE"}},"adaptiveStreaming":{{"audioOnly":false,"maxWidth":{w},"maxHeight":{h},"maxFrameRate":60}}}}}}]}}"#,
+        audio.is_some(),
+        pcm = if audio == Some(Codec::Pcm) {
+            r#","pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#
+        } else {
+            ""
+        },
     )
 }
 
@@ -851,6 +856,21 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dts_core_is_declared_as_lgs_stereo_48k_pcm_input() {
+        let p = payload("a", "w", Codec::H264, Some(Codec::Pcm));
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        let c = &v["args"][0]["option"]["externalStreamingInfo"]["contents"];
+        assert_eq!(c["codec"]["audio"], "PCM");
+        assert_eq!(
+            c["pcmInfo"],
+            serde_json::json!({"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16})
+        );
+        for a in [Codec::Ac3, Codec::Eac3, Codec::Aac] {
+            assert!(!payload("a", "w", Codec::H264, Some(a)).contains("pcmInfo"));
+        }
+    }
 
     #[test]
     fn payload_is_json_with_the_window_and_codecs() {

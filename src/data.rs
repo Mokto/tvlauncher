@@ -147,6 +147,35 @@ pub fn apply_debloat(root: &str) {
     }
 }
 
+/// `hbr/hbr.sh status`: whether the receiver link's kernel module is installed and active.
+pub fn hbr_status() -> String {
+    crate::ff::lossless::hbr_status(DIR)
+}
+
+/// Runs `hbr/hbr.sh <action>` (`install` or `remove`) off the main thread; the one result line comes back on the channel,
+/// and `wake` makes the launcher look.
+pub fn hbr_run(action: &'static str, wake: u32) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new("/bin/sh")
+            .arg(format!("{DIR}/hbr/hbr.sh"))
+            .arg(action)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let line = out.map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .last()
+                .unwrap_or("")
+                .to_string()
+        });
+        let _ = tx.send(line.unwrap_or_else(|_| "hbr: REFUSED: could not run".into()));
+        unsafe { crate::sdl::SDL_PushEvent(&mut crate::sdl::Event::new(wake)) };
+    });
+    rx
+}
+
 const BOOT_HOOK: &str = "/var/lib/webosbrew/init.d/20-tvlauncher-home";
 
 /// Whether the TV starts this launcher as Home at boot (`takeover.sh boot`).
@@ -433,6 +462,8 @@ pub struct Prefs {
     pub rows_off: Vec<String>,
     /// Jellyfin titles play in the launcher's own player rather than the Jellyfin app.
     pub jf_player: bool,
+    /// DTS, DTS-HD and TrueHD go to an AV receiver unconverted (`ff::lossless`).
+    pub lossless: bool,
     /// How the library tabs are sorted: "name" or "added".
     pub lib_sort: String,
 }
@@ -472,6 +503,7 @@ impl Prefs {
             tabs_off: list("tabsOff"),
             rows_off: list("rowsOff"),
             jf_player: v["jfPlayer"].as_bool().unwrap_or(false),
+            lossless: v["lossless"].as_bool().unwrap_or(false),
             tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
             lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
             path,
@@ -480,7 +512,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "libSort": self.lib_sort })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

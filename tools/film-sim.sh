@@ -21,6 +21,8 @@ cargo build --release
 R=$D/root
 rm -rf "$R" && cp -R fixtures "$R" && rm -f "$R/media/developer/tvlauncher/state.json"
 printf '{"server":"http://127.0.0.1:8780","serverId":"s1","userId":"u1","user":"demo","token":"t"}' > "$R/media/developer/tvlauncher/jellyfin.json"
+# lossless audio on; it only does anything with FILM_RECEIVER=1, which stands in for an ARC receiver
+printf '{"lossless":true}' > "$R/media/developer/tvlauncher/state.json"
 node tools/fake-media.js "$D" 8780 > "$D/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER' EXIT

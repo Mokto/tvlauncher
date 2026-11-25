@@ -13,6 +13,10 @@ pub enum Act {
     PlexApp,
     /// Whether Jellyfin titles play in the launcher's own player.
     JfPlayer,
+    /// Whether DTS and TrueHD go to a receiver unconverted.
+    Lossless,
+    /// Installs or removes the kernel module that the receiver link needs for TrueHD and full-rate DTS-HD.
+    Hbr,
     /// The switch of a Continue watching row on Home: WATCH (Jellyfin) or PLEX.
     Watching(usize),
     /// Where the TV channels come from, and the guide.

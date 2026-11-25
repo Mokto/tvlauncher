@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 pub mod convert;
 pub mod demux;
+pub mod lossless;
 pub mod range;
 
 pub enum AVInputFormat {}

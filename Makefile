@@ -32,11 +32,15 @@ $(FFMPEG_ARM):
 ffmpeg-host:
 	sh tools/build-ffmpeg.sh host
 
+# The kernel module that lets the film player send TrueHD and full-rate DTS-HD to a receiver (vendor/earc_route).
+HBR_FILES = vendor/earc_route/out/earc_route-4.4.ko vendor/earc_route/earc-route-load.sh hbr/hbr.sh
+
 deploy: arm $(FFMPEG_ARM)
-	ssh $(TV) 'mkdir -p $(DEST)/lib && rm -f $(DEST)/tvlauncher.new'
+	ssh $(TV) 'mkdir -p $(DEST)/lib $(DEST)/hbr && rm -f $(DEST)/tvlauncher.new'
 	scp $(ARM_BIN) $(TV):$(DEST)/tvlauncher.new
 	scp takeover.sh debloat.sh boot.sh $(TV):$(DEST)/
 	scp build/ffmpeg-arm/*.so.* $(TV):$(DEST)/lib/
+	scp $(HBR_FILES) $(TV):$(DEST)/hbr/
 	ssh $(TV) 'chmod 755 $(DEST)/tvlauncher.new && mv $(DEST)/tvlauncher.new $(DEST)/tvlauncher'
 
 # The ARM build under QEMU, without a TV (needs Docker).
@@ -55,9 +59,11 @@ off: ; ssh $(TV) sh $(DEST)/takeover.sh off
 VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 PKG     = tvlauncher-$(VERSION)-webos-arm
 release: arm $(FFMPEG_ARM)
-	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)/lib
+	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)/lib dist/$(PKG)/hbr
 	cp $(ARM_BIN) takeover.sh debloat.sh boot.sh install.sh LICENSE README.md THIRD-PARTY-NOTICES.md dist/$(PKG)/
 	cp build/ffmpeg-arm/*.so.* dist/$(PKG)/lib/
+	cp $(HBR_FILES) dist/$(PKG)/hbr/
+	cp -R vendor/earc_route dist/$(PKG)/earc_route-source
 	cp build/ffmpeg-*.tar.xz dist/ 2>/dev/null || true
 	tar -C dist -czf dist/$(PKG).tar.gz $(PKG)
 	cd dist && shasum -a 256 $(PKG).tar.gz > $(PKG).tar.gz.sha256 && cat $(PKG).tar.gz.sha256

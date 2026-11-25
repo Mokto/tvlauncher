@@ -3,4 +3,5 @@
 # -Zbuild-std so the flags apply to it. NEON is off because some dependencies need unstable intrinsics for it.
 # RUSTFLAGS in the environment replaces this list, so never set it for the ARM build.
 [target.arm-unknown-linux-gnueabi]
-rustflags = ["-C", "target-cpu=cortex-a9", "-C", "target-feature=-neon"]
+# --export-dynamic-symbol=ioctl: the film player hooks LG's ES renderer writes (src/ff/lossless.rs).
+rustflags = ["-C", "target-cpu=cortex-a9", "-C", "target-feature=-neon", "-C", "link-arg=-Wl,--export-dynamic-symbol=ioctl"]

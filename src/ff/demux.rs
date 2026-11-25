@@ -4,6 +4,7 @@
 //! FLAC, ...) is re-encoded to AC-3 by `convert`. The framing follows Native Jelly's `rust-modules/src/ff.rs`
 //! (GPL-3.0).
 use super::convert::{self, Converter};
+use super::lossless::{self, Kind, Mat, Mode, Packer};
 use super::range::{Range, Stop};
 use super::*;
 use crate::sdl::log;
@@ -52,6 +53,14 @@ pub struct ATrack {
     pub stream: i32,
     pub name: String,
     pub how: How,
+    pub kind: Kind,
+}
+
+impl ATrack {
+    /// Whether the TV can play it: as it is, converted, or (DTS) unconverted to a receiver.
+    pub fn playable(&self) -> bool {
+        self.how != How::No || (self.kind == Kind::Dts && lossless::dts_possible())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +88,7 @@ impl Info {
         if let Some(r) = &v.refused {
             return Err(r.clone());
         }
-        let ok = |a: &&ATrack| a.how != How::No;
+        let ok = |a: &&ATrack| a.playable();
         want.and_then(|w| self.audio.iter().filter(ok).find(|a| i64::from(a.stream) == w))
             .or_else(|| self.audio.iter().find(ok))
             .map(|a| a.stream)
@@ -241,6 +250,7 @@ enum Cmd {
         at_ns: i64,
         audio: i32,
         sub: Option<i32>,
+        lossless: Mode,
         q: Arc<Queue>,
     },
     Quit,
@@ -283,12 +293,13 @@ impl Demux {
     }
 
     /// Starts reading at `at_ns` (the keyframe at or before it). Ends the run before this one.
-    pub fn start(&self, at_ns: i64, audio: i32, sub: Option<i32>) -> Run {
+    pub fn start(&self, at_ns: i64, audio: i32, sub: Option<i32>, lossless: Mode) -> Run {
         let q = Queue::new(QUEUE_BYTES);
         let _ = self.cmd.send(Cmd::Start {
             at_ns,
             audio,
             sub,
+            lossless,
             q: q.clone(),
         });
         Run::new(q, Some(self.stop.clone()))
@@ -483,10 +494,16 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                     }
                     _ => How::No,
                 };
+                let kind = match name.as_str() {
+                    "dts" => Kind::Dts,
+                    "truehd" => Kind::TrueHd,
+                    _ => Kind::Other,
+                };
                 info.audio.push(ATrack {
                     stream: i as i32,
                     name: track_name(f, s, &name, Some(ch), n_a),
                     how,
+                    kind,
                 });
             }
             AVMEDIA_TYPE_SUBTITLE => {
@@ -598,12 +615,30 @@ fn thread_main(url: String, stop: Arc<Stop>, cmds: Receiver<Cmd>, ready: Sender<
     let _ = ready.send(Ok(info.clone()));
     let mut first = true;
     while let Ok(c) = cmds.recv() {
-        let Cmd::Start { at_ns, audio, sub, q } = c else {
+        let Cmd::Start {
+            at_ns,
+            audio,
+            sub,
+            lossless,
+            q,
+        } = c
+        else {
             break;
         };
         // A new run must not see the stop of the one before it.
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            run(f, &open, &info, at_ns, audio, sub, &q, first && at_ns == 0, &stop)
+            run(
+                f,
+                &open,
+                &info,
+                at_ns,
+                audio,
+                sub,
+                lossless,
+                &q,
+                first && at_ns == 0,
+                &stop,
+            )
         }));
         first = false;
         match out {
@@ -1021,6 +1056,7 @@ unsafe fn run(
     at_ns: i64,
     audio: i32,
     sub: Option<i32>,
+    lossless: Mode,
     q: &Arc<Queue>,
     no_seek: bool,
     stop: &Arc<Stop>,
@@ -1056,9 +1092,14 @@ unsafe fn run(
         return Err("The AAC audio has a sample rate that ADTS cannot name.".into());
     }
     let mut conv = match a_how {
-        How::Convert => Some(Converter::open(acp)?),
+        How::Convert if lossless != Mode::TrueHd => Some(Converter::open(acp)?),
         _ => None,
     };
+    lossless::clear();
+    let (mut packer, mut mat) = (Packer::default(), Mat::default());
+    if a_how == How::No && lossless == Mode::Off {
+        return Err("the TV cannot decode that audio".into());
+    }
     if let Some(c) = &conv {
         log(&format!("ff: audio {}", c.desc));
     }
@@ -1082,8 +1123,10 @@ unsafe fn run(
     }
 
     let pkt = (f.av_packet_alloc)();
-    let a_codec = match a_how {
-        How::Direct(c) => Some(c),
+    let a_codec = match (lossless, a_how) {
+        (Mode::Dts | Mode::TrueHd, _) => Some(Codec::Eac3),
+        (Mode::DtsCore, _) => Some(Codec::Pcm),
+        (_, How::Direct(c)) => Some(c),
         _ => Some(Codec::Ac3),
     };
     let dv = video.dv.clone().filter(|d| !(hevc && d.profile == 7));
@@ -1153,7 +1196,46 @@ unsafe fn run(
         } else if let Some(b) = base {
             if si as i32 == audio {
                 if let Some(pts) = pts.filter(|p| *p >= b - 40_000_000) {
+                    let silent = |t: i64| Au {
+                        video: false,
+                        key: true,
+                        pts_ns: (t - b).max(0),
+                        data: lossless::SILENT_EAC3.to_vec(),
+                    };
                     match (&mut conv, adts) {
+                        _ if lossless == Mode::Dts => {
+                            let core = lossless::dts_core_packet(data).map_or(0, |c| c.len());
+                            match packer.frame(data, core, pts) {
+                                Ok(Some(t)) => {
+                                    audios += 1;
+                                    alive = q.push(Feed::Au(silent(t)));
+                                }
+                                Ok(None) => {}
+                                Err(()) => break Err("A DTS-HD frame fits no burst of the receiver link.".into()),
+                            }
+                        }
+                        _ if lossless == Mode::TrueHd => match mat.au(data, pts) {
+                            Ok(times) => {
+                                for t in times {
+                                    audios += 1;
+                                    alive &= q.push(Feed::Au(silent(t)));
+                                }
+                            }
+                            Err(()) => break Err("A TrueHD unit cannot be packed for the receiver link.".into()),
+                        },
+                        _ if lossless == Mode::DtsCore => {
+                            let Some(burst) = lossless::dts_core_packet(data).and_then(|c| lossless::dts_iec61937(&c))
+                            else {
+                                break Err("The DTS core does not fit an IEC 61937 burst.".into());
+                            };
+                            audios += 1;
+                            alive = q.push(Feed::Au(Au {
+                                video: false,
+                                key: true,
+                                pts_ns: (pts - b).max(0),
+                                data: burst,
+                            }));
+                        }
                         (Some(c), _) => {
                             converted.clear();
                             if let Err(e) = c.push(pkt, Some(pts), &mut converted) {
@@ -1248,12 +1330,12 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
     };
     if std::env::var_os("FF_INTERRUPT").is_some() {
         // A run cut off in the middle (a seek while reading), then another from somewhere else.
-        let first = d.start(0, a, None);
+        let first = d.start(0, a, None, Mode::Off);
         std::thread::sleep(Duration::from_millis(300));
         drop(first);
         println!("first run cut");
     }
-    let run = d.start(at_s * 1_000_000_000, a, sub.map(|s| s as i32));
+    let run = d.start(at_s * 1_000_000_000, a, sub.map(|s| s as i32), Mode::Off);
     let t = std::time::Instant::now();
     let (mut v, mut au, mut keys, mut subs, mut last_v, mut last_a) = (0, 0, 0, 0, 0i64, 0i64);
     let mut base = None;

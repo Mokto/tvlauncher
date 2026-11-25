@@ -191,6 +191,9 @@ pub struct App {
     px_pending: bool,
     /// Set while an app is being uninstalled; the app list is read again when it ends.
     rm_rx: Option<Receiver<()>>,
+    /// `hbr.sh status` as last read, and the install or removal running now.
+    hbr: Option<String>,
+    hbr_rx: Option<Receiver<String>>,
     /// First paint on the TV: apps and inputs are fetched on a thread.
     luna_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>,
     bgl: Background,
@@ -267,6 +270,8 @@ impl App {
             yt_pending: false,
             px_pending: false,
             rm_rx: None,
+            hbr: None,
+            hbr_rx: None,
             luna_rx: None,
             bgl,
             jf,
@@ -554,12 +559,36 @@ impl App {
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
-        let player = vec![entry(
-            Act::JfPlayer,
-            "Play in the launcher",
-            "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
-            Value::Switch(self.prefs.jf_player),
-        )];
+        let mut player = vec![
+            entry(
+                Act::JfPlayer,
+                "Play in the launcher",
+                "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
+                Value::Switch(self.prefs.jf_player),
+            ),
+            entry(
+                Act::Lossless,
+                "Lossless audio to a receiver",
+                "Sends DTS, DTS-HD, DTS:X and Dolby TrueHD (Atmos) unconverted to an AV receiver on HDMI ARC or optical. Only while the TV's sound output is that receiver; on TV speakers the server converts them as before.",
+                Value::Switch(self.prefs.lossless),
+            ),
+        ];
+        if self.prefs.lossless {
+            let state = match self.hbr.as_deref() {
+                _ if self.hbr_rx.is_some() => "Working...",
+                Some(s) if s.contains("not installed") => "Not installed",
+                Some(s) if s.contains("active") && !s.contains("not active") => "Installed",
+                Some(s) if s.contains("not active") => "Restart the TV",
+                Some(s) if s.contains("REFUSED") => "Refused",
+                _ => "Unknown",
+            };
+            player.push(entry(
+                Act::Hbr,
+                "Atmos, TrueHD and DTS:X (root)",
+                "Full-rate DTS-HD and TrueHD need an 8-channel eARC link, which LG only opens for its own apps. This installs a small kernel module (tested on an LG C1 with firmware 03.53.45 only; other TVs refuse it and keep the stereo link). It loads again at every start.",
+                text(state),
+            ));
+        }
         let host = |url: &str| {
             let rest = url.split_once("://").map_or(url, |(_, r)| r);
             rest.split(['/', '?']).next().unwrap_or(rest).to_string()
@@ -651,7 +680,12 @@ impl App {
         self.mode = Mode::Settings(Box::new(page));
     }
 
+    fn load_hbr(&mut self) {
+        self.hbr = (self.prefs.lossless && !self.luna.root.is_empty()).then(data::hbr_status);
+    }
+
     fn open_settings(&mut self) {
+        self.load_hbr();
         self.last_settings = (0, 0, false);
         self.show_settings();
     }
@@ -1168,6 +1202,14 @@ impl App {
             match list {
                 Some(list) => self.apply_watching(list),
                 None => self.pick_home_bg(false),
+            }
+        }
+        if let Some(Ok(line)) = self.hbr_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.hbr_rx = None;
+            log(&format!("hbr: {line}"));
+            self.load_hbr();
+            if matches!(self.mode, Mode::Settings(_)) {
+                self.show_settings();
             }
         }
         if self.rm_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
@@ -1789,6 +1831,20 @@ impl App {
         };
         if act == Act::Boot {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
+            return self.show_settings();
+        }
+        if act == Act::Lossless {
+            self.prefs.lossless = !self.prefs.lossless;
+            self.prefs.save();
+            self.hbr = None;
+            self.load_hbr();
+            return self.show_settings();
+        }
+        if act == Act::Hbr {
+            if self.hbr_rx.is_none() && !self.luna.root.is_empty() {
+                let remove = self.hbr.as_deref().is_some_and(|s| !s.contains("not installed"));
+                self.hbr_rx = Some(data::hbr_run(if remove { "remove" } else { "install" }, self.wake));
+            }
             return self.show_settings();
         }
         if act == Act::JfPlayer {

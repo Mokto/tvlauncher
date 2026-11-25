@@ -5,7 +5,8 @@
 mod ui;
 
 use super::*;
-use crate::ff::demux::{Demux, Feed, How, Queue, Run, ENDED};
+use crate::ff::demux::{Demux, Feed, Queue, Run, ENDED};
+use crate::ff::lossless;
 use crate::film::{self, Backend, Clock, Event as Note, Item, Why, TICKS};
 use crate::subs::Cue;
 use std::sync::mpsc::{channel, Receiver};
@@ -188,11 +189,7 @@ impl Player {
             Source::File(d) => {
                 let mut t = Tracks::default();
                 for a in &d.info.audio {
-                    let note = if a.how == How::No {
-                        " (the server converts it)"
-                    } else {
-                        ""
-                    };
+                    let note = if !a.playable() { " (the server converts it)" } else { "" };
                     t.audio.push(AudioRow {
                         index: i64::from(a.stream),
                         name: format!("{}{note}", a.name),
@@ -288,11 +285,24 @@ impl Player {
         }
 
         let start_s = start / TICKS;
+        // Before the pipeline loads: the receiver link is set up as it connects.
+        let (lossless_mode, _armed) = match src {
+            Source::File(d) => {
+                let kind = d
+                    .info
+                    .audio
+                    .iter()
+                    .find(|a| Some(i64::from(a.stream)) == choice.audio)
+                    .map_or(lossless::Kind::Other, |a| a.kind);
+                lossless::arm(kind)
+            }
+            Source::Server => lossless::arm(lossless::Kind::Other),
+        };
         let run = match src {
             Source::File(d) => {
                 let audio = choice.audio.map_or(-1, |a| a as i32);
                 let sub = choice.sub.filter(|s| !s.server).map(|s| s.index as i32);
-                d.start(start * 100, audio, sub)
+                d.start(start * 100, audio, sub, lossless_mode)
             }
             Source::Server => hls_run(&film::hls_url(it, start, choice.audio)),
         };
@@ -426,11 +436,9 @@ impl Player {
                             choice.audio = Some(i);
                             smp.retire();
                             let can = match src {
-                                Source::File(d) => d
-                                    .info
-                                    .audio
-                                    .iter()
-                                    .any(|a| i64::from(a.stream) == i && a.how != How::No),
+                                Source::File(d) => {
+                                    d.info.audio.iter().any(|a| i64::from(a.stream) == i && a.playable())
+                                }
                                 Source::Server => true,
                             };
                             return if can {
@@ -553,6 +561,14 @@ impl Player {
                 osd.say(g, None);
                 film::report(it, Note::Progress, pos, false, direct, false);
             }
+            // LG made no write to its ES renderer: its DD+ route is not in pass-through on this output (TV speakers, or
+            // a receiver without DD+). Start again without the carrier.
+            if clock.running() && !paused && lossless::silent_route((clock.now().as_millis() as i64 * 24 / 1000) as i32)
+            {
+                log("film: the receiver link did not take the carrier; starting again without it");
+                smp.retire();
+                return Vod::Seek(pos);
+            }
             let size = SIZE.load(Ordering::SeqCst);
             if size != placed {
                 placed = place(size);
@@ -618,6 +634,7 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
     };
     let g = Gfx::new(root, ren, |name, size| crate::font(root, name, size));
     set_font_root(root);
+    lossless::configure(crate::data::Prefs::load(root).lossless);
     let mut p = match Player::new() {
         Ok(p) => p,
         Err(e) => {
