@@ -464,6 +464,10 @@ pub struct Prefs {
     pub jf_player: bool,
     /// DTS, DTS-HD and TrueHD go to an AV receiver unconverted (`ff::lossless`).
     pub lossless: bool,
+    /// "auto", "off" (the server always converts) or "force" (never), and the most the server's conversion may send in
+    /// megabits per second (0 for no limit).
+    pub direct: String,
+    pub max_mbps: u32,
     /// The language films start in ("" for the server's choice, else a code of `lang::LANGS`), how subtitles start
     /// ("default", "off", "on", "forced" or "smart") and their language ("" for the audio language).
     pub audio_lang: String,
@@ -509,6 +513,8 @@ impl Prefs {
             rows_off: list("rowsOff"),
             jf_player: v["jfPlayer"].as_bool().unwrap_or(false),
             lossless: v["lossless"].as_bool().unwrap_or(false),
+            direct: v["direct"].as_str().unwrap_or("auto").into(),
+            max_mbps: v["maxMbps"].as_u64().unwrap_or(0) as u32,
             audio_lang: v["audioLang"].as_str().unwrap_or_default().into(),
             sub_mode: v["subMode"].as_str().unwrap_or("default").into(),
             sub_lang: v["subLang"].as_str().unwrap_or_default().into(),
@@ -520,7 +526,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

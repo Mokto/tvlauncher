@@ -129,11 +129,15 @@ pub fn next(cfg: &Config, series: &str, current: &str) -> Option<Item> {
 /// converts audio the TV cannot decode (DTS, TrueHD) to AC-3.
 pub fn master_url(cfg: &Config, it: &Item, start: i64, audio: Option<i64>) -> String {
     let audio = audio.map_or(String::new(), |i| format!("&AudioStreamIndex={i}"));
+    let max = match MAX_KBPS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => String::new(),
+        k => format!("&MaxStreamingBitrate={}", u64::from(k) * 1000),
+    };
     format!(
         "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={DEVICE}&VideoCodec=h264,hevc\
          &AudioCodec=aac,ac3,eac3&TranscodingMaxAudioChannels=6&SegmentContainer=ts&MinSegments=1\
          &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true&StartTimeTicks={start}\
-         &api_key={}{audio}",
+         &api_key={}{audio}{max}",
         cfg.server, it.id, it.source, it.session, cfg.token
     )
 }

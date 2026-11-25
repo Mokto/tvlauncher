@@ -101,12 +101,24 @@ impl Player {
     pub fn film(&mut self, g: &Gfx, it: &Item) -> (i64, bool) {
         let mut osd = Osd::new(g, it);
         osd.say(g, Some("Loading..."));
-        let mut src = match self.open_file(g, it, &mut osd) {
-            Ok(Some(d)) => Source::File(d),
-            Ok(None) => return (it.resume, false),
-            Err(why) => {
-                log(&format!("film: the server will convert it: {why}"));
-                Source::Server
+        let mode = film::direct_mode();
+        let forced = |why: &str| format!("Direct Play is forced, and this file cannot be played as it is: {why}");
+        let mut src = if mode == 1 {
+            Source::Server
+        } else {
+            match self.open_file(g, it, &mut osd) {
+                Ok(Some(d)) => Source::File(d),
+                Ok(None) => return (it.resume, false),
+                Err(why) if mode == 2 => {
+                    return match self.vod_fail(g, &mut osd, &forced(&why), it.resume) {
+                        Vod::Exit(p, d) => (p, d),
+                        _ => (it.resume, false),
+                    };
+                }
+                Err(why) => {
+                    log(&format!("film: the server will convert it: {why}"));
+                    Source::Server
+                }
             }
         };
         let mut choice = Choice::default();
@@ -118,6 +130,12 @@ impl Player {
             let out = self.vod(g, it, &src, at, &mut osd, &mut choice, &mut events, &mut thumbs);
             match out {
                 Vod::Seek(t) => at = t,
+                Vod::Server(t, why) if mode == 2 => {
+                    break match self.vod_fail(g, &mut osd, &forced(&why), t) {
+                        Vod::Exit(p, d) => (p, d),
+                        _ => (t, false),
+                    };
+                }
                 Vod::Server(t, why) => {
                     log(&format!("film: the server converts it from here: {why}"));
                     src = Source::Server;
@@ -718,6 +736,15 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
     set_font_root(root);
     let prefs = crate::data::Prefs::load(root);
     lossless::configure(prefs.lossless);
+    film::DIRECT.store(
+        match prefs.direct.as_str() {
+            "off" => 1,
+            "force" => 2,
+            _ => 0,
+        },
+        Ordering::Relaxed,
+    );
+    film::MAX_KBPS.store(prefs.max_mbps * 1000, Ordering::Relaxed);
     *film::LANGS.lock().unwrap_or_else(|e| e.into_inner()) = film::pick::Langs {
         audio: prefs.audio_lang,
         sub_mode: prefs.sub_mode,

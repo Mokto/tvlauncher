@@ -19,6 +19,16 @@ const SHELF: f32 = 0.84;
 /// How long OK is held on an app before its options open.
 const HOLD_MS: u32 = 700;
 
+/// How films are delivered (`film::DIRECT`), as Settings words it.
+const DIRECT_MODES: [(&str, &str); 3] = [
+    ("auto", "Automatic"),
+    ("off", "Off"),
+    ("force", "Forced"),
+];
+
+/// The choices of the server's streaming quality, in Mbps; 0 is no limit.
+const QUALITIES: [u32; 7] = [0, 40, 20, 12, 8, 4, 2];
+
 /// How subtitles start (`film::pick`), as Settings words it.
 const SUB_MODES: [(&str, &str); 5] = [
     ("default", "Server's choice"),
@@ -78,6 +88,8 @@ enum Opt {
     Unfav(String),
     /// The details of the focused programme.
     TvDetails,
+    DirectMode(&'static str),
+    Quality(u32),
     /// The language films start in, how subtitles start, and their language ("" for none, else a `lang::LANGS` code).
     AudioLang(&'static str),
     SubMode(&'static str),
@@ -572,12 +584,34 @@ impl App {
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
-        let player = vec![entry(
-            Act::JfPlayer,
-            "Play in the launcher",
-            "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
-            Value::Switch(self.prefs.jf_player),
-        )];
+        let direct = DIRECT_MODES
+            .iter()
+            .find(|m| m.0 == self.prefs.direct)
+            .map_or(DIRECT_MODES[0].1, |m| m.1);
+        let quality = match self.prefs.max_mbps {
+            0 => "Maximum".to_string(),
+            m => format!("{m} Mbps"),
+        };
+        let player = vec![
+            entry(
+                Act::JfPlayer,
+                "Play in the launcher",
+                "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
+                Value::Switch(self.prefs.jf_player),
+            ),
+            entry(
+                Act::Direct,
+                "Direct Play",
+                "Automatic plays the file as it is and has the server convert only what the TV cannot play. Off always has the server convert. Forced never falls back, and shows why a file will not play.",
+                text(direct),
+            ),
+            entry(
+                Act::Quality,
+                "Streaming quality",
+                "The most the server may send when it converts a film: lower it on a slow connection. Direct Play is not limited.",
+                text(&quality),
+            ),
+        ];
         let language = |code: &str, none: &str| match code {
             "" => none.to_string(),
             c => crate::lang::name(c),
@@ -1897,6 +1931,27 @@ impl App {
                 .collect();
             return self.show_menu(title, list, sel);
         }
+        if act == Act::Direct {
+            let sel = DIRECT_MODES.iter().position(|m| m.0 == self.prefs.direct).unwrap_or(0);
+            let list = DIRECT_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (Opt::DirectMode(m.0), format!("{}{}", m.1, if i == sel { "   (current)" } else { "" })))
+                .collect();
+            return self.show_menu("Direct Play", list, sel);
+        }
+        if act == Act::Quality {
+            let sel = QUALITIES.iter().position(|m| *m == self.prefs.max_mbps).unwrap_or(0);
+            let list = QUALITIES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let name = if *m == 0 { "Maximum".to_string() } else { format!("{m} Mbps") };
+                    (Opt::Quality(*m), format!("{name}{}", if i == sel { "   (current)" } else { "" }))
+                })
+                .collect();
+            return self.show_menu("Streaming quality", list, sel);
+        }
         if act == Act::SubMode {
             let sel = SUB_MODES.iter().position(|m| m.0 == self.prefs.sub_mode).unwrap_or(0);
             let list = SUB_MODES
@@ -2182,6 +2237,16 @@ impl App {
                 for lib in &self.libs {
                     let _ = lib.refresh.send(true);
                 }
+                return;
+            }
+            Opt::DirectMode(m) => {
+                self.prefs.direct = m.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::Quality(m) => {
+                self.prefs.max_mbps = *m;
+                self.prefs.save();
                 return;
             }
             Opt::AudioLang(c) => {

@@ -54,6 +54,16 @@ pub static LANGS: std::sync::Mutex<pick::Langs> = std::sync::Mutex::new(pick::La
     sub_lang: String::new(),
 });
 
+/// How a film is delivered: 0 as it is when it can be and by the server otherwise, 1 always by the server, 2 only as it
+/// is (no fallback).
+pub static DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The most the server's conversion may send, in kilobits per second; 0 for no limit.
+pub static MAX_KBPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn direct_mode() -> u8 {
+    DIRECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What is played: a film or one episode.
 pub struct Item {
     pub backend: Backend,

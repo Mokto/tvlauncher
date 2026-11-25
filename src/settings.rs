@@ -17,6 +17,9 @@ pub enum Act {
     AudioLang,
     SubMode,
     SubLang,
+    /// How films are delivered (as they are, or by the server), and the most the server's conversion may send.
+    Direct,
+    Quality,
     /// Whether DTS and TrueHD go to a receiver unconverted.
     Lossless,
     /// Installs or removes the kernel module that the receiver link needs for TrueHD and full-rate DTS-HD.

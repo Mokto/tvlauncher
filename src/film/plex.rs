@@ -146,6 +146,10 @@ pub fn hls_url(conn: &Conn, it: &Item, start: i64, audio: Option<i64>) -> String
     let stream = audio
         .and_then(|i| it.audio.iter().find(|t| t.index == i))
         .map_or(String::new(), |t| format!("&audioStreamID={}", t.key));
+    let stream = match MAX_KBPS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => stream,
+        k => format!("{stream}&maxVideoBitrate={k}"),
+    };
     format!(
         "{}/video/:/transcode/universal/start.m3u8?path=/library/metadata/{}&mediaIndex=0&partIndex=0&protocol=hls\
          &offset={}&fastSeek=1&directPlay=0&directStream=1&directStreamAudio=1&videoQuality=100&subtitles=none\
