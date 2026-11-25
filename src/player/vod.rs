@@ -512,8 +512,7 @@ impl Player {
                 }
                 _ => {}
             }
-            if let Some((to, since)) = seek.filter(|s| s.1.elapsed() > Duration::from_millis(600)) {
-                let _ = since;
+            if let Some((to, _)) = seek.filter(|s| s.1.elapsed() > Duration::from_millis(600)) {
                 smp.retire();
                 return Vod::Seek(to * TICKS);
             }
