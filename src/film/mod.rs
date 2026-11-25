@@ -133,11 +133,12 @@ pub fn next(it: &Item) -> Option<Item> {
     }
 }
 
-/// The playlist of the server's remux of the film, from `start` ticks in.
-pub fn hls_url(it: &Item, start: i64, audio: Option<i64>) -> String {
+/// The playlist of the server's remux of the film, and how many ticks of it to skip: Jellyfin's playlist always starts
+/// at the beginning, Plex's starts at `start`.
+pub fn hls_url(it: &Item, start: i64, audio: Option<i64>) -> (String, i64) {
     match &it.backend {
-        Backend::Jellyfin(c) => jellyfin::master_url(c, it, start, audio),
-        Backend::Plex(c) => plex::hls_url(c, it, start, audio),
+        Backend::Jellyfin(c) => (jellyfin::master_url(c, it, audio), start),
+        Backend::Plex(c) => (plex::hls_url(c, it, start, audio), 0),
     }
 }
 

@@ -9,6 +9,8 @@ pub enum Playlist {
         seq: u64,
         target_s: u64,
         segs: Vec<String>,
+        /// Each segment's length in seconds, as `#EXTINF` gives it.
+        durs: Vec<f64>,
         end: bool,
     },
 }
@@ -43,11 +45,24 @@ fn attr<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// The index of the segment that holds second `s` of the stream (the last one when `s` is past the end).
+pub fn index_at(durs: &[f64], s: f64) -> usize {
+    let mut t = 0.0;
+    for (i, d) in durs.iter().enumerate() {
+        t += d;
+        if t > s {
+            return i;
+        }
+    }
+    durs.len().saturating_sub(1)
+}
+
 pub fn parse(base: &str, text: &str) -> Result<Playlist, String> {
     if !text.trim_start().starts_with("#EXTM3U") {
         return Err("The channel's address is not an HLS playlist.".into());
     }
-    let (mut variants, mut segs) = (Vec::new(), Vec::new());
+    let (mut variants, mut segs, mut durs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut dur = 0.0;
     let (mut seq, mut target_s, mut end, mut inf) = (0, 2, false, None::<u64>);
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(a) = line.strip_prefix("#EXT-X-STREAM-INF:") {
@@ -56,6 +71,8 @@ pub fn parse(base: &str, text: &str) -> Result<Playlist, String> {
             seq = n.parse().unwrap_or(0);
         } else if let Some(n) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
             target_s = n.parse().unwrap_or(2);
+        } else if let Some(n) = line.strip_prefix("#EXTINF:") {
+            dur = n.split(',').next().and_then(|d| d.trim().parse().ok()).unwrap_or(0.0);
         } else if line == "#EXT-X-ENDLIST" {
             end = true;
         } else if let Some(a) = line.strip_prefix("#EXT-X-KEY:") {
@@ -67,7 +84,10 @@ pub fn parse(base: &str, text: &str) -> Result<Playlist, String> {
         } else if !line.starts_with('#') {
             match inf.take() {
                 Some(bw) => variants.push((bw, join(base, line))),
-                None => segs.push(join(base, line)),
+                None => {
+                    segs.push(join(base, line));
+                    durs.push(std::mem::take(&mut dur));
+                }
             }
         }
     }
@@ -76,6 +96,7 @@ pub fn parse(base: &str, text: &str) -> Result<Playlist, String> {
             seq,
             target_s,
             segs,
+            durs,
             end,
         }
     } else {
@@ -115,9 +136,22 @@ mod tests {
                     "https://h.example/a/b/x41.ts".into(),
                     "https://h.example/a/b/x42.ts".into()
                 ],
+                durs: vec![6.0, 6.0],
                 end: false
             })
         );
+        let d = [7.0, 8.0, 4.0];
+        assert_eq!(
+            (
+                index_at(&d, 0.0),
+                index_at(&d, 6.9),
+                index_at(&d, 7.0),
+                index_at(&d, 15.0)
+            ),
+            (0, 0, 1, 2)
+        );
+        assert_eq!(index_at(&d, 99.0), 2);
+        assert_eq!(index_at(&[], 5.0), 0);
         assert!(parse(b, "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\nx.ts\n").is_err());
         assert!(parse(b, "<!DOCTYPE html>").is_err());
     }

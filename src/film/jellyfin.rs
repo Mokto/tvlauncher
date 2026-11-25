@@ -125,19 +125,22 @@ pub fn next(cfg: &Config, series: &str, current: &str) -> Option<Item> {
     resolve(cfg, id).ok()
 }
 
-/// The playlist of the server's remux of the film, from `start` ticks in. The server copies H.264 and H.265 and
+/// The playlist of the server's remux of the film. It takes no start time (Jellyfin 12: "StartTimeTicks is not
+/// allowed"), so the reader skips to the segment. The server copies H.264 and H.265 and
 /// converts audio the TV cannot decode (DTS, TrueHD) to AC-3.
-pub fn master_url(cfg: &Config, it: &Item, start: i64, audio: Option<i64>) -> String {
+pub fn master_url(cfg: &Config, it: &Item, audio: Option<i64>) -> String {
     let audio = audio.map_or(String::new(), |i| format!("&AudioStreamIndex={i}"));
     let max = match MAX_KBPS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => String::new(),
         k => format!("&MaxStreamingBitrate={}", u64::from(k) * 1000),
     };
+    // `ApiKey`, not `api_key`: Jellyfin 12 answers 401 to the latter on the playlists (the file stream still takes it),
+    // and passes the former on to the segment addresses in them.
     format!(
         "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={DEVICE}&VideoCodec=h264,hevc\
          &AudioCodec=aac,ac3,eac3&TranscodingMaxAudioChannels=6&SegmentContainer=ts&MinSegments=1\
-         &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true&StartTimeTicks={start}\
-         &api_key={}{audio}{max}",
+         &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true\
+         &ApiKey={}{audio}{max}",
         cfg.server, it.id, it.source, it.session, cfg.token
     )
 }
@@ -255,16 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn master_url_asks_for_a_remux_from_the_start_point() {
+    fn master_url_asks_for_a_remux() {
         let it = item_from(&cfg(), &json!({ "Id": "m1", "MediaSources": [{ "Id": "src9" }] })).unwrap();
-        let u = master_url(&cfg(), &it, 42 * TICKS, Some(3));
+        let u = master_url(&cfg(), &it, Some(3));
         assert!(u.starts_with("https://jf.example/Videos/m1/master.m3u8?MediaSourceId=src9&PlaySessionId="));
         for part in [
             "VideoCodec=h264,hevc",
             "SegmentContainer=ts",
             "AllowVideoStreamCopy=true",
-            "StartTimeTicks=420000000",
-            "api_key=tok",
+            "ApiKey=tok",
             "&AudioStreamIndex=3",
         ] {
             assert!(u.contains(part), "{part}");

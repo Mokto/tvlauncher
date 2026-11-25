@@ -61,7 +61,7 @@ impl Drop for Reader {
 
 /// Reads `url` on a thread: one MPEG-TS stream, or the segments of an HLS one in turn, through one demuxer.
 /// The bounded channel holds the stream back while the pipeline is full.
-fn read(url: &str) -> Reader {
+fn read(url: &str, skip_s: f64) -> Reader {
     let (tx, rx) = sync_channel(256);
     let curl = Arc::new(Curl::default());
     let (url, shared) = (url.to_string(), curl.clone());
@@ -109,7 +109,7 @@ fn read(url: &str) -> Reader {
             }
         };
         let r = if hls::is_hls(&url) {
-            read_hls(&url, &shared.stop, &mut pump)
+            read_hls(&url, skip_s, &shared.stop, &mut pump)
         } else {
             pump(&url).and_then(|more| if more { Err(ENDED.into()) } else { Ok(()) })
         };
@@ -124,7 +124,12 @@ fn read(url: &str) -> Reader {
 /// start for a complete playlist), then each new segment as the playlist lists it.
 // ponytail: no switching between variants on a slow network, and a gap or a discontinuity (an inserted
 // advert) jumps the timestamps, which the feed throttle then waits out.
-fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<bool, String>) -> Result<(), String> {
+fn read_hls(
+    url: &str,
+    skip_s: f64,
+    stop: &AtomicBool,
+    pump: &mut impl FnMut(&str) -> Result<bool, String>,
+) -> Result<(), String> {
     let mut url = url.to_string();
     let (mut next, mut masters, mut failed) = (None::<u64>, 0, 0);
     loop {
@@ -140,9 +145,10 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
         match hls::parse(&url, &String::from_utf8_lossy(&reply.body))? {
             hls::Playlist::Master(v) => {
                 masters += 1;
+                // The first of equal bandwidths: Jellyfin 12 gives every variant the same figure, best first.
                 url = v
                     .into_iter()
-                    .max_by_key(|v| v.0)
+                    .reduce(|a, b| if b.0 > a.0 { b } else { a })
                     .ok_or("The playlist has no stream.")?
                     .1;
                 if masters > 3 {
@@ -153,11 +159,19 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
                 seq,
                 target_s,
                 segs,
+                durs,
                 end,
             } => {
                 let last = seq + segs.len() as u64;
-                // A film's playlist is complete from the start: play it from its first segment.
-                let from = next.unwrap_or(if end { seq } else { last.saturating_sub(3) }).max(seq);
+                // A film's playlist is complete from the start: play it from the segment that holds `skip_s`
+                // seconds in (the server's playlists take no start time; Jellyfin 12 refuses one).
+                let from = next
+                    .unwrap_or(if end {
+                        seq + hls::index_at(&durs, skip_s) as u64
+                    } else {
+                        last.saturating_sub(3)
+                    })
+                    .max(seq);
                 for (n, seg) in (seq..).zip(&segs).skip((from - seq) as usize) {
                     match pump(seg) {
                         Ok(true) => failed = 0,
@@ -184,7 +198,7 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
 
 /// `--play <url>` on a desktop: reads ten seconds of the stream and says what the TV would be fed.
 pub fn probe(url: &str) -> ExitCode {
-    let rx = read(url);
+    let rx = read(url, 0.0);
     let rx = &rx.rx;
     let end = Instant::now() + Duration::from_secs(10);
     let (mut n, mut keys, mut last) = ([0u32; 2], 0, [0i64; 2]);
@@ -605,7 +619,7 @@ impl Player {
 
     fn session(&mut self, g: &Gfx, ch: &Channel, banner: &mut Banner) -> End {
         log(&format!("play: {}", ch.name));
-        let reader = read(&ch.url);
+        let reader = read(&ch.url, 0.0);
         let t = Instant::now();
         let (video, audio) = loop {
             match key() {

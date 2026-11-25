@@ -50,9 +50,9 @@ fn foreground() {
 }
 
 /// The server's HLS stream as a run: a thread carries what `read` finds into a queue.
-fn hls_run(url: &str) -> Run {
+fn hls_run(url: &str, skip_s: f64) -> Run {
     let q = Queue::new(12 * 1024 * 1024);
-    let reader = read(url);
+    let reader = read(url, skip_s);
     let out = q.clone();
     std::thread::spawn(move || {
         while !out.is_closed() {
@@ -352,7 +352,10 @@ impl Player {
                 let sub = choice.sub.filter(|s| !s.server).map(|s| s.index as i32);
                 d.start(start * 100, audio, sub, lossless_mode)
             }
-            Source::Server => hls_run(&film::hls_url(it, start, choice.audio)),
+            Source::Server => {
+                let (url, skip) = film::hls_url(it, start, choice.audio);
+                hls_run(&url, skip as f64 / TICKS as f64)
+            }
         };
         let t = Instant::now();
         let (video, audio, dv) = loop {
