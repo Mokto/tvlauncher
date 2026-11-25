@@ -783,8 +783,8 @@ pub fn child(url: &str) -> ExitCode {
 }
 
 /// Starts this program as the player process with `args` and waits for it, swallowing the launcher window's events
-/// meanwhile. The Home key (a relaunch, once registered) stops it: SIGTERM first, so LG's pipeline is released, and a
-/// kill after two seconds. Gives its exit status, None when a signal ended it. The launcher's window is raised again
+/// meanwhile. The Home key (a relaunch, once registered) stops it: SIGTERM first, so LG's pipeline is released and the
+/// server hears where it stopped, and a kill after eight seconds. Gives its exit status, None when a signal ended it. The launcher's window is raised again
 /// afterwards: the TV leaves it hidden.
 pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
     let exe = std::env::current_exe().unwrap_or_default();
@@ -810,7 +810,8 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
             unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
             asked = Some(Instant::now());
         }
-        if asked.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+        // The player needs up to 3 s to release LG's pipeline and 3 s more to tell the server where it stopped.
+        if asked.is_some_and(|t| t.elapsed() > Duration::from_secs(8)) {
             log("player: it did not stop, killing it");
             let _ = child.kill();
         }

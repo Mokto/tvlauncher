@@ -175,7 +175,7 @@ pub fn report(cfg: &Config, it: &Item, event: Event, ticks: i64, paused: bool) {
     let (url, token) = (format!("{}{path}", cfg.server), cfg.token.clone());
     let send = move || {
         let auth = format!("MediaBrowser Token=\"{token}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"");
-        if let Err(e) = crate::net::send(&url, Some(&body), &[("Authorization", auth)], 6) {
+        if let Err(e) = crate::net::send(&url, Some(&body), &[("Authorization", auth)], if wait { 3 } else { 6 }) {
             crate::sdl::log(&format!("film: report: {e}"));
         }
     };
