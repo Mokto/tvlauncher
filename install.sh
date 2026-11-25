@@ -12,6 +12,16 @@ done
 ssh "$TV" "mkdir -p $DEST && rm -f $DEST/tvlauncher.new"
 scp -q "$HERE/tvlauncher" "$TV:$DEST/tvlauncher.new"
 scp -q "$HERE/takeover.sh" "$HERE/debloat.sh" "$HERE/boot.sh" "$TV:$DEST/"
+# the film player's FFmpeg libraries
+if [ -d "$HERE/lib" ]; then
+  ssh "$TV" "mkdir -p $DEST/lib"
+  scp -q "$HERE"/lib/*.so.* "$TV:$DEST/lib/"
+fi
+# the receiver support of the film player (Settings, Player)
+if [ -d "$HERE/hbr" ]; then
+  ssh "$TV" "mkdir -p $DEST/hbr"
+  scp -q "$HERE"/hbr/* "$TV:$DEST/hbr/"
+fi
 ssh "$TV" "chmod 755 $DEST/tvlauncher.new $DEST/takeover.sh $DEST/boot.sh && mv $DEST/tvlauncher.new $DEST/tvlauncher"
 # the mount pins the old file, so a running launcher is switched off and on again
 if ssh "$TV" "[ -f /tmp/tvlauncher-home ]"; then

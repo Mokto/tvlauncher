@@ -9,6 +9,7 @@ description = "An Android TV-style Home for rooted LG webOS TVs."
 libc = "0.2"
 minreq = { version = "2", default-features = false }
 serde_json = "1"
+dolby_vision = { version = "=3.4.0", default-features = false }
 
 [profile.release]
 opt-level = 3

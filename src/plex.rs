@@ -35,6 +35,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// A server reached at `base` with its `token` (as a library tab already knows them).
+    pub fn conn(&self, base: &str, token: &str) -> Conn {
+        Conn {
+            base: base.into(),
+            token: token.into(),
+            client_id: self.client_id.clone(),
+        }
+    }
+
     pub fn load(root: &str) -> Option<Config> {
         let v: Value = serde_json::from_slice(&std::fs::read(format!("{root}{DIR}/plex.json")).ok()?).ok()?;
         let f = |k: &str| v[k].as_str().map(String::from);
@@ -52,7 +61,7 @@ impl Config {
     }
 }
 
-fn headers(client_id: &str, token: Option<&str>) -> Vec<(&'static str, String)> {
+pub(crate) fn headers(client_id: &str, token: Option<&str>) -> Vec<(&'static str, String)> {
     let mut h = vec![
         ("Accept", "application/json".to_string()),
         ("X-Plex-Client-Identifier", client_id.to_string()),
@@ -75,6 +84,59 @@ fn get(url: &str, h: &[(&str, String)], secs: u64) -> Result<Vec<u8>, String> {
 
 fn get_json(url: &str, h: &[(&str, String)], secs: u64) -> Result<Value, String> {
     serde_json::from_slice(&get(url, h, secs)?).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// A server of the account, reached at an address that answered: where its API and its files are.
+#[derive(Clone)]
+pub struct Conn {
+    pub base: String,
+    pub token: String,
+    pub client_id: String,
+}
+
+impl Conn {
+    pub fn get_json(&self, path: &str, secs: u64) -> Result<Value, String> {
+        get_json(
+            &format!("{}{path}", self.base),
+            &headers(&self.client_id, Some(&self.token)),
+            secs,
+        )
+    }
+
+    pub fn get_bytes(&self, path: &str, secs: u64) -> Result<Vec<u8>, String> {
+        get(
+            &format!("{}{path}", self.base),
+            &headers(&self.client_id, Some(&self.token)),
+            secs,
+        )
+    }
+
+    /// An address with the token in it, for what is read by something that sends no headers of ours (FFmpeg's
+    /// reader goes through `curl` with this as its address).
+    pub fn url(&self, path: &str) -> String {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        format!("{}{path}{sep}X-Plex-Token={}", self.base, self.token)
+    }
+}
+
+/// The server `machine` of the account, at the first of its addresses that answers.
+pub fn connect(cfg: &Config, machine: &str) -> Result<Conn, String> {
+    let server = servers(cfg)?
+        .into_iter()
+        .find(|s| s.id == machine)
+        .ok_or("That Plex server is not on the account.")?;
+    let h = [("X-Plex-Token", server.token.clone())];
+    let base = server
+        .urls
+        .iter()
+        .find(|u| get(&format!("{u}/identity"), &h, TRY_SECS).is_ok())
+        .ok_or("The Plex server did not answer.")?
+        .clone();
+    Ok(Conn {
+        base,
+        token: server.token,
+        client_id: cfg.client_id.clone(),
+    })
 }
 
 /// Signing out deletes the login and the cache here. The token itself stays valid at Plex until it is removed

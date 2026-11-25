@@ -20,6 +20,14 @@ use std::time::{Duration, Instant};
 /// (for testing without the remote).
 pub const TRIGGER: &str = "/tmp/tvlauncher-play";
 const AHEAD_NS: i64 = 1_600_000_000;
+mod vod;
+pub use vod::{child as film_child, child_in as film_child_in, film_sim_keys, shot as film_shot};
+
+/// For testing without the remote: `film:<item id>` or a stream address in this file makes the running launcher
+/// start the player process for it.
+pub const SPAWN: &str = "/tmp/tvlauncher-spawn";
+/// What a finished HLS playlist ends with: a film's end, an error for a channel.
+const ENDED: &str = "The stream ended.";
 /// The pipeline's app id. The media resource manager never gives a decoder to com.webos.app.home.
 const APP: &str = "tvlauncher";
 
@@ -53,7 +61,7 @@ impl Drop for Reader {
 
 /// Reads `url` on a thread: one MPEG-TS stream, or the segments of an HLS one in turn, through one demuxer.
 /// The bounded channel holds the stream back while the pipeline is full.
-fn read(url: &str) -> Reader {
+fn read(url: &str, skip_s: f64) -> Reader {
     let (tx, rx) = sync_channel(256);
     let curl = Arc::new(Curl::default());
     let (url, shared) = (url.to_string(), curl.clone());
@@ -101,9 +109,9 @@ fn read(url: &str) -> Reader {
             }
         };
         let r = if hls::is_hls(&url) {
-            read_hls(&url, &shared.stop, &mut pump)
+            read_hls(&url, skip_s, &shared.stop, &mut pump)
         } else {
-            pump(&url).and_then(|more| if more { Err("The stream ended.".into()) } else { Ok(()) })
+            pump(&url).and_then(|more| if more { Err(ENDED.into()) } else { Ok(()) })
         };
         if let Err(e) = r {
             let _ = tx.send(Msg::End(e));
@@ -112,11 +120,16 @@ fn read(url: &str) -> Reader {
     Reader { rx, curl }
 }
 
-/// A live HLS stream: the variant with the most bandwidth, from three segments before the live edge, then
-/// each new segment as the playlist lists it.
+/// An HLS stream: the variant with the most bandwidth, from three segments before the live edge (or from the
+/// start for a complete playlist), then each new segment as the playlist lists it.
 // ponytail: no switching between variants on a slow network, and a gap or a discontinuity (an inserted
 // advert) jumps the timestamps, which the feed throttle then waits out.
-fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<bool, String>) -> Result<(), String> {
+fn read_hls(
+    url: &str,
+    skip_s: f64,
+    stop: &AtomicBool,
+    pump: &mut impl FnMut(&str) -> Result<bool, String>,
+) -> Result<(), String> {
     let mut url = url.to_string();
     let (mut next, mut masters, mut failed) = (None::<u64>, 0, 0);
     loop {
@@ -132,9 +145,10 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
         match hls::parse(&url, &String::from_utf8_lossy(&reply.body))? {
             hls::Playlist::Master(v) => {
                 masters += 1;
+                // The first of equal bandwidths: Jellyfin 12 gives every variant the same figure, best first.
                 url = v
                     .into_iter()
-                    .max_by_key(|v| v.0)
+                    .reduce(|a, b| if b.0 > a.0 { b } else { a })
                     .ok_or("The playlist has no stream.")?
                     .1;
                 if masters > 3 {
@@ -145,10 +159,19 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
                 seq,
                 target_s,
                 segs,
+                durs,
                 end,
             } => {
                 let last = seq + segs.len() as u64;
-                let from = next.unwrap_or(last.saturating_sub(3)).max(seq);
+                // A film's playlist is complete from the start: play it from the segment that holds `skip_s`
+                // seconds in (the server's playlists take no start time; Jellyfin 12 refuses one).
+                let from = next
+                    .unwrap_or(if end {
+                        seq + hls::index_at(&durs, skip_s) as u64
+                    } else {
+                        last.saturating_sub(3)
+                    })
+                    .max(seq);
                 for (n, seg) in (seq..).zip(&segs).skip((from - seq) as usize) {
                     match pump(seg) {
                         Ok(true) => failed = 0,
@@ -162,7 +185,7 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
                     next = Some(n + 1);
                 }
                 if end && next.unwrap_or(0) >= last {
-                    return Err("The stream ended.".into());
+                    return Err(ENDED.into());
                 }
                 let wait = Duration::from_millis(target_s.clamp(1, 10) * 500);
                 if let Some(rest) = wait.checked_sub(t.elapsed()) {
@@ -175,7 +198,7 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
 
 /// `--play <url>` on a desktop: reads ten seconds of the stream and says what the TV would be fed.
 pub fn probe(url: &str) -> ExitCode {
-    let rx = read(url);
+    let rx = read(url, 0.0);
     let rx = &rx.rx;
     let end = Instant::now() + Duration::from_secs(10);
     let (mut n, mut keys, mut last) = ([0u32; 2], 0, [0i64; 2]);
@@ -220,6 +243,7 @@ struct Smp {
     // Returns a std::string through the hidden pointer in the first argument.
     feed: unsafe extern "C" fn(*mut c_void, Obj, *const c_char),
     play: unsafe extern "C" fn(Obj) -> c_int,
+    pause: unsafe extern "C" fn(Obj) -> c_int,
     unload: unsafe extern "C" fn(Obj) -> c_int,
     loaded: unsafe extern "C" fn(Obj) -> c_int,
     delete: unsafe extern "C" fn(*mut c_void),
@@ -249,6 +273,8 @@ static ERROR: Mutex<Option<String>> = Mutex::new(None);
 static UNLOADED: AtomicBool = AtomicBool::new(false);
 /// The picture's size, from the video info (event 4), as width << 16 | height.
 static SIZE: AtomicU32 = AtomicU32::new(0);
+/// The picture's dynamic range as the TV reports it (event 4's `hdrType`), for Info.
+static HDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// The pipeline's events, from its own threads: the first few of each type go to the log.
 extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
@@ -262,7 +288,7 @@ extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
             unsafe { CStr::from_ptr(s) }
                 .to_string_lossy()
                 .chars()
-                .take(300)
+                .take(600)
                 .collect()
         };
         log(&format!("smp event {kind} {num} {s}"));
@@ -276,6 +302,9 @@ extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
             let (w, h) = (v["video"]["width"].as_u64(), v["video"]["height"].as_u64());
             if let (Some(w @ 1..=8192), Some(h @ 1..=8192)) = (w, h) {
                 SIZE.store((w as u32) << 16 | h as u32, Ordering::SeqCst);
+            }
+            if let Some(t) = v["video"]["hdrType"].as_str() {
+                *HDR.lock().unwrap_or_else(|e| e.into_inner()) = t.to_string();
             }
         }
     }
@@ -307,6 +336,7 @@ impl Smp {
                 load: sym(lib, c"_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_E")?,
                 feed: sym(lib, c"_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc")?,
                 play: sym(lib, c"_ZN17StarfishMediaAPIs4PlayEv")?,
+                pause: sym(lib, c"_ZN17StarfishMediaAPIs5PauseEv")?,
                 unload: sym(lib, c"_ZN17StarfishMediaAPIs6UnloadEv")?,
                 loaded: sym(lib, c"_ZN17StarfishMediaAPIs15isLoadCompletedEv")?,
                 delete: sym(libc::RTLD_DEFAULT, c"_ZdlPv")?,
@@ -374,6 +404,24 @@ impl Smp {
 
 /// The Load payload (the shape of ss4s and Native Jelly). `windowId` binds the picture to our exported window.
 fn payload(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> String {
+    payload_dv(app, window, video, audio, None)
+}
+
+/// The same with Dolby Vision declared: `profile` is the stream's profile (5 or 8), which the pipeline then shows in
+/// Dolby Vision. The node sits in `contents`, as Native Jelly sends it (`with_dolby_hdr_info`).
+fn payload_dv(app: &str, window: &str, video: Codec, audio: Option<Codec>, profile: Option<u8>) -> String {
+    let p = payload_base(app, window, video, audio);
+    match profile.filter(|_| video == Codec::H265 || video == Codec::H264) {
+        Some(n) => p.replacen(
+            r#""provider":"tvlauncher""#,
+            &format!(r#""provider":"tvlauncher","DolbyHdrInfo":{{"trackType":"single","encryptionType":"clear","profileId":{n}}}"#),
+            1,
+        ),
+        None => p,
+    }
+}
+
+fn payload_base(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> String {
     let (w, h) = if video == Codec::H265 {
         (3840, 2160)
     } else {
@@ -384,8 +432,13 @@ fn payload(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> Strin
         codec.push_str(&format!(r#","audio":"{}""#, a.payload_name()));
     }
     format!(
-        r#"{{"args":[{{"mediaTransportType":"BUFFERSTREAM","option":{{"appId":"{app}","windowId":"{window}","externalStreamingInfo":{{"contents":{{"codec":{{{codec}}},"esInfo":{{"pauseAtDecodeTime":false,"ptsToDecode":0,"seperatedPTS":true}},"format":"RAW","provider":"tvlauncher"}},"streamQualityInfo":true,"audioSync":true,"restartStreaming":false,"bufferingCtrInfo":{{"bufferMaxLevel":0,"bufferMinLevel":0,"preBufferByte":0,"qBufferLevelAudio":0,"qBufferLevelVideo":0,"srcBufferLevelAudio":{{"minimum":1,"maximum":1048576}},"srcBufferLevelVideo":{{"minimum":1,"maximum":8388608}}}}}},"needAudio":{},"queryPosition":false,"lowDelayMode":false,"transmission":{{"contentsType":"LIVE"}},"adaptiveStreaming":{{"audioOnly":false,"maxWidth":{w},"maxHeight":{h},"maxFrameRate":60}}}}}}]}}"#,
-        audio.is_some()
+        r#"{{"args":[{{"mediaTransportType":"BUFFERSTREAM","option":{{"appId":"{app}","windowId":"{window}","externalStreamingInfo":{{"contents":{{"codec":{{{codec}}},"esInfo":{{"pauseAtDecodeTime":false,"ptsToDecode":0,"seperatedPTS":true}},"format":"RAW","provider":"tvlauncher"{pcm}}},"streamQualityInfo":true,"audioSync":true,"restartStreaming":false,"bufferingCtrInfo":{{"bufferMaxLevel":0,"bufferMinLevel":0,"preBufferByte":0,"qBufferLevelAudio":0,"qBufferLevelVideo":0,"srcBufferLevelAudio":{{"minimum":1,"maximum":1048576}},"srcBufferLevelVideo":{{"minimum":1,"maximum":8388608}}}}}},"needAudio":{},"queryPosition":false,"lowDelayMode":false,"transmission":{{"contentsType":"LIVE"}},"adaptiveStreaming":{{"audioOnly":false,"maxWidth":{w},"maxHeight":{h},"maxFrameRate":60}}}}}}]}}"#,
+        audio.is_some(),
+        pcm = if audio == Some(Codec::Pcm) {
+            r#","pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#
+        } else {
+            ""
+        },
     )
 }
 
@@ -401,6 +454,9 @@ const K_PAGEDOWN: i32 = 0x4000_004e;
 /// The remote, while a channel plays: Back (or Home, or quitting) leaves, Up and Down change channel, OK shows
 /// the banner. A quit is put back for the main loop.
 fn key() -> Option<Key> {
+    if STOP.load(Ordering::SeqCst) {
+        return Some(Key::Back);
+    }
     let mut e = Event::new(0);
     while unsafe { SDL_PollEvent(&mut e) } != 0 {
         if e.kind() == QUIT {
@@ -568,7 +624,7 @@ impl Player {
 
     fn session(&mut self, g: &Gfx, ch: &Channel, banner: &mut Banner) -> End {
         log(&format!("play: {}", ch.name));
-        let reader = read(&ch.url);
+        let reader = read(&ch.url, 0.0);
         let t = Instant::now();
         let (video, audio) = loop {
             match key() {
@@ -735,9 +791,110 @@ impl Player {
         end
     }
 }
+/// Set by SIGTERM in the `--player` process: Home wants the screen back, and playback ends as on Back.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// POC: the `--player` process. Opens its own window and plays `url` until Back.
+pub fn child(url: &str) -> ExitCode {
+    unsafe { libc::signal(libc::SIGTERM, on_term as *const () as usize) };
+    let Some((_win, ren)) = crate::start("", false) else {
+        return ExitCode::FAILURE;
+    };
+    let g = Gfx::new("", ren, |name, size| crate::font("", name, size));
+    let mut p = match Player::new() {
+        Ok(p) => p,
+        Err(e) => {
+            log(&format!("player: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let ch = Channel {
+        name: "Test".into(),
+        group: String::new(),
+        url: url.into(),
+        logo: None,
+        epg: String::new(),
+    };
+    p.watch(&g, &[ch], 0, &Guide::new());
+    log("player: done");
+    ExitCode::SUCCESS
+}
+
+/// Starts this program as the player process with `args` and waits for it, swallowing the launcher window's events
+/// meanwhile. The Home key (a relaunch, once registered) stops it: SIGTERM first, so LG's pipeline is released and the
+/// server hears where it stopped, and a kill after eight seconds. Gives its exit status, None when a signal ended it. The launcher's window is raised again
+/// afterwards: the TV leaves it hidden.
+pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let t = Instant::now();
+    // Its own app id: while the player's window carries Home's id the app manager takes Home to be in front already and
+    // the Home key does nothing (checked on the TV); with another id the key launches Home, which arrives as a relaunch.
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env("APPID", "tvlauncher.player");
+    let mut child = match cmd.args(args).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!("player: {}: {e}", exe.display()));
+            return Some(1);
+        }
+    };
+    log(&format!(
+        "player: pid {} for {}",
+        child.id(),
+        args.first().unwrap_or(&"")
+    ));
+    // Only a registered Home hears the Home key (as a relaunch) while another window is in front.
+    crate::lifecycle::RELAUNCH.store(false, Ordering::SeqCst);
+    crate::lifecycle::register(wake);
+    let mut asked: Option<Instant> = None;
+    let status = loop {
+        if asked.is_none() && crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
+            log("player: Home key, stopping the player");
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            asked = Some(Instant::now());
+        }
+        // The player needs up to 3 s to release LG's pipeline and 3 s more to tell the server where it stopped.
+        if asked.is_some_and(|t| t.elapsed() > Duration::from_secs(8)) {
+            log("player: it did not stop, killing it");
+            let _ = child.kill();
+        }
+        let mut e = Event::new(0);
+        while unsafe { SDL_PollEvent(&mut e) } != 0 {}
+        if let Ok(Some(st)) = child.try_wait() {
+            break st;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    log(&format!("player: ended {status} after {} ms", t.elapsed().as_millis()));
+    unsafe {
+        SDL_ShowWindow(win);
+        SDL_RaiseWindow(win);
+    }
+    status.code()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dts_core_is_declared_as_lgs_stereo_48k_pcm_input() {
+        let p = payload("a", "w", Codec::H264, Some(Codec::Pcm));
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        let c = &v["args"][0]["option"]["externalStreamingInfo"]["contents"];
+        assert_eq!(c["codec"]["audio"], "PCM");
+        assert_eq!(
+            c["pcmInfo"],
+            serde_json::json!({"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16})
+        );
+        for a in [Codec::Ac3, Codec::Eac3, Codec::Aac] {
+            assert!(!payload("a", "w", Codec::H264, Some(a)).contains("pcmInfo"));
+        }
+    }
 
     #[test]
     fn payload_is_json_with_the_window_and_codecs() {

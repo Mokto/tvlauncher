@@ -4,10 +4,12 @@ use std::ffi::{c_int, CStr};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const CRASH_FILE: &CStr = c"/tmp/tvlauncher-crashes";
 
 pub static RELAUNCH: AtomicBool = AtomicBool::new(false);
+static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_crash(sig: c_int) {
     // Only async-signal-safe calls: open, write, close, signal, raise. One line per crash, the time in seconds;
@@ -58,6 +60,9 @@ pub fn note_failed_start() {
 ///
 /// Opt-in (`<DIR>/register`): not yet seen to bring the window to the front on a relaunch.
 pub fn register(wake: u32) {
+    if REGISTERED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(move || {
         let child = Command::new("/usr/bin/luna-send")
             .args([
@@ -74,7 +79,7 @@ pub fn register(wake: u32) {
         let Ok(mut child) = child else {
             return log("register: luna-send did not start");
         };
-        let mut registered = false;
+        let mut registered: Option<Instant> = None;
         for line in BufReader::new(child.stdout.take().expect("piped"))
             .lines()
             .map_while(Result::ok)
@@ -84,15 +89,19 @@ pub fn register(wake: u32) {
                 return;
             }
             if line.contains("\"registered\"") {
-                registered = true;
+                registered = Some(Instant::now());
             } else if line.contains("\"relaunch\"") {
+                // The app manager answers the registration itself with a relaunch (seen on the TV): not the Home key.
+                if registered.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    continue;
+                }
                 RELAUNCH.store(true, Ordering::SeqCst);
                 unsafe { SDL_PushEvent(&mut Event::new(wake)) };
             } else if line.contains("\"close\"") {
                 std::process::exit(0);
             }
         }
-        if registered {
+        if registered.is_some() {
             log("register: the app manager went away");
             std::process::exit(0);
         }

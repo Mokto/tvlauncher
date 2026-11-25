@@ -128,6 +128,8 @@ pub const K_KP_ENTER: i32 = 0x4000_0058;
 pub const K_RIGHT: i32 = 0x4000_004f;
 pub const K_LEFT: i32 = 0x4000_0050;
 pub const K_DOWN: i32 = 0x4000_0051;
+pub const K_PAGEUP: i32 = 0x4000_004B;
+pub const K_PAGEDOWN: i32 = 0x4000_004E;
 pub const K_UP: i32 = 0x4000_0052;
 
 pub type LogFn = extern "C" fn(*mut c_void, c_int, c_int, *const c_char);
@@ -155,6 +157,7 @@ extern "C" {
     pub fn SDL_RenderPresent(r: *mut Opaque);
     pub fn SDL_RaiseWindow(win: *mut Opaque);
     pub fn SDL_ShowWindow(win: *mut Opaque);
+    pub fn SDL_HideWindow(win: *mut Opaque);
     pub fn SDL_ShowCursor(toggle: c_int) -> c_int;
     pub fn SDL_RenderFillRectF(r: *mut Opaque, rect: *const FRect) -> c_int;
     pub fn SDL_RenderCopyF(r: *mut Opaque, t: *mut Opaque, src: *const Rect, dst: *const FRect) -> c_int;
@@ -249,6 +252,29 @@ impl Tex {
     }
     pub fn ptr(&self) -> *mut Opaque {
         self.p
+    }
+
+    /// A texture of `w` x `h` pixels from R, G, B, A bytes (a subtitle bitmap), blended over what is behind it.
+    pub fn rgba(ren: *mut Opaque, w: i32, h: i32, px: &[u8]) -> Option<Tex> {
+        if w <= 0 || h <= 0 || px.len() < (w * h * 4) as usize {
+            return None;
+        }
+        let s = Surf(unsafe { SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, PIXELFORMAT_ARGB8888) });
+        if s.0.is_null() {
+            return None;
+        }
+        let stride = unsafe { (*s.0).pitch as usize / 4 };
+        let dst = unsafe { (*s.0).pixels as *mut u32 };
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let p = &px[(y * w as usize + x) * 4..][..4];
+                let v = (p[3] as u32) << 24 | (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+                unsafe { *dst.add(y * stride + x) = v };
+            }
+        }
+        let t = Tex::new(ren, &s)?;
+        unsafe { SDL_SetTextureBlendMode(t.ptr(), BLENDMODE_BLEND) };
+        Some(t)
     }
 }
 

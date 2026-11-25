@@ -147,6 +147,35 @@ pub fn apply_debloat(root: &str) {
     }
 }
 
+/// `hbr/hbr.sh status`: whether the receiver link's kernel module is installed and active.
+pub fn hbr_status() -> String {
+    crate::ff::lossless::hbr_status(DIR)
+}
+
+/// Runs `hbr/hbr.sh <action>` (`install` or `remove`) off the main thread; the one result line comes back on the channel,
+/// and `wake` makes the launcher look.
+pub fn hbr_run(action: &'static str, wake: u32) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new("/bin/sh")
+            .arg(format!("{DIR}/hbr/hbr.sh"))
+            .arg(action)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let line = out.map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .last()
+                .unwrap_or("")
+                .to_string()
+        });
+        let _ = tx.send(line.unwrap_or_else(|_| "hbr: REFUSED: could not run".into()));
+        unsafe { crate::sdl::SDL_PushEvent(&mut crate::sdl::Event::new(wake)) };
+    });
+    rx
+}
+
 const BOOT_HOOK: &str = "/var/lib/webosbrew/init.d/20-tvlauncher-home";
 
 /// Whether the TV starts this launcher as Home at boot (`takeover.sh boot`).
@@ -431,8 +460,43 @@ pub struct Prefs {
     pub tab_names: BTreeMap<String, String>,
     /// The Continue watching rows turned off: "jellyfin", "plex".
     pub rows_off: Vec<String>,
+    /// Jellyfin titles play in the launcher's own player rather than the Jellyfin app.
+    pub jf_player: bool,
+    /// DTS, DTS-HD and TrueHD go to an AV receiver unconverted (`ff::lossless`).
+    pub lossless: bool,
+    /// "auto", "off" (the server always converts) or "force" (never), and the most the server's conversion may send in
+    /// megabits per second (0 for no limit).
+    pub direct: String,
+    pub max_mbps: u32,
+    /// The language films start in ("" for the server's choice, else a code of `lang::LANGS`), how subtitles start
+    /// ("default", "off", "on", "forced" or "smart") and their language ("" for the audio language).
+    pub audio_lang: String,
+    pub sub_mode: String,
+    pub sub_lang: String,
     /// How the library tabs are sorted: "name" or "added".
     pub lib_sort: String,
+    /// The film player's Options, which it saves itself (see [`Prefs::save_look`]).
+    pub look: Look,
+}
+
+/// The film player's subtitle look and skip step: indexes into the player's lists of choices.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Look {
+    pub sub_size: usize,
+    pub sub_pos: usize,
+    pub sub_bg: bool,
+    pub skip: usize,
+}
+
+impl Default for Look {
+    fn default() -> Look {
+        Look {
+            sub_size: 1,
+            sub_pos: 0,
+            sub_bg: true,
+            skip: 1,
+        }
+    }
 }
 
 /// The groups `debloat.sh` knows, with what each stops.
@@ -469,15 +533,40 @@ impl Prefs {
             tabs: list("tabs"),
             tabs_off: list("tabsOff"),
             rows_off: list("rowsOff"),
+            jf_player: v["jfPlayer"].as_bool().unwrap_or(true),
+            lossless: v["lossless"].as_bool().unwrap_or(false),
+            direct: v["direct"].as_str().unwrap_or("auto").into(),
+            max_mbps: v["maxMbps"].as_u64().unwrap_or(0) as u32,
+            audio_lang: v["audioLang"].as_str().unwrap_or_default().into(),
+            sub_mode: v["subMode"].as_str().unwrap_or("default").into(),
+            sub_lang: v["subLang"].as_str().unwrap_or_default().into(),
             tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
             lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
+            look: {
+                let d = Look::default();
+                let n = |k: &str, d: usize| v[k].as_u64().map_or(d, |n| n as usize);
+                Look {
+                    sub_size: n("subSize", d.sub_size),
+                    sub_pos: n("subPos", d.sub_pos),
+                    sub_bg: v["subBg"].as_bool().unwrap_or(d.sub_bg),
+                    skip: n("skipBy", d.skip),
+                }
+            },
             path,
         }
     }
 
+    /// The player process saves its Options over what is on disk now, so it keeps the launcher's other settings; the
+    /// launcher reads them back when the player ends.
+    pub fn save_look(root: &str, look: Look) {
+        let mut p = Prefs::load(root);
+        p.look = look;
+        p.save();
+    }
+
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort, "subSize": self.look.sub_size, "subPos": self.look.sub_pos, "subBg": self.look.sub_bg, "skipBy": self.look.skip })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

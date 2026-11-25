@@ -4,13 +4,13 @@ use crate::gfx::*;
 use crate::iptv::{self, Channel, Got, Guide};
 use crate::jellyfin::{self, Watch, DEFAULT_APP};
 use crate::keyboard::{Prompt, Typed};
-use crate::library;
 use crate::login::{Login, Signed};
 use crate::plex::{self, Tile as PlexTile};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
 use crate::tv;
 use crate::youtube::{self, Tile};
+use crate::{detail, library};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -18,6 +18,21 @@ use std::sync::mpsc::{Receiver, Sender};
 const SHELF: f32 = 0.84;
 /// How long OK is held on an app before its options open.
 const HOLD_MS: u32 = 700;
+
+/// How films are delivered (`film::DIRECT`), as Settings words it.
+const DIRECT_MODES: [(&str, &str); 3] = [("auto", "Automatic"), ("off", "Off"), ("force", "Forced")];
+
+/// The choices of the server's streaming quality, in Mbps; 0 is no limit.
+const QUALITIES: [u32; 7] = [0, 40, 20, 12, 8, 4, 2];
+
+/// How subtitles start (`film::pick`), as Settings words it.
+const SUB_MODES: [(&str, &str); 5] = [
+    ("default", "Server's choice"),
+    ("off", "Off"),
+    ("on", "Always on"),
+    ("forced", "Forced only"),
+    ("smart", "Foreign audio only"),
+];
 /// How long a featured movie or series stays on Home before the next one.
 const FEATURED_MS: u32 = 30_000;
 const PINNED: usize = 0;
@@ -41,6 +56,8 @@ fn row_height(row: usize) -> f32 {
 }
 
 enum Opt {
+    /// A choice of a title's page (see `detail`).
+    Detail(detail::Act),
     Move,
     Hide,
     Show,
@@ -69,6 +86,12 @@ enum Opt {
     Unfav(String),
     /// The details of the focused programme.
     TvDetails,
+    DirectMode(&'static str),
+    Quality(u32),
+    /// The language films start in, how subtitles start, and their language ("" for none, else a `lang::LANGS` code).
+    AudioLang(&'static str),
+    SubMode(&'static str),
+    SubLang(&'static str),
     /// Sort the library tabs by "name" or by date "added".
     LibSort(&'static str),
     RefreshLib,
@@ -191,6 +214,9 @@ pub struct App {
     px_pending: bool,
     /// Set while an app is being uninstalled; the app list is read again when it ends.
     rm_rx: Option<Receiver<()>>,
+    /// `hbr.sh status` as last read, and the install or removal running now.
+    hbr: Option<String>,
+    hbr_rx: Option<Receiver<String>>,
     /// First paint on the TV: apps and inputs are fetched on a thread.
     luna_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>,
     bgl: Background,
@@ -202,6 +228,8 @@ pub struct App {
     libs: Vec<Lib>,
     /// The tab shown: empty for Home, "tv", or a library's id.
     tab: String,
+    /// The page of a library title, over its tab.
+    detail: Option<Box<detail::Page>>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -267,6 +295,8 @@ impl App {
             yt_pending: false,
             px_pending: false,
             rm_rx: None,
+            hbr: None,
+            hbr_rx: None,
             luna_rx: None,
             bgl,
             jf,
@@ -291,6 +321,7 @@ impl App {
             last_settings: (0, 0, false),
             in_settings: false,
             ok_down: None,
+            detail: None,
             cog_f: 0.0,
         };
         if let Some(jf) = &app.jf {
@@ -554,6 +585,84 @@ impl App {
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
+        let direct = DIRECT_MODES
+            .iter()
+            .find(|m| m.0 == self.prefs.direct)
+            .map_or(DIRECT_MODES[0].1, |m| m.1);
+        let quality = match self.prefs.max_mbps {
+            0 => "Maximum".to_string(),
+            m => format!("{m} Mbps"),
+        };
+        let player = vec![
+            entry(
+                Act::JfPlayer,
+                "Play in the launcher",
+                "Plays Jellyfin and Plex films with the launcher's own player. Collections and what it cannot start still open in the app.",
+                Value::Switch(self.prefs.jf_player),
+            ),
+            entry(
+                Act::Direct,
+                "Direct Play",
+                "Automatic plays the file as it is when the TV can. Off always has the server convert. Forced never does, and says why.",
+                text(direct),
+            ),
+            entry(
+                Act::Quality,
+                "Streaming quality",
+                "The most the server may send when it converts a film: lower it on a slow connection. Direct Play is not limited.",
+                text(&quality),
+            ),
+        ];
+        let language = |code: &str, none: &str| match code {
+            "" => none.to_string(),
+            c => crate::lang::name(c),
+        };
+        let sub_mode = SUB_MODES
+            .iter()
+            .find(|m| m.0 == self.prefs.sub_mode)
+            .map_or(SUB_MODES[0].1, |m| m.1);
+        let mut audio = vec![
+            entry(
+                Act::AudioLang,
+                "Audio language",
+                "The language films start in, when the file has a track in it. Otherwise the server's choice.",
+                text(&language(&self.prefs.audio_lang, "Server's choice")),
+            ),
+            entry(
+                Act::SubMode,
+                "Subtitles",
+                "When subtitles start. Foreign audio only: when the audio is not in the subtitle language.",
+                text(sub_mode),
+            ),
+            entry(
+                Act::SubLang,
+                "Subtitle language",
+                "The language of the subtitles that start. Without one it is the audio language.",
+                text(&language(&self.prefs.sub_lang, "Same as audio")),
+            ),
+            entry(
+                Act::Lossless,
+                "Lossless audio to a receiver",
+                "DTS and DTS-HD MA go unchanged to an AV receiver (Digital Sound Output: Pass Through). TrueHD, Atmos and DTS:X need the row below.",
+                Value::Switch(self.prefs.lossless),
+            ),
+        ];
+        if self.prefs.lossless {
+            let state = match self.hbr.as_deref() {
+                _ if self.hbr_rx.is_some() => "Working...",
+                Some(s) if s.contains("not installed") => "Not installed",
+                Some(s) if s.contains("active") && !s.contains("not active") => "Installed",
+                Some(s) if s.contains("not active") => "Restart the TV",
+                Some(s) if s.contains("REFUSED") => "Refused",
+                _ => "Unknown",
+            };
+            audio.push(entry(
+                Act::Hbr,
+                "Atmos, TrueHD and DTS:X (root)",
+                "Installs a kernel module that opens the 8-channel eARC link TrueHD, Atmos and DTS:X need. Tested on an LG C1 (03.53.45) only.",
+                text(state),
+            ));
+        }
         let host = |url: &str| {
             let rest = url.split_once("://").map_or(url, |(_, r)| r);
             rest.split(['/', '?']).next().unwrap_or(rest).to_string()
@@ -615,10 +724,12 @@ impl App {
             })
             .collect::<Vec<_>>();
         let tabs = (!tabs.is_empty()).then_some(("Tabs", tabs));
+        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", player));
         tabs.into_iter()
+            .chain([("Jellyfin", jellyfin), ("Plex", plex)])
+            .chain(player)
             .chain([
-                ("Jellyfin", jellyfin),
-                ("Plex", plex),
+                ("Audio", audio),
                 ("YouTube", youtube),
                 ("Live TV", tv),
                 ("Ads and privacy", privacy),
@@ -644,7 +755,12 @@ impl App {
         self.mode = Mode::Settings(Box::new(page));
     }
 
+    fn load_hbr(&mut self) {
+        self.hbr = (self.prefs.lossless && self.luna.root.is_empty()).then(data::hbr_status);
+    }
+
     fn open_settings(&mut self) {
+        self.load_hbr();
         self.last_settings = (0, 0, false);
         self.show_settings();
     }
@@ -800,8 +916,53 @@ impl App {
         lib.asked.clear();
     }
 
-    /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
+    /// Opens the focused title's page, or its page in the media app when films do not play in the launcher.
     fn open_title(&mut self) {
+        if !self.prefs.jf_player {
+            return self.open_in_app();
+        }
+        let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) else {
+            return;
+        };
+        let page = &lib.pages[&self.tab];
+        let Some(t) = page.title().cloned() else { return };
+        let backend = match (page.source(), &self.px, &self.jf) {
+            (library::Source::Plex { base, token }, Some(px), _) => {
+                let server = lib.views.iter().find(|v| v.id == self.tab).map(|v| v.server.clone());
+                detail::Backend::Plex(px.cfg.conn(&base, &token), server.unwrap_or_default())
+            }
+            (library::Source::Jellyfin(_), _, Some(jf)) => detail::Backend::Jellyfin(jf.cfg.clone()),
+            _ => return self.open_in_app(),
+        };
+        let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
+        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, page.source(), self.wake)));
+        lib.asked.clear();
+        self.animating = true;
+    }
+
+    /// What a title's page asked for.
+    fn detail_act(&mut self, a: detail::Act) {
+        match a {
+            detail::Act::Play(spec) => {
+                if self.film(&spec) {
+                    self.open_in_app();
+                }
+                if let Some(d) = &mut self.detail {
+                    d.reload();
+                }
+            }
+            detail::Act::Mark(id, played) => {
+                if let Some(d) = &mut self.detail {
+                    detail::mark(d.backend.clone(), id.clone(), played);
+                    d.marked(&id, played);
+                }
+            }
+        }
+        self.animating = true;
+    }
+
+    /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
+    fn open_in_app(&mut self) {
         let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
             return;
         };
@@ -821,13 +982,60 @@ impl App {
                 card: None,
                 bg: None,
             };
-            self.luna.launch(&tile.item(&self.plex_app()));
-        } else if let Some(jf) = &self.jf {
-            let mut it = Item::new(format!("jf:{}", t.id), self.jf_app(), Kind::Watch, Some(t.name.clone()));
-            it.params =
-                Some(serde_json::json!({ "itemId": t.id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
-            self.luna.launch(&it);
+            let item = tile.item(&self.plex_app());
+            if !(self.prefs.jf_player && !self.film(&item.key)) {
+                self.luna.launch(&item);
+            }
+        } else if let Some(item) = self.jf_item(&t.id, &t.name) {
+            if !(self.prefs.jf_player && !self.film(&t.id.clone())) {
+                self.luna.launch(&item);
+            }
         }
+    }
+
+    /// The title's page in the Jellyfin app.
+    fn jf_item(&self, id: &str, name: &str) -> Option<Item> {
+        let jf = self.jf.as_ref()?;
+        let mut it = Item::new(format!("jf:{id}"), self.jf_app(), Kind::Watch, Some(name.to_string()));
+        it.params = Some(serde_json::json!({ "itemId": id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
+        Some(it)
+    }
+
+    /// Plays a Jellyfin or Plex title in the launcher's own player (a process of its own, see `player::run_child`).
+    /// `spec` is a Jellyfin item id or `plex:<server>:<rating key>`. What it cannot play (a collection) or cannot
+    /// start is left to the caller: this gives true then, and the caller opens the title in the media app.
+    fn film(&mut self, spec: &str) -> bool {
+        if !self.luna.root.is_empty() {
+            log("play: the simulator has no player");
+            return true;
+        }
+        let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
+        let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
+        self.prefs.look = Prefs::load(&self.luna.root).look;
+        // What was watched moves up in Continue watching and in the libraries.
+        self.refresh_jellyfin();
+        self.refresh_plex();
+        for lib in self.libs.iter().filter(|l| !l.plex) {
+            let _ = lib.refresh.send(true);
+        }
+        not_played
+    }
+
+    /// For testing without the remote: what `player::SPAWN` holds, `film:<item id>` or a stream address.
+    pub fn spawn_file(&mut self) {
+        let Ok(what) = std::fs::read_to_string(crate::player::SPAWN) else {
+            return;
+        };
+        let _ = std::fs::remove_file(crate::player::SPAWN);
+        match what.trim().strip_prefix("film:") {
+            Some(id) => drop(self.film(id)),
+            None => drop(crate::player::run_child(
+                self.win,
+                self.wake,
+                &["--player", what.trim()],
+            )),
+        }
+        self.animating = true;
     }
 
     /// The tabs after Home that can be shown, in the user's order: (key, name, shown).
@@ -1117,6 +1325,14 @@ impl App {
                 None => self.pick_home_bg(false),
             }
         }
+        if let Some(Ok(line)) = self.hbr_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.hbr_rx = None;
+            log(&format!("hbr: {line}"));
+            self.load_hbr();
+            if matches!(self.mode, Mode::Settings(_)) {
+                self.show_settings();
+            }
+        }
         if self.rm_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
             self.rm_rx = None;
             self.load();
@@ -1186,17 +1402,29 @@ impl App {
         if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
             self.tab.clear();
         }
+        if self.detail.as_mut().and_then(|d| d.poll(&self.g)) == Some(true) {
+            self.detail = None;
+            self.open_in_app();
+        }
         let tab = self.tab.clone();
         for lib in &mut self.libs {
             while let Ok(path) = lib.saved.try_recv() {
                 if let Some(p) = lib.pages.get_mut(&tab) {
                     p.saved(&path);
                 }
+                if let Some(d) = &mut self.detail {
+                    d.saved(&path);
+                }
             }
             if let Some(p) = lib.pages.get(&tab) {
-                let asked = format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str()));
+                let asked = match &self.detail {
+                    Some(d) => d.wanted_key(),
+                    None => format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str())),
+                };
                 if lib.asked != asked {
-                    let _ = lib.pics.send(p.wanted());
+                    let _ = lib
+                        .pics
+                        .send(self.detail.as_ref().map_or_else(|| p.wanted(), |d| d.wanted()));
                     lib.asked = asked;
                 }
             }
@@ -1252,7 +1480,10 @@ impl App {
         if let Some(tv) = &mut self.tv {
             anim |= tv.page.animate(dt);
         }
-        let active = !top && matches!(self.mode, Mode::Browse);
+        let active = !top && matches!(self.mode, Mode::Browse) && self.detail.is_none();
+        if let Some(d) = &mut self.detail {
+            anim |= d.animate(dt);
+        }
         for (id, p) in self.libs.iter_mut().flat_map(|l| &mut l.pages) {
             if *id == self.tab {
                 anim |= p.animate(dt, active);
@@ -1375,7 +1606,10 @@ impl App {
         };
 
         if let Some(p) = self.libs.iter_mut().find_map(|l| l.pages.get_mut(&self.tab)) {
-            p.draw(g);
+            match &mut self.detail {
+                Some(d) => d.draw(g),
+                None => p.draw(g),
+            }
             self.draw_top();
             return self.draw_dialog();
         }
@@ -1657,6 +1891,17 @@ impl App {
                 self.rebuild_apps();
                 self.refocus(key, col);
             }
+            Kind::Watch
+                if self.prefs.jf_player
+                    && (self.rows[r].items[c].key.starts_with("jf:")
+                        || self.rows[r].items[c].key.starts_with("plex:")) =>
+            {
+                let key = &self.rows[r].items[c].key;
+                let spec = key.strip_prefix("jf:").unwrap_or(key).to_string();
+                if self.film(&spec) {
+                    self.luna.launch(&self.rows[r].items[c]);
+                }
+            }
             _ => self.luna.launch(&self.rows[r].items[c]),
         }
     }
@@ -1674,6 +1919,13 @@ impl App {
     }
 
     fn open_menu(&mut self) {
+        if let Some(d) = &self.detail {
+            if let Some((title, opts)) = d.options() {
+                let list = opts.into_iter().map(|(label, a)| (Opt::Detail(a), label)).collect();
+                self.show_menu(&title, list, 0);
+            }
+            return;
+        }
         if let Some(t) = self.lib_page().and_then(library::Page::title) {
             let name = t.name.clone();
             let sort = if self.prefs.lib_sort == "added" {
@@ -1725,6 +1977,96 @@ impl App {
         };
         if act == Act::Boot {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
+            return self.show_settings();
+        }
+        if matches!(act, Act::AudioLang | Act::SubLang) {
+            let (now, none, title) = if act == Act::AudioLang {
+                (&self.prefs.audio_lang, "Server's choice", "Audio language")
+            } else {
+                (&self.prefs.sub_lang, "Same as audio", "Subtitle language")
+            };
+            let mut list = vec![(None, none)];
+            list.extend(crate::lang::LANGS.iter().map(|l| (Some(l.1), l.0)));
+            let sel = list.iter().position(|l| l.0.unwrap_or("") == now).unwrap_or(0);
+            let list = list
+                .into_iter()
+                .map(|(code, name)| {
+                    let code = code.unwrap_or("");
+                    let mark = if code == now { "   (current)" } else { "" };
+                    let opt = if act == Act::AudioLang {
+                        Opt::AudioLang(code)
+                    } else {
+                        Opt::SubLang(code)
+                    };
+                    (opt, format!("{name}{mark}"))
+                })
+                .collect();
+            return self.show_menu(title, list, sel);
+        }
+        if act == Act::Direct {
+            let sel = DIRECT_MODES.iter().position(|m| m.0 == self.prefs.direct).unwrap_or(0);
+            let list = DIRECT_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    (
+                        Opt::DirectMode(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Direct Play", list, sel);
+        }
+        if act == Act::Quality {
+            let sel = QUALITIES.iter().position(|m| *m == self.prefs.max_mbps).unwrap_or(0);
+            let list = QUALITIES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let name = if *m == 0 {
+                        "Maximum".to_string()
+                    } else {
+                        format!("{m} Mbps")
+                    };
+                    (
+                        Opt::Quality(*m),
+                        format!("{name}{}", if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Streaming quality", list, sel);
+        }
+        if act == Act::SubMode {
+            let sel = SUB_MODES.iter().position(|m| m.0 == self.prefs.sub_mode).unwrap_or(0);
+            let list = SUB_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    (
+                        Opt::SubMode(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Subtitles", list, sel);
+        }
+        if act == Act::Lossless {
+            self.prefs.lossless = !self.prefs.lossless;
+            self.prefs.save();
+            self.hbr = None;
+            self.load_hbr();
+            return self.show_settings();
+        }
+        if act == Act::Hbr {
+            if self.hbr_rx.is_none() && self.luna.root.is_empty() {
+                let remove = self.hbr.as_deref().is_some_and(|s| !s.contains("not installed"));
+                self.hbr_rx = Some(data::hbr_run(if remove { "remove" } else { "install" }, self.wake));
+            }
+            return self.show_settings();
+        }
+        if act == Act::JfPlayer {
+            self.prefs.jf_player = !self.prefs.jf_player;
+            self.prefs.save();
             return self.show_settings();
         }
         if let Act::Watching(r) = act {
@@ -1975,10 +2317,36 @@ impl App {
                 }
                 return;
             }
+            Opt::Detail(a) => return self.detail_act(a.clone()),
             Opt::RefreshLib => {
                 for lib in &self.libs {
                     let _ = lib.refresh.send(true);
                 }
+                return;
+            }
+            Opt::DirectMode(m) => {
+                self.prefs.direct = m.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::Quality(m) => {
+                self.prefs.max_mbps = *m;
+                self.prefs.save();
+                return;
+            }
+            Opt::AudioLang(c) => {
+                self.prefs.audio_lang = c.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::SubLang(c) => {
+                self.prefs.sub_lang = c.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::SubMode(m) => {
+                self.prefs.sub_mode = m.to_string();
+                self.prefs.save();
                 return;
             }
             Opt::TabShow(k) => {
@@ -2186,6 +2554,17 @@ impl App {
             self.ok_down = None;
         }
         match &mut self.mode {
+            Mode::Browse if self.detail.is_some() => {
+                if back {
+                    self.detail = None;
+                    self.animating = true;
+                } else if ok {
+                    self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
+                } else if let Some(d) = &mut self.detail {
+                    d.key(dx, dy);
+                }
+                return true;
+            }
             Mode::Browse => {
                 let details = self.tv.as_ref().is_some_and(|t| self.on_tv() && t.page.details);
                 // The programme details: Back closes them, OK (below) watches the channel.
@@ -2374,6 +2753,14 @@ impl App {
 
     /// OK was released: a tap on an app launches it (a hold already opened its options).
     fn ok_up(&mut self) {
+        if self.detail.is_some() {
+            if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
+                if let Some(a) = self.detail.as_ref().and_then(|d| d.tap()) {
+                    self.detail_act(a);
+                }
+            }
+            return;
+        }
         if !self.tab.is_empty() && !self.on_tv() {
             if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
                 self.open_title();
@@ -2405,6 +2792,7 @@ impl App {
         self.mode = Mode::Browse;
         self.in_settings = false;
         self.ok_down = None;
+        self.detail = None;
         self.cog = false;
         self.tabs_f = false;
         self.tab.clear();
@@ -2423,6 +2811,13 @@ impl App {
 }
 
 /// The panel of a menu and where its options are.
+/// The options on screen: all of them, or nine around the selected one in a long list (the languages).
+fn menu_rows(m: &Menu) -> std::ops::Range<usize> {
+    let shown = m.opts.len().min(9);
+    let first = m.sel.saturating_sub(4).min(m.opts.len() - shown);
+    first..first + shown
+}
+
 fn menu_panel(m: &Menu) -> (f32, f32, f32, f32) {
     let wide = m
         .opts
@@ -2430,7 +2825,7 @@ fn menu_panel(m: &Menu) -> (f32, f32, f32, f32) {
         .filter_map(|(_, t)| t.as_ref())
         .map(|t| t.w as f32)
         .fold(0.0, f32::max);
-    let (pw, ph) = ((wide + 112.0).max(640.0), 124.0 + m.opts.len() as f32 * 84.0);
+    let (pw, ph) = ((wide + 112.0).max(640.0), 124.0 + menu_rows(m).len() as f32 * 84.0);
     ((W - pw) / 2.0, (H - ph) / 2.0, pw, ph)
 }
 
@@ -2448,8 +2843,9 @@ fn draw_menu(g: &Gfx, m: &Menu) {
     let (px, py, pw, ph) = menu_panel(m);
     g.rounded(px, py, pw, ph, 28.0, PANEL, 1.0);
     g.put(m.title.as_ref(), px + 48.0, py + 36.0, DIM, 1.0);
-    for (i, (_, tex)) in m.opts.iter().enumerate() {
-        let oy = py + 100.0 + i as f32 * 84.0;
+    let rows = menu_rows(m);
+    for (i, (_, tex)) in m.opts.iter().enumerate().skip(rows.start).take(rows.len()) {
+        let oy = py + 100.0 + (i - rows.start) as f32 * 84.0;
         let th = tex.as_ref().map_or(0.0, |t| t.h as f32);
         if i == m.sel {
             g.rounded(px + 24.0, oy, pw - 48.0, 72.0, 18.0, WHITE, 1.0);

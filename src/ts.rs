@@ -8,6 +8,8 @@ pub enum Codec {
     Aac,
     Ac3,
     Eac3,
+    /// Stereo 48 kHz PCM: what the DTS core as IEC 61937 bursts is declared as (`ff::lossless`).
+    Pcm,
 }
 
 impl Codec {
@@ -19,6 +21,7 @@ impl Codec {
             Codec::Aac => "AAC",
             Codec::Ac3 => "AC3",
             Codec::Eac3 => "AC3 PLUS",
+            Codec::Pcm => "PCM",
         }
     }
 }
