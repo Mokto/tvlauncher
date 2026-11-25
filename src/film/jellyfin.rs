@@ -84,6 +84,9 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
                 t.external = s["IsExternal"] == true;
                 t.lang = s["Language"].as_str().unwrap_or_default().into();
                 t.forced = s["IsForced"] == true;
+                t.sdh = s["IsHearingImpaired"] == true;
+                t.title = s["Title"].as_str().unwrap_or_default().into();
+                t.format = super::sub_format(s["Codec"].as_str().unwrap_or_default());
                 Some(t)
             })
             .collect()
@@ -120,8 +123,9 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
 /// The next episode to watch of `series`, if it is not `current`.
 pub fn next(cfg: &Config, series: &str, current: &str) -> Option<Item> {
     let user = &cfg.user_id;
-    let v = json_of(cfg, &format!("/Shows/NextUp?userId={user}&seriesId={series}&limit=1")).ok()?;
-    let id = v["Items"][0]["Id"].as_str().filter(|id| *id != current)?;
+    let path = format!("/Shows/{series}/Episodes?userId={user}&startItemId={current}&limit=2");
+    let v = json_of(cfg, &path).ok()?;
+    let id = v["Items"][1]["Id"].as_str().filter(|id| *id != current)?;
     resolve(cfg, id).ok()
 }
 
@@ -348,19 +352,17 @@ mod tests {
     }
 
     #[test]
-    fn the_next_episode_is_one_not_yet_watched_and_not_the_current() {
+    fn the_next_episode_is_the_one_after_the_current() {
         let cfg = serve(&[
-            ("/NextUp", r#"{"Items":[{"Id":"e8"}]}"#),
+            ("/Episodes", r#"{"Items":[{"Id":"e7"},{"Id":"e8"}]}"#),
             (
                 "/Items/e8",
                 r#"{"Id":"e8","Name":"Eight","Type":"Episode","SeriesId":"s1"}"#,
             ),
         ]);
         assert_eq!(next(&cfg, "s1", "e7").map(|i| i.id), Some("e8".into()));
-        assert!(
-            next(&cfg, "s1", "e8").is_none(),
-            "the server still names the one just watched"
-        );
+        let last = serve(&[("/Episodes", r#"{"Items":[{"Id":"e9"}]}"#)]);
+        assert!(next(&last, "s1", "e9").is_none(), "the last episode has none");
     }
 
     #[test]

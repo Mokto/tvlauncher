@@ -54,6 +54,8 @@ pub struct Gfx {
     pub hgrad: Tex,
     pub vgrad: Tex,
     pub gear: Tex,
+    /// `icons::ALL` in order.
+    icons: Vec<Tex>,
 }
 
 impl Gfx {
@@ -75,7 +77,28 @@ impl Gfx {
             hgrad: gen(ren, 256, 1, f_hgrad),
             vgrad: gen(ren, 1, 256, f_vgrad),
             gear: gen(ren, 128, 128, f_gear),
+            icons: crate::icons::ALL
+                .iter()
+                .map(|i| {
+                    gen(ren, crate::icons::SIZE, crate::icons::SIZE, |x, y, w, _| {
+                        crate::icons::coverage(*i, x, y, w)
+                    })
+                })
+                .collect(),
         }
+    }
+
+    /// An icon `size` pixels wide with its top left at `(x, y)`.
+    pub fn icon(&self, icon: crate::icons::Icon, x: f32, y: f32, size: f32, c: Color, a: f32) {
+        let Some(t) = crate::icons::ALL
+            .iter()
+            .position(|i| *i == icon)
+            .and_then(|i| self.icons.get(i))
+        else {
+            return;
+        };
+        self.tint(t, c, a);
+        self.copy(t, None, FRect { x, y, w: size, h: size });
     }
 
     pub fn rp(&self, p: &str) -> String {
@@ -291,7 +314,7 @@ impl Gfx {
 }
 
 /// A white texture whose alpha is `f(x, y, w, h)`.
-fn gen(ren: *mut Opaque, w: i32, h: i32, f: fn(f32, f32, f32, f32) -> f32) -> Tex {
+fn gen(ren: *mut Opaque, w: i32, h: i32, f: impl Fn(f32, f32, f32, f32) -> f32) -> Tex {
     let s = Surf(unsafe { SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, PIXELFORMAT_ARGB8888) });
     let stride = unsafe { (*s.0).pitch as usize / 4 };
     let px = unsafe { (*s.0).pixels as *mut u32 };

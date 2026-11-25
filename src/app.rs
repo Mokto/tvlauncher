@@ -22,6 +22,9 @@ const HOLD_MS: u32 = 700;
 /// How films are delivered (`film::DIRECT`), as Settings words it.
 const DIRECT_MODES: [(&str, &str); 3] = [("auto", "Automatic"), ("off", "Off"), ("force", "Forced")];
 
+/// What follows an episode (`Prefs::next_ep`), as Settings words it.
+const NEXT_MODES: [(&str, &str); 3] = [("countdown", "Countdown"), ("credits", "After credits"), ("off", "Off")];
+
 /// The choices of the server's streaming quality, in Mbps; 0 is no limit.
 const QUALITIES: [u32; 7] = [0, 40, 20, 12, 8, 4, 2];
 
@@ -87,6 +90,7 @@ enum Opt {
     /// The details of the focused programme.
     TvDetails,
     DirectMode(&'static str),
+    NextEp(&'static str),
     Quality(u32),
     /// The language films start in, how subtitles start, and their language ("" for none, else a `lang::LANGS` code).
     AudioLang(&'static str),
@@ -612,6 +616,12 @@ impl App {
                 "The most the server may send when it converts a film: lower it on a slow connection. Direct Play is not limited.",
                 text(&quality),
             ),
+            entry(
+                Act::NextEp,
+                "Next episode",
+                "Countdown offers it on a card when the credits begin. After credits waits for the end. Off stops there.",
+                text(NEXT_MODES.iter().find(|m| m.0 == self.prefs.next_ep).map_or(NEXT_MODES[0].1, |m| m.1)),
+            ),
         ];
         let language = |code: &str, none: &str| match code {
             "" => none.to_string(),
@@ -723,20 +733,22 @@ impl App {
                 entry(Act::Tab(i), &name, &desc, Value::Switch(on))
             })
             .collect::<Vec<_>>();
-        let tabs = (!tabs.is_empty()).then_some(("Tabs", tabs));
-        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", player));
+        use crate::icons::Icon;
+        let tabs = (!tabs.is_empty()).then_some(("Tabs", Icon::Tabs, tabs));
+        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", Icon::Play, player));
         tabs.into_iter()
-            .chain([("Jellyfin", jellyfin), ("Plex", plex)])
+            .chain([("Jellyfin", Icon::Server, jellyfin), ("Plex", Icon::Server, plex)])
             .chain(player)
             .chain([
-                ("Audio", audio),
-                ("YouTube", youtube),
-                ("Live TV", tv),
-                ("Ads and privacy", privacy),
-                ("Startup", startup),
+                ("Audio", Icon::Audio, audio),
+                ("YouTube", Icon::Video, youtube),
+                ("Live TV", Icon::Tv, tv),
+                ("Ads and privacy", Icon::Lock, privacy),
+                ("Startup", Icon::Power, startup),
             ])
-            .map(|(name, entries)| Category {
+            .map(|(name, icon, entries)| Category {
                 name: name.into(),
+                icon,
                 entries,
             })
             .collect()
@@ -940,6 +952,24 @@ impl App {
         self.animating = true;
     }
 
+    /// The page of the film or series `id` (Info → *Go to series* in the player), when a library tab has the title.
+    fn go_to_page(&mut self, id: &str) {
+        if self.detail.as_ref().is_some_and(|d| d.id() == id) {
+            return;
+        }
+        let tab = self.libs.iter_mut().find_map(|l| {
+            l.pages
+                .iter_mut()
+                .find_map(|(tab, p)| p.focus_id(id).then(|| tab.clone()))
+        });
+        let Some(tab) = tab else {
+            return log(&format!("player: no library tab has {id}"));
+        };
+        (self.tab, self.tabs_f, self.cog) = (tab, false, false);
+        self.mode = Mode::Browse;
+        self.open_title();
+    }
+
     /// What a title's page asked for.
     fn detail_act(&mut self, a: detail::Act) {
         match a {
@@ -1012,6 +1042,10 @@ impl App {
         let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
         let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
         self.prefs.look = Prefs::load(&self.luna.root).look;
+        if let Ok(id) = std::fs::read_to_string(crate::player::PAGE) {
+            let _ = std::fs::remove_file(crate::player::PAGE);
+            self.go_to_page(id.trim());
+        }
         // What was watched moves up in Continue watching and in the libraries.
         self.refresh_jellyfin();
         self.refresh_plex();
@@ -2017,6 +2051,20 @@ impl App {
                 .collect();
             return self.show_menu("Direct Play", list, sel);
         }
+        if act == Act::NextEp {
+            let sel = NEXT_MODES.iter().position(|m| m.0 == self.prefs.next_ep).unwrap_or(0);
+            let list = NEXT_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    (
+                        Opt::NextEp(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Next episode", list, sel);
+        }
         if act == Act::Quality {
             let sel = QUALITIES.iter().position(|m| *m == self.prefs.max_mbps).unwrap_or(0);
             let list = QUALITIES
@@ -2326,6 +2374,11 @@ impl App {
             }
             Opt::DirectMode(m) => {
                 self.prefs.direct = m.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::NextEp(m) => {
+                self.prefs.next_ep = m.to_string();
                 self.prefs.save();
                 return;
             }

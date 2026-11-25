@@ -504,6 +504,10 @@ impl Page {
     }
 
     /// Asks the server again (after a film was played, its resume point moved).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn reload(&mut self) {
         self.rx = Some(load(self.backend.clone(), self.id.clone(), self.wake));
     }

@@ -115,6 +115,9 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
                 let mut t = Track::new(index, name);
                 t.lang = lang.clone();
                 t.forced = s["forced"] == true;
+                t.sdh = s["hearingImpaired"] == true;
+                t.title = s["title"].as_str().unwrap_or_default().into();
+                t.format = super::sub_format(s["codec"].as_str().unwrap_or_default());
                 t.external = s["key"].is_string();
                 t.key = s["key"]
                     .as_str()
@@ -149,9 +152,12 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
 /// The first episode of `series` not watched, if it is not `current`. `server` is the connection of `current`.
 pub fn next(conn: &Conn, series: &str, current: &str) -> Option<Item> {
     let list = episodes(conn, series, "allLeaves").ok()?;
-    let e = list
-        .iter()
-        .find(|e| e["viewCount"].as_i64().unwrap_or(0) == 0 && e["ratingKey"] != current)?;
+    let e = match list.iter().position(|e| e["ratingKey"] == current) {
+        Some(i) => list.get(i + 1)?,
+        None => list
+            .iter()
+            .find(|e| e["viewCount"].as_i64().unwrap_or(0) == 0 && e["ratingKey"] != current)?,
+    };
     item_from(conn, &meta(conn, e["ratingKey"].as_str()?).ok()?)
 }
 

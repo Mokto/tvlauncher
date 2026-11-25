@@ -593,6 +593,20 @@ impl Page {
         self.src.clone()
     }
 
+    /// Puts the focus on the title `id` (in the grid, where every title is). Gives whether the page has it.
+    pub fn focus_id(&mut self, id: &str) -> bool {
+        let titles = &self.titles;
+        let at = self.lines.iter().enumerate().rev().find_map(|(r, l)| {
+            let c = l.idx.iter().position(|i| titles[*i].id == id)?;
+            l.grid.then_some((r, c))
+        });
+        let Some((r, c)) = at else { return false };
+        self.cur = r;
+        self.lines[r].col = c;
+        self.scroll = self.lines[r].top;
+        true
+    }
+
     pub fn title(&self) -> Option<&Title> {
         let l = self.lines.get(self.cur)?;
         self.titles.get(*l.idx.get(l.col)?)

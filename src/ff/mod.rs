@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub mod ass;
+pub mod av1;
 pub mod convert;
 pub mod demux;
 pub mod dolby;
@@ -348,6 +349,11 @@ pub unsafe fn stream_tag(f: &Fns, s: *mut AVStream, key: &CStr) -> Option<String
 /// and the 8-byte sample_aspect_ratio come between), which the offsets above agree with on both layouts.
 pub unsafe fn stream_forced(s: *mut AVStream) -> bool {
     *((s as *const u8).add(STREAM_METADATA - 16) as *const c_int) & 0x40 != 0
+}
+
+/// `AV_DISPOSITION_HEARING_IMPAIRED`: subtitles for the deaf and hard of hearing (SDH).
+pub unsafe fn stream_sdh(s: *mut AVStream) -> bool {
+    *((s as *const u8).add(STREAM_METADATA - 16) as *const c_int) & 0x80 != 0
 }
 
 pub unsafe fn fmt_duration(fmt: *const AVFormatContext) -> i64 {
