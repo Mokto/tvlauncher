@@ -108,6 +108,10 @@ pub fn curl(
     body: Option<&str>,
     timeout: u64,
 ) -> Result<Reply, String> {
+    curl_with(&curl_config(url, ua, headers, body, timeout))
+}
+
+fn curl_with(config: &str) -> Result<Reply, String> {
     let mut child = Command::new(curl_bin())
         .args(["-K", "-"])
         .stdin(Stdio::piped())
@@ -116,7 +120,7 @@ pub fn curl(
         .spawn()
         .map_err(|e| format!("curl: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(curl_config(url, ua, headers, body, timeout).as_bytes());
+        let _ = stdin.write_all(config.as_bytes());
     }
     let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -212,6 +216,24 @@ fn parse_size(headers: &str) -> Result<i64, String> {
         .and_then(|n| n.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
         .ok_or_else(|| "the server does not serve byte ranges".to_string())
+}
+
+/// A DELETE, which `send` does not do.
+pub fn delete(url: &str, headers: &[(&str, String)], timeout: u64) -> Result<Reply, String> {
+    if url.starts_with("https://") {
+        return curl_with(&(curl_config(url, "tvlauncher", headers, None, timeout) + "request = \"DELETE\"\n"));
+    }
+    let r = headers
+        .iter()
+        .fold(minreq::delete(url), |r, (k, v)| r.with_header(*k, v.clone()))
+        .with_timeout(timeout)
+        .send()
+        .map_err(|e| e.to_string())?;
+    Ok(Reply {
+        status: r.status_code as u16,
+        url: r.url.clone(),
+        body: r.into_bytes(),
+    })
 }
 
 /// A GET, or a POST of a JSON body, with `headers`, that gives up after `timeout` seconds.

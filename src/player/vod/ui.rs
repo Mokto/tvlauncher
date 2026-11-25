@@ -36,6 +36,7 @@ pub fn fkey() -> Option<Fk> {
             continue;
         }
         let (sym, wcode) = (e.key_sym(), e.key_wcode());
+        log(&format!("film: key {sym} wcode {wcode}"));
         // 413 is the remote's Stop
         if sym == K_ESCAPE || wcode == WCODE_BACK || wcode == 413 {
             return Some(Fk::Back);
@@ -53,7 +54,7 @@ pub fn fkey() -> Option<Fk> {
             (_, 417) => return Some(Fk::Seek(30)),
             (K_UP, _) => return Some(Fk::Up),
             (K_DOWN, _) => return Some(Fk::Down),
-            _ => log(&format!("film: key {sym} wcode {wcode}")),
+            _ => {}
         }
     }
     None

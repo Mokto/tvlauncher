@@ -1,7 +1,7 @@
 //! The library tabs: each movie, series or collection library of the signed-in Jellyfin user and Plex account in
 //! a tab of its own, as rows of posters (Continue watching, Recently added, Unwatched, genres) and a grid of all
-//! titles, under the focused title's backdrop, details and overview. OK opens the title in Native Jelly or
-//! PlxNative, which show its page, with the seasons and Play; nothing plays here.
+//! titles, under the focused title's backdrop, details and overview. OK opens the title's page (`detail`), or the
+//! title in Native Jelly or PlxNative when films do not play in the launcher.
 //!
 //! The lists are cached (`cache/lib-*.json` for Jellyfin, `cache/plib-*.json` for Plex) and shown at once; a background thread asks for new ones when they
 //! are older than `MAX_AGE`, with the same short timeout as Continue watching, so a sleeping server is never
@@ -42,6 +42,21 @@ pub enum Source {
 }
 
 impl Source {
+    /// An episode's still, `w` wide.
+    pub fn still(&self, id: &str, tag: &str, w: u32) -> Option<String> {
+        match self {
+            Source::None => None,
+            Source::Jellyfin(server) => Some(format!(
+                "{server}/Items/{id}/Images/Primary?maxWidth={w}&quality=80&tag={tag}"
+            )),
+            Source::Plex { base, token } => Some(format!(
+                "{base}/photo/:/transcode?width={w}&height={}&minSize=1&upscale=1&url={}&X-Plex-Token={token}",
+                w * 9 / 16,
+                encode(tag)
+            )),
+        }
+    }
+
     fn url(&self, id: &str, backdrop: bool, tag: &str) -> Option<String> {
         match self {
             Source::None => None,
@@ -77,8 +92,8 @@ pub struct Title {
     sort: String,
     added: String,
     /// Year, length, rating and genres, ready to show.
-    meta: String,
-    overview: String,
+    pub meta: String,
+    pub overview: String,
     progress: f32,
     played: bool,
     rating: f32,

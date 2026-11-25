@@ -7,6 +7,7 @@ mod app;
 #[cfg(target_arch = "arm")]
 mod compat;
 mod data;
+mod detail;
 mod ff;
 mod film;
 mod gfx;

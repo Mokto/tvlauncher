@@ -4,13 +4,13 @@ use crate::gfx::*;
 use crate::iptv::{self, Channel, Got, Guide};
 use crate::jellyfin::{self, Watch, DEFAULT_APP};
 use crate::keyboard::{Prompt, Typed};
-use crate::library;
 use crate::login::{Login, Signed};
 use crate::plex::{self, Tile as PlexTile};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
 use crate::tv;
 use crate::youtube::{self, Tile};
+use crate::{detail, library};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -56,6 +56,8 @@ fn row_height(row: usize) -> f32 {
 }
 
 enum Opt {
+    /// A choice of a title's page (see `detail`).
+    Detail(detail::Act),
     Move,
     Hide,
     Show,
@@ -226,6 +228,8 @@ pub struct App {
     libs: Vec<Lib>,
     /// The tab shown: empty for Home, "tv", or a library's id.
     tab: String,
+    /// The page of a library title, over its tab.
+    detail: Option<Box<detail::Page>>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -317,6 +321,7 @@ impl App {
             last_settings: (0, 0, false),
             in_settings: false,
             ok_down: None,
+            detail: None,
             cog_f: 0.0,
         };
         if let Some(jf) = &app.jf {
@@ -911,8 +916,53 @@ impl App {
         lib.asked.clear();
     }
 
-    /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
+    /// Opens the focused title's page, or its page in the media app when films do not play in the launcher.
     fn open_title(&mut self) {
+        if !self.prefs.jf_player {
+            return self.open_in_app();
+        }
+        let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) else {
+            return;
+        };
+        let page = &lib.pages[&self.tab];
+        let Some(t) = page.title().cloned() else { return };
+        let backend = match (page.source(), &self.px, &self.jf) {
+            (library::Source::Plex { base, token }, Some(px), _) => {
+                let server = lib.views.iter().find(|v| v.id == self.tab).map(|v| v.server.clone());
+                detail::Backend::Plex(px.cfg.conn(&base, &token), server.unwrap_or_default())
+            }
+            (library::Source::Jellyfin(_), _, Some(jf)) => detail::Backend::Jellyfin(jf.cfg.clone()),
+            _ => return self.open_in_app(),
+        };
+        let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
+        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, page.source(), self.wake)));
+        lib.asked.clear();
+        self.animating = true;
+    }
+
+    /// What a title's page asked for.
+    fn detail_act(&mut self, a: detail::Act) {
+        match a {
+            detail::Act::Play(spec) => {
+                if self.film(&spec) {
+                    self.open_in_app();
+                }
+                if let Some(d) = &mut self.detail {
+                    d.reload();
+                }
+            }
+            detail::Act::Mark(id, played) => {
+                if let Some(d) = &mut self.detail {
+                    detail::mark(d.backend.clone(), id.clone(), played);
+                    d.marked(&id, played);
+                }
+            }
+        }
+        self.animating = true;
+    }
+
+    /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
+    fn open_in_app(&mut self) {
         let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
             return;
         };
@@ -1351,17 +1401,29 @@ impl App {
         if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
             self.tab.clear();
         }
+        if self.detail.as_mut().and_then(|d| d.poll(&self.g)) == Some(true) {
+            self.detail = None;
+            self.open_in_app();
+        }
         let tab = self.tab.clone();
         for lib in &mut self.libs {
             while let Ok(path) = lib.saved.try_recv() {
                 if let Some(p) = lib.pages.get_mut(&tab) {
                     p.saved(&path);
                 }
+                if let Some(d) = &mut self.detail {
+                    d.saved(&path);
+                }
             }
             if let Some(p) = lib.pages.get(&tab) {
-                let asked = format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str()));
+                let asked = match &self.detail {
+                    Some(d) => d.wanted_key(),
+                    None => format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str())),
+                };
                 if lib.asked != asked {
-                    let _ = lib.pics.send(p.wanted());
+                    let _ = lib
+                        .pics
+                        .send(self.detail.as_ref().map_or_else(|| p.wanted(), |d| d.wanted()));
                     lib.asked = asked;
                 }
             }
@@ -1417,7 +1479,10 @@ impl App {
         if let Some(tv) = &mut self.tv {
             anim |= tv.page.animate(dt);
         }
-        let active = !top && matches!(self.mode, Mode::Browse);
+        let active = !top && matches!(self.mode, Mode::Browse) && self.detail.is_none();
+        if let Some(d) = &mut self.detail {
+            anim |= d.animate(dt);
+        }
         for (id, p) in self.libs.iter_mut().flat_map(|l| &mut l.pages) {
             if *id == self.tab {
                 anim |= p.animate(dt, active);
@@ -1540,7 +1605,10 @@ impl App {
         };
 
         if let Some(p) = self.libs.iter_mut().find_map(|l| l.pages.get_mut(&self.tab)) {
-            p.draw(g);
+            match &mut self.detail {
+                Some(d) => d.draw(g),
+                None => p.draw(g),
+            }
             self.draw_top();
             return self.draw_dialog();
         }
@@ -1850,6 +1918,13 @@ impl App {
     }
 
     fn open_menu(&mut self) {
+        if let Some(d) = &self.detail {
+            if let Some((title, opts)) = d.options() {
+                let list = opts.into_iter().map(|(label, a)| (Opt::Detail(a), label)).collect();
+                self.show_menu(&title, list, 0);
+            }
+            return;
+        }
         if let Some(t) = self.lib_page().and_then(library::Page::title) {
             let name = t.name.clone();
             let sort = if self.prefs.lib_sort == "added" {
@@ -2241,6 +2316,7 @@ impl App {
                 }
                 return;
             }
+            Opt::Detail(a) => return self.detail_act(a.clone()),
             Opt::RefreshLib => {
                 for lib in &self.libs {
                     let _ = lib.refresh.send(true);
@@ -2477,6 +2553,17 @@ impl App {
             self.ok_down = None;
         }
         match &mut self.mode {
+            Mode::Browse if self.detail.is_some() => {
+                if back {
+                    self.detail = None;
+                    self.animating = true;
+                } else if ok {
+                    self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
+                } else if let Some(d) = &mut self.detail {
+                    d.key(dx, dy);
+                }
+                return true;
+            }
             Mode::Browse => {
                 let details = self.tv.as_ref().is_some_and(|t| self.on_tv() && t.page.details);
                 // The programme details: Back closes them, OK (below) watches the channel.
@@ -2665,6 +2752,14 @@ impl App {
 
     /// OK was released: a tap on an app launches it (a hold already opened its options).
     fn ok_up(&mut self) {
+        if self.detail.is_some() {
+            if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
+                if let Some(a) = self.detail.as_ref().and_then(|d| d.tap()) {
+                    self.detail_act(a);
+                }
+            }
+            return;
+        }
         if !self.tab.is_empty() && !self.on_tv() {
             if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
                 self.open_title();
@@ -2696,6 +2791,7 @@ impl App {
         self.mode = Mode::Browse;
         self.in_settings = false;
         self.ok_down = None;
+        self.detail = None;
         self.cog = false;
         self.tabs_f = false;
         self.tab.clear();

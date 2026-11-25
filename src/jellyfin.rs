@@ -89,6 +89,22 @@ impl Config {
     }
 
     /// For a long answer (a whole library), once `get` has shown that the server is awake.
+    pub(crate) fn post(&self, path: &str) -> Result<(), String> {
+        request(&self.server, Some(""), path, Some(&self.token)).map(drop)
+    }
+
+    pub(crate) fn delete(&self, path: &str) -> Result<(), String> {
+        let r = net::delete(
+            &format!("{}{path}", self.server),
+            &[("Authorization", auth(Some(&self.token)))],
+            10,
+        )?;
+        (200..300)
+            .contains(&r.status)
+            .then_some(())
+            .ok_or(format!("HTTP {}", r.status))
+    }
+
     pub(crate) fn get_within(&self, path: &str, secs: u64) -> Result<Vec<u8>, String> {
         request_within(&self.server, None, path, Some(&self.token), secs)
     }

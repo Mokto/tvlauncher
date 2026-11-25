@@ -35,6 +35,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// A server reached at `base` with its `token` (as a library tab already knows them).
+    pub fn conn(&self, base: &str, token: &str) -> Conn {
+        Conn {
+            base: base.into(),
+            token: token.into(),
+            client_id: self.client_id.clone(),
+        }
+    }
+
     pub fn load(root: &str) -> Option<Config> {
         let v: Value = serde_json::from_slice(&std::fs::read(format!("{root}{DIR}/plex.json")).ok()?).ok()?;
         let f = |k: &str| v[k].as_str().map(String::from);
