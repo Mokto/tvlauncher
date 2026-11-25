@@ -540,7 +540,11 @@ impl Player {
                 }
                 (Some(Fk::Toggle | Fk::Pause), false) if clock.running() || paused => {
                     paused = !paused;
-                    log(&format!("film: {} at {} s", if paused { "paused" } else { "resumed" }, pos / TICKS));
+                    log(&format!(
+                        "film: {} at {} s",
+                        if paused { "paused" } else { "resumed" },
+                        pos / TICKS
+                    ));
                     if paused {
                         unsafe { (smp.pause)(smp.obj) };
                         clock.hold();

@@ -3,8 +3,8 @@ use crate::sdl::{log, Event, SDL_PushEvent};
 use std::ffi::{c_int, CStr};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const CRASH_FILE: &CStr = c"/tmp/tvlauncher-crashes";
 
