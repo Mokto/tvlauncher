@@ -91,6 +91,14 @@ const PANE_W: f32 = W - MARGIN - PANE_X;
 const ROW_STEP: f32 = 148.0;
 const ENTRY_H: f32 = 132.0;
 const ON: Color = rgb(52, 168, 83);
+/// How many categories and entries fit above the help line; longer lists scroll with the focus.
+const CATS_SHOWN: usize = 7;
+const ENTRIES_SHOWN: usize = 5;
+
+/// The first item drawn, so that `sel` is on screen.
+fn first(sel: usize, shown: usize) -> usize {
+    sel.saturating_sub(shown - 1)
+}
 
 fn cat_rect(i: usize) -> FRect {
     FRect {
@@ -186,8 +194,9 @@ impl Page {
         };
         g.fill(BG, 1.0, full);
         g.put(self.title.as_ref(), MARGIN, 76.0, TEXT, 1.0);
-        for (i, c) in self.cats.iter().enumerate() {
-            let r = cat_rect(i);
+        let c0 = first(self.cat, CATS_SHOWN);
+        for (i, c) in self.cats.iter().enumerate().skip(c0).take(CATS_SHOWN) {
+            let r = cat_rect(i - c0);
             let (on, here) = (i == self.cat && !self.pane, i == self.cat);
             if here {
                 g.rounded(r.x, r.y, r.w, r.h, 20.0, if on { WHITE } else { PANEL }, 1.0);
@@ -204,8 +213,9 @@ impl Page {
             }
         }
         let Some(cat) = self.cats.get(self.cat) else { return };
-        for (i, e) in cat.entries.iter().enumerate() {
-            let r = entry_rect(i);
+        let e0 = first(self.row, ENTRIES_SHOWN);
+        for (i, e) in cat.entries.iter().enumerate().skip(e0).take(ENTRIES_SHOWN) {
+            let r = entry_rect(i - e0);
             let on = self.pane && i == self.row;
             g.rounded(
                 r.x,
@@ -244,5 +254,23 @@ impl Page {
             }
         }
         g.put(self.help.as_ref(), MARGIN, H - 96.0, DIM, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_lists_scroll_and_stay_above_the_help_line() {
+        assert_eq!((first(0, 7), first(6, 7), first(7, 7), first(9, 7)), (0, 0, 1, 3));
+        let help = H - 96.0;
+        let c = cat_rect(CATS_SHOWN - 1);
+        let e = entry_rect(ENTRIES_SHOWN - 1);
+        assert!(c.y + c.h < help && e.y + e.h < help);
+        assert!(
+            cat_rect(CATS_SHOWN).y + SIDE_H >= help - 16.0,
+            "one more category would reach the help line"
+        );
     }
 }

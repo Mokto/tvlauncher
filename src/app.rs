@@ -592,13 +592,13 @@ impl App {
             entry(
                 Act::JfPlayer,
                 "Play in the launcher",
-                "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
+                "Plays Jellyfin and Plex films with the launcher's own player. Collections and what it cannot start still open in the app.",
                 Value::Switch(self.prefs.jf_player),
             ),
             entry(
                 Act::Direct,
                 "Direct Play",
-                "Automatic plays the file as it is and has the server convert only what the TV cannot play. Off always has the server convert. Forced never falls back, and shows why a file will not play.",
+                "Automatic plays the file as it is when the TV can. Off always has the server convert. Forced never does, and says why.",
                 text(direct),
             ),
             entry(
@@ -638,7 +638,7 @@ impl App {
             entry(
                 Act::Lossless,
                 "Lossless audio to a receiver",
-                "Sends DTS, DTS-HD, DTS:X and Dolby TrueHD (Atmos) in films unconverted to an AV receiver on HDMI ARC or optical. Only while the TV's sound output is that receiver; on TV speakers the server converts them as before.",
+                "DTS and DTS-HD MA go unchanged to an AV receiver (Digital Sound Output: Pass Through). TrueHD, Atmos and DTS:X need the row below.",
                 Value::Switch(self.prefs.lossless),
             ),
         ];
@@ -654,7 +654,7 @@ impl App {
             audio.push(entry(
                 Act::Hbr,
                 "Atmos, TrueHD and DTS:X (root)",
-                "Full-rate DTS-HD and TrueHD need an 8-channel eARC link, which LG only opens for its own apps. This installs a small kernel module (tested on an LG C1 with firmware 03.53.45 only; other TVs refuse it and keep the stereo link). It loads again at every start.",
+                "Installs a kernel module that opens the 8-channel eARC link TrueHD, Atmos and DTS:X need. Tested on an LG C1 (03.53.45) only.",
                 text(state),
             ));
         }
@@ -751,7 +751,7 @@ impl App {
     }
 
     fn load_hbr(&mut self) {
-        self.hbr = (self.prefs.lossless && !self.luna.root.is_empty()).then(data::hbr_status);
+        self.hbr = (self.prefs.lossless && self.luna.root.is_empty()).then(data::hbr_status);
     }
 
     fn open_settings(&mut self) {
@@ -1982,7 +1982,7 @@ impl App {
             return self.show_settings();
         }
         if act == Act::Hbr {
-            if self.hbr_rx.is_none() && !self.luna.root.is_empty() {
+            if self.hbr_rx.is_none() && self.luna.root.is_empty() {
                 let remove = self.hbr.as_deref().is_some_and(|s| !s.contains("not installed"));
                 self.hbr_rx = Some(data::hbr_run(if remove { "remove" } else { "install" }, self.wake));
             }
