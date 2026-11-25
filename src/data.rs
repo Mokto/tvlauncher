@@ -511,7 +511,7 @@ impl Prefs {
             tabs: list("tabs"),
             tabs_off: list("tabsOff"),
             rows_off: list("rowsOff"),
-            jf_player: v["jfPlayer"].as_bool().unwrap_or(false),
+            jf_player: v["jfPlayer"].as_bool().unwrap_or(true),
             lossless: v["lossless"].as_bool().unwrap_or(false),
             direct: v["direct"].as_str().unwrap_or("auto").into(),
             max_mbps: v["maxMbps"].as_u64().unwrap_or(0) as u32,
