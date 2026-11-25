@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 pub mod jellyfin;
+pub mod pick;
 pub mod plex;
 
 pub const TICKS: i64 = 10_000_000;
@@ -19,6 +20,9 @@ pub struct Track {
     pub name: String,
     /// A subtitle file beside the video, which only the server can hand over.
     pub external: bool,
+    /// The language code the server gives, and whether the track holds only the lines of foreign speech.
+    pub lang: String,
+    pub forced: bool,
     /// Plex: where the server serves the track (`/library/streams/<id>`).
     pub key: String,
 }
@@ -29,6 +33,8 @@ impl Track {
             index,
             name: name.into(),
             external: false,
+            lang: String::new(),
+            forced: false,
             key: String::new(),
         }
     }
@@ -39,6 +45,13 @@ pub enum Backend {
     Jellyfin(crate::jellyfin::Config),
     Plex(plex::Conn),
 }
+
+/// The viewer's language settings, read when the player starts (`vod::child_in`).
+pub static LANGS: std::sync::Mutex<pick::Langs> = std::sync::Mutex::new(pick::Langs {
+    audio: String::new(),
+    sub_mode: String::new(),
+    sub_lang: String::new(),
+});
 
 /// What is played: a film or one episode.
 pub struct Item {

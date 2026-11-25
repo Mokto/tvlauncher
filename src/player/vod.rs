@@ -7,7 +7,7 @@ mod ui;
 use super::*;
 use crate::ff::demux::{Demux, Feed, Queue, Run, ENDED};
 use crate::ff::lossless;
-use crate::film::{self, Backend, Clock, Event as Note, Item, Why, TICKS};
+use crate::film::{self, Backend, Clock, Event as Note, Item, Track, Why, TICKS};
 use crate::subs::Cue;
 use std::sync::mpsc::{channel, Receiver};
 use ui::*;
@@ -248,19 +248,64 @@ impl Player {
         let direct = matches!(src, Source::File(_));
         let tracks = self.tracks(it, src);
         let mut shown = Shown::default();
-        // The first run picks what the server would start with.
+        // The first run picks the tracks the viewer's language settings and the server's choice lead to.
         if !choice.init {
             choice.init = true;
-            choice.audio = match src {
-                Source::File(d) => d.info.plan(it.default_audio).ok().map(i64::from),
-                Source::Server => it.default_audio,
+            let langs = film::LANGS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let cand = |index: i64, t: Option<&Track>| film::pick::Cand {
+                index,
+                lang: t.map(|t| t.lang.clone()).unwrap_or_default(),
+                forced: t.is_some_and(|t| t.forced),
             };
-            if let Some(ds) = it.default_sub {
+            let (audio_cands, sub_cands): (Vec<_>, Vec<_>) = match src {
+                Source::File(d) => (
+                    d.info
+                        .audio
+                        .iter()
+                        .filter(|a| a.playable())
+                        .map(|a| film::pick::Cand {
+                            index: i64::from(a.stream),
+                            lang: a.lang.clone(),
+                            forced: false,
+                        })
+                        .collect(),
+                    d.info
+                        .subs
+                        .iter()
+                        .map(|s| film::pick::Cand {
+                            index: i64::from(s.stream),
+                            lang: s.lang.clone(),
+                            forced: s.forced,
+                        })
+                        .chain(it.subs.iter().filter(|s| s.external).map(|s| cand(s.index, Some(s))))
+                        .collect(),
+                ),
+                Source::Server => (
+                    it.audio.iter().map(|a| cand(a.index, Some(a))).collect(),
+                    it.subs.iter().map(|s| cand(s.index, Some(s))).collect(),
+                ),
+            };
+            let want = film::pick::audio(&langs, &audio_cands, it.default_audio);
+            choice.audio = match src {
+                Source::File(d) => d.info.plan(want).ok().map(i64::from),
+                Source::Server => want,
+            };
+            let audio_lang = audio_cands
+                .iter()
+                .find(|c| Some(c.index) == choice.audio)
+                .map(|c| c.lang.clone())
+                .unwrap_or_default();
+            if let Some(ds) = film::pick::sub(&langs, &audio_lang, &sub_cands, it.default_sub) {
                 choice.sub = tracks.subs.iter().find(|s| s.index == ds).map(|s| SubSel {
                     index: s.index,
                     server: s.server,
                 });
             }
+            log(&format!(
+                "film: starts with audio {:?} ({audio_lang:?}) and subtitle {:?}",
+                choice.audio,
+                choice.sub.map(|s| s.index)
+            ));
         }
         let mut loading: Option<Receiver<Subtitles>> = None;
         let fetch = |sel: SubSel| -> Receiver<Subtitles> {
@@ -634,7 +679,13 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
     };
     let g = Gfx::new(root, ren, |name, size| crate::font(root, name, size));
     set_font_root(root);
-    lossless::configure(crate::data::Prefs::load(root).lossless);
+    let prefs = crate::data::Prefs::load(root);
+    lossless::configure(prefs.lossless);
+    *film::LANGS.lock().unwrap_or_else(|e| e.into_inner()) = film::pick::Langs {
+        audio: prefs.audio_lang,
+        sub_mode: prefs.sub_mode,
+        sub_lang: prefs.sub_lang,
+    };
     let mut p = match Player::new() {
         Ok(p) => p,
         Err(e) => {

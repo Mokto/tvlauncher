@@ -464,6 +464,11 @@ pub struct Prefs {
     pub jf_player: bool,
     /// DTS, DTS-HD and TrueHD go to an AV receiver unconverted (`ff::lossless`).
     pub lossless: bool,
+    /// The language films start in ("" for the server's choice, else a code of `lang::LANGS`), how subtitles start
+    /// ("default", "off", "on", "forced" or "smart") and their language ("" for the audio language).
+    pub audio_lang: String,
+    pub sub_mode: String,
+    pub sub_lang: String,
     /// How the library tabs are sorted: "name" or "added".
     pub lib_sort: String,
 }
@@ -504,6 +509,9 @@ impl Prefs {
             rows_off: list("rowsOff"),
             jf_player: v["jfPlayer"].as_bool().unwrap_or(false),
             lossless: v["lossless"].as_bool().unwrap_or(false),
+            audio_lang: v["audioLang"].as_str().unwrap_or_default().into(),
+            sub_mode: v["subMode"].as_str().unwrap_or("default").into(),
+            sub_lang: v["subLang"].as_str().unwrap_or_default().into(),
             tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
             lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
             path,
@@ -512,7 +520,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

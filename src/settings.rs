@@ -13,6 +13,10 @@ pub enum Act {
     PlexApp,
     /// Whether Jellyfin titles play in the launcher's own player.
     JfPlayer,
+    /// The language films start in, how their subtitles start, and the subtitles' language.
+    AudioLang,
+    SubMode,
+    SubLang,
     /// Whether DTS and TrueHD go to a receiver unconverted.
     Lossless,
     /// Installs or removes the kernel module that the receiver link needs for TrueHD and full-rate DTS-HD.

@@ -18,6 +18,15 @@ use std::sync::mpsc::{Receiver, Sender};
 const SHELF: f32 = 0.84;
 /// How long OK is held on an app before its options open.
 const HOLD_MS: u32 = 700;
+
+/// How subtitles start (`film::pick`), as Settings words it.
+const SUB_MODES: [(&str, &str); 5] = [
+    ("default", "Server's choice"),
+    ("off", "Off"),
+    ("on", "Always on"),
+    ("forced", "Forced only"),
+    ("smart", "Foreign audio only"),
+];
 /// How long a featured movie or series stays on Home before the next one.
 const FEATURED_MS: u32 = 30_000;
 const PINNED: usize = 0;
@@ -69,6 +78,10 @@ enum Opt {
     Unfav(String),
     /// The details of the focused programme.
     TvDetails,
+    /// The language films start in, how subtitles start, and their language ("" for none, else a `lang::LANGS` code).
+    AudioLang(&'static str),
+    SubMode(&'static str),
+    SubLang(&'static str),
     /// Sort the library tabs by "name" or by date "added".
     LibSort(&'static str),
     RefreshLib,
@@ -565,7 +578,33 @@ impl App {
             "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
             Value::Switch(self.prefs.jf_player),
         )];
+        let language = |code: &str, none: &str| match code {
+            "" => none.to_string(),
+            c => crate::lang::name(c),
+        };
+        let sub_mode = SUB_MODES
+            .iter()
+            .find(|m| m.0 == self.prefs.sub_mode)
+            .map_or(SUB_MODES[0].1, |m| m.1);
         let mut audio = vec![
+            entry(
+                Act::AudioLang,
+                "Audio language",
+                "The language films start in, when the file has a track in it. Otherwise the server's choice.",
+                text(&language(&self.prefs.audio_lang, "Server's choice")),
+            ),
+            entry(
+                Act::SubMode,
+                "Subtitles",
+                "When subtitles start. Foreign audio only: when the audio is not in the subtitle language.",
+                text(sub_mode),
+            ),
+            entry(
+                Act::SubLang,
+                "Subtitle language",
+                "The language of the subtitles that start. Without one it is the audio language.",
+                text(&language(&self.prefs.sub_lang, "Same as audio")),
+            ),
             entry(
                 Act::Lossless,
                 "Lossless audio to a receiver",
@@ -1834,6 +1873,44 @@ impl App {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
             return self.show_settings();
         }
+        if matches!(act, Act::AudioLang | Act::SubLang) {
+            let (now, none, title) = if act == Act::AudioLang {
+                (&self.prefs.audio_lang, "Server's choice", "Audio language")
+            } else {
+                (&self.prefs.sub_lang, "Same as audio", "Subtitle language")
+            };
+            let mut list = vec![(None, none)];
+            list.extend(crate::lang::LANGS.iter().map(|l| (Some(l.1), l.0)));
+            let sel = list.iter().position(|l| l.0.unwrap_or("") == now).unwrap_or(0);
+            let list = list
+                .into_iter()
+                .map(|(code, name)| {
+                    let code = code.unwrap_or("");
+                    let mark = if code == now { "   (current)" } else { "" };
+                    let opt = if act == Act::AudioLang {
+                        Opt::AudioLang(code)
+                    } else {
+                        Opt::SubLang(code)
+                    };
+                    (opt, format!("{name}{mark}"))
+                })
+                .collect();
+            return self.show_menu(title, list, sel);
+        }
+        if act == Act::SubMode {
+            let sel = SUB_MODES.iter().position(|m| m.0 == self.prefs.sub_mode).unwrap_or(0);
+            let list = SUB_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    (
+                        Opt::SubMode(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Subtitles", list, sel);
+        }
         if act == Act::Lossless {
             self.prefs.lossless = !self.prefs.lossless;
             self.prefs.save();
@@ -2105,6 +2182,21 @@ impl App {
                 for lib in &self.libs {
                     let _ = lib.refresh.send(true);
                 }
+                return;
+            }
+            Opt::AudioLang(c) => {
+                self.prefs.audio_lang = c.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::SubLang(c) => {
+                self.prefs.sub_lang = c.to_string();
+                self.prefs.save();
+                return;
+            }
+            Opt::SubMode(m) => {
+                self.prefs.sub_mode = m.to_string();
+                self.prefs.save();
                 return;
             }
             Opt::TabShow(k) => {
@@ -2549,6 +2641,13 @@ impl App {
 }
 
 /// The panel of a menu and where its options are.
+/// The options on screen: all of them, or nine around the selected one in a long list (the languages).
+fn menu_rows(m: &Menu) -> std::ops::Range<usize> {
+    let shown = m.opts.len().min(9);
+    let first = m.sel.saturating_sub(4).min(m.opts.len() - shown);
+    first..first + shown
+}
+
 fn menu_panel(m: &Menu) -> (f32, f32, f32, f32) {
     let wide = m
         .opts
@@ -2556,7 +2655,7 @@ fn menu_panel(m: &Menu) -> (f32, f32, f32, f32) {
         .filter_map(|(_, t)| t.as_ref())
         .map(|t| t.w as f32)
         .fold(0.0, f32::max);
-    let (pw, ph) = ((wide + 112.0).max(640.0), 124.0 + m.opts.len() as f32 * 84.0);
+    let (pw, ph) = ((wide + 112.0).max(640.0), 124.0 + menu_rows(m).len() as f32 * 84.0);
     ((W - pw) / 2.0, (H - ph) / 2.0, pw, ph)
 }
 
@@ -2574,8 +2673,9 @@ fn draw_menu(g: &Gfx, m: &Menu) {
     let (px, py, pw, ph) = menu_panel(m);
     g.rounded(px, py, pw, ph, 28.0, PANEL, 1.0);
     g.put(m.title.as_ref(), px + 48.0, py + 36.0, DIM, 1.0);
-    for (i, (_, tex)) in m.opts.iter().enumerate() {
-        let oy = py + 100.0 + i as f32 * 84.0;
+    let rows = menu_rows(m);
+    for (i, (_, tex)) in m.opts.iter().enumerate().skip(rows.start).take(rows.len()) {
+        let oy = py + 100.0 + (i - rows.start) as f32 * 84.0;
         let th = tex.as_ref().map_or(0.0, |t| t.h as f32);
         if i == m.sel {
             g.rounded(px + 24.0, oy, pw - 48.0, 72.0, 18.0, WHITE, 1.0);

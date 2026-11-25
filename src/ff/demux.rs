@@ -54,6 +54,7 @@ pub struct ATrack {
     pub name: String,
     pub how: How,
     pub kind: Kind,
+    pub lang: String,
 }
 
 impl ATrack {
@@ -68,6 +69,8 @@ pub struct STrack {
     pub stream: i32,
     pub name: String,
     pub image: bool,
+    pub lang: String,
+    pub forced: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -353,40 +356,6 @@ extern "C" fn seek_cb(op: *mut c_void, offset: i64, whence: c_int) -> i64 {
     io.range.position()
 }
 
-fn lang_name(code: &str) -> String {
-    let n = match code {
-        "eng" => "English",
-        "fre" | "fra" => "French",
-        "ger" | "deu" => "German",
-        "spa" => "Spanish",
-        "ita" => "Italian",
-        "por" => "Portuguese",
-        "dut" | "nld" => "Dutch",
-        "rus" => "Russian",
-        "jpn" => "Japanese",
-        "kor" => "Korean",
-        "chi" | "zho" => "Chinese",
-        "ara" => "Arabic",
-        "hin" => "Hindi",
-        "swe" => "Swedish",
-        "dan" => "Danish",
-        "nor" | "nob" => "Norwegian",
-        "fin" => "Finnish",
-        "pol" => "Polish",
-        "tur" => "Turkish",
-        "cze" | "ces" => "Czech",
-        "hun" => "Hungarian",
-        "gre" | "ell" => "Greek",
-        "heb" => "Hebrew",
-        "tha" => "Thai",
-        "ukr" => "Ukrainian",
-        "rum" | "ron" => "Romanian",
-        "und" | "" => "",
-        other => return other.to_uppercase(),
-    };
-    n.to_string()
-}
-
 fn channels_name(n: i32) -> String {
     match n {
         1 => "Mono".into(),
@@ -400,7 +369,7 @@ fn channels_name(n: i32) -> String {
 
 /// "French - AC3 5.1" or, when the file names the track, "French - Director's commentary".
 unsafe fn track_name(f: &Fns, s: *mut AVStream, codec: &str, channels: Option<i32>, n: usize) -> String {
-    let lang = lang_name(&stream_tag(f, s, c"language").unwrap_or_default());
+    let lang = crate::lang::name(&stream_tag(f, s, c"language").unwrap_or_default());
     let title = stream_tag(f, s, c"title").or_else(|| stream_tag(f, s, c"name"));
     let tech = match channels {
         Some(c) => format!("{} {}", codec.to_uppercase(), channels_name(c)),
@@ -504,6 +473,7 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                     name: track_name(f, s, &name, Some(ch), n_a),
                     how,
                     kind,
+                    lang: stream_tag(f, s, c"language").unwrap_or_default(),
                 });
             }
             AVMEDIA_TYPE_SUBTITLE => {
@@ -518,6 +488,8 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                         stream: i as i32,
                         name: track_name(f, s, &name, None, n_s),
                         image,
+                        lang: stream_tag(f, s, c"language").unwrap_or_default(),
+                        forced: stream_forced(s),
                     });
                 }
             }
@@ -605,12 +577,15 @@ fn thread_main(url: String, stop: Arc<Stop>, cmds: Receiver<Cmd>, ready: Sender<
     };
     let info = unsafe { read_info(f, open.fmt) };
     log(&format!(
-        "ff: opened, {} s, {} bytes read, video {:?}, {} audio, {} subtitle tracks",
+        "ff: opened, {} s, {} bytes read, video {:?}, audio {:?}, subtitles {:?}",
         info.duration_ns / 1_000_000_000,
         open.io.range.fetched,
         info.video.as_ref().map(|v| (v.codec, v.w, v.h)),
-        info.audio.len(),
-        info.subs.len()
+        info.audio.iter().map(|a| a.lang.as_str()).collect::<Vec<_>>(),
+        info.subs
+            .iter()
+            .map(|t| format!("{}{}", t.lang, if t.forced { " forced" } else { "" }))
+            .collect::<Vec<_>>()
     ));
     let _ = ready.send(Ok(info.clone()));
     let mut first = true;

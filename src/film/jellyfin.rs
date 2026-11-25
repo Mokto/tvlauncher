@@ -74,6 +74,8 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
                     s["DisplayTitle"].as_str().or(s["Language"].as_str())?,
                 );
                 t.external = s["IsExternal"] == true;
+                t.lang = s["Language"].as_str().unwrap_or_default().into();
+                t.forced = s["IsForced"] == true;
                 Some(t)
             })
             .collect()

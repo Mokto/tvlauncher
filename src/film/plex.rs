@@ -66,11 +66,17 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
     for s in &streams {
         let Some(index) = s["index"].as_i64() else { continue };
         let name = s["displayTitle"].as_str().or(s["language"].as_str()).unwrap_or("Track");
+        let lang = s["languageCode"]
+            .as_str()
+            .or(s["languageTag"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let sid = s["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
         let selected = s["selected"] == true;
         match s["streamType"].as_i64() {
             Some(2) => {
                 let mut t = Track::new(index, name);
+                t.lang = lang.clone();
                 t.key = sid;
                 audio.push(t);
                 if selected {
@@ -89,6 +95,8 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
                     continue;
                 }
                 let mut t = Track::new(index, name);
+                t.lang = lang.clone();
+                t.forced = s["forced"] == true;
                 t.external = s["key"].is_string();
                 t.key = s["key"]
                     .as_str()

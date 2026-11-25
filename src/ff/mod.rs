@@ -340,6 +340,12 @@ pub unsafe fn stream_tag(f: &Fns, s: *mut AVStream, key: &CStr) -> Option<String
     Some(CStr::from_ptr((*e).value).to_string_lossy().into_owned()).filter(|s| !s.is_empty())
 }
 
+/// `AV_DISPOSITION_FORCED`, in `AVStream.disposition`: the field sits 16 bytes before `metadata` (disposition, discard
+/// and the 8-byte sample_aspect_ratio come between), which the offsets above agree with on both layouts.
+pub unsafe fn stream_forced(s: *mut AVStream) -> bool {
+    *((s as *const u8).add(STREAM_METADATA - 16) as *const c_int) & 0x40 != 0
+}
+
 pub unsafe fn fmt_duration(fmt: *const AVFormatContext) -> i64 {
     *((fmt as *const u8).add(FMT_DURATION) as *const i64)
 }
