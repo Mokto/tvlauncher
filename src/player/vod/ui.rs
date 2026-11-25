@@ -30,7 +30,8 @@ pub fn fkey() -> Option<Fk> {
             continue;
         }
         let (sym, wcode) = (e.key_sym(), e.key_wcode());
-        if sym == K_ESCAPE || wcode == WCODE_BACK {
+        // 413 is the remote's Stop
+        if sym == K_ESCAPE || wcode == WCODE_BACK || wcode == 413 {
             return Some(Fk::Back);
         }
         match (sym, wcode) {
