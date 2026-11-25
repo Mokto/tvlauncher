@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 pub mod ass;
 pub mod convert;
 pub mod demux;
+pub mod dolby;
 pub mod lossless;
 pub mod range;
 

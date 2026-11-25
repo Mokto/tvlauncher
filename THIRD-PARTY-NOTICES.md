@@ -15,6 +15,16 @@ They are licensed under the GNU Lesser General Public License, version 2.1 or la
   (`/media/developer/tvlauncher/lib`).
 - The `-plx` suffix in the file names keeps them apart from any FFmpeg the TV has.
 
+## Dolby Vision RPU conversion (`dolby_vision` crate)
+
+`src/ff/dolby.rs` rewrites a Dolby Vision profile 7 RPU to profile 8.1 with quietvoid's `dolby_vision` 3.4.0 (MIT,
+<https://github.com/quietvoid/dovi_tool>, the library behind `dovi_tool` and libdovi) and its dependencies, compiled
+into the program: `anyhow`, `bitvec` with `funty`, `radium`, `tap` and `wyz`, `bitvec_helpers`, `bitstream-io`,
+`no_std_io2`, `memchr`, `crc` with `crc-catalog`, and `tinyvec`, all MIT, Apache-2.0 or Zlib. The three files in
+`src/ff/dovi-assets/` are dovi_tool's own test assets (`assets/tests/mel_orig.bin`, `fel_orig.bin`, `mel_to_81.bin`, MIT),
+copied unmodified. The approach (convert to 8.1, drop the enhancement layer, cut HDR10+ SEI messages) follows Native
+Jelly (below).
+
 ## libass, FreeType, HarfBuzz and FriBidi (styled subtitles)
 
 The package carries `lib/libass-plx.so.0`, one shared library that exports only `ass_*` and has these four libraries

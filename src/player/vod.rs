@@ -8,6 +8,7 @@ mod ui;
 use super::*;
 use crate::ff::ass::Ass;
 use crate::ff::demux::{Demux, Feed, Queue, Run, ENDED};
+use crate::ff::dolby;
 use crate::ff::lossless;
 use crate::film::{self, extras, Backend, Clock, Event as Note, Item, Track, Why, TICKS};
 use crate::subs::Cue;
@@ -46,27 +47,6 @@ fn foreground() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status();
-}
-
-/// Whether this TV shows Dolby Vision (`tv.config.supportDolbyHDRContents`): the picture is declared Dolby Vision to
-/// the pipeline only then.
-fn dolby_vision_tv() -> bool {
-    static DV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DV.get_or_init(|| {
-        std::process::Command::new("/usr/bin/luna-send")
-            .args([
-                "-n",
-                "1",
-                "-w",
-                "3000",
-                "luna://com.webos.service.config/getConfigs",
-                r#"{"configNames":["tv.config.supportDolbyHDRContents"]}"#,
-            ])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(r#""tv.config.supportDolbyHDRContents":true"#))
-            .unwrap_or(false)
-    })
 }
 
 /// The server's HLS stream as a run: a thread carries what `read` finds into a queue.
@@ -406,7 +386,7 @@ impl Player {
         };
         let smp = &self.smp.fresh();
         let profile = dv.as_ref().filter(|d| matches!(d.profile, 5 | 8)).map(|d| d.profile);
-        let profile = profile.filter(|_| dolby_vision_tv());
+        let profile = profile.filter(|_| dolby::tv_shows_dv());
         let p = cstr(&payload_dv(APP, &window.0.to_string_lossy(), video, audio, profile));
         if unsafe { (smp.load)(smp.obj, p.as_ptr(), on_event) } & 0xff == 0 {
             return self.or_server(g, osd, direct, "The TV's player refused the video.", start);

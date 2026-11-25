@@ -4,11 +4,13 @@
 //! FLAC, ...) is re-encoded to AC-3 by `convert`. The framing follows Native Jelly's `rust-modules/src/ff.rs`
 //! (GPL-3.0).
 use super::convert::{self, Converter};
+use super::dolby::{self, Dv7, Sei};
 use super::lossless::{self, Kind, Mat, Mode, Packer};
 use super::range::{Range, Stop};
 use super::*;
 use crate::sdl::log;
 use crate::ts::{Au, Codec};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -793,17 +795,9 @@ fn for_each_nal(d: &[u8], nls: usize, mut f: impl FnMut(&[u8]) -> bool) {
 }
 
 /// One length-prefixed video packet as Annex-B in `out`, with `param` in front when it is a keyframe. Gives whether it
-/// is one. `drop_dv` removes the Dolby Vision layers a profile 7 disc adds (the enhancement layer, NAL type 63, and
-/// the RPU, 62): what is left is the HDR10 picture.
-fn annexb(
-    d: &[u8],
-    nls: usize,
-    hevc: bool,
-    container_key: bool,
-    drop_dv: bool,
-    param: &[u8],
-    out: &mut Vec<u8>,
-) -> bool {
+/// is one. On a profile 7 disc `dv7` decides what happens to the second layer and the RPU (`dolby`); HDR10+ metadata
+/// is cut out of every HEVC picture.
+fn annexb(d: &[u8], nls: usize, hevc: bool, container_key: bool, dv7: Dv7, param: &[u8], out: &mut Vec<u8>) -> bool {
     out.clear();
     let mut is_key = false;
     let mut sps_seen = false;
@@ -822,9 +816,31 @@ fn annexb(
         out.extend_from_slice(param);
     }
     for_each_nal(d, nls, |n| {
-        if !(hevc && drop_dv && matches!((n[0] >> 1) & 0x3f, 62 | 63)) {
+        if !hevc {
             out.extend_from_slice(&[0, 0, 0, 1]);
             out.extend_from_slice(n);
+            return false;
+        }
+        let nal: Cow<[u8]> = match (dv7, dolby::nal_type(n)) {
+            (Dv7::Off, _) => Cow::Borrowed(n),
+            (Dv7::Drop, dolby::NAL_RPU | dolby::NAL_EL) => return false,
+            (_, _) if dolby::is_el(n) => return false,
+            (Dv7::Convert, dolby::NAL_RPU) => match dolby::rpu_to_p81(n) {
+                Some(r) => Cow::Owned(r),
+                None => return false,
+            },
+            _ => Cow::Borrowed(n),
+        };
+        match dolby::strip_hdr10plus(&nal) {
+            Sei::Keep => {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(&nal);
+            }
+            Sei::Rewrite(v) => {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(&v);
+            }
+            Sei::Drop => {}
         }
         false
     });
@@ -1098,7 +1114,11 @@ unsafe fn run(
         std::slice::from_raw_parts((*vcp).extradata, (*vcp).extradata_size as usize)
     };
     let (param, nls) = parse_extradata(ed, hevc);
-    let drop_dv = hevc && video.dv.as_ref().is_some_and(|d| d.profile == 7);
+    let dv7 = match &video.dv {
+        Some(d) if hevc && d.profile == 7 && d.el && d.compat == 6 && dolby::tv_shows_dv() => Dv7::Convert,
+        Some(d) if hevc && d.profile == 7 => Dv7::Drop,
+        _ => Dv7::Off,
+    };
     let acp = stream_codecpar(*streams.get(audio as usize).ok_or("no such audio track")?);
     let a_how = info
         .audio
@@ -1157,7 +1177,15 @@ unsafe fn run(
         (_, How::Direct(c)) => Some(c),
         _ => Some(Codec::Ac3),
     };
-    let dv = video.dv.clone().filter(|d| !(hevc && d.profile == 7));
+    let dv = match dv7 {
+        Dv7::Convert => Some(Dv {
+            profile: 8,
+            compat: 1,
+            el: false,
+        }),
+        Dv7::Drop => None,
+        Dv7::Off => video.dv.clone(),
+    };
     if !q.push(Feed::Streams {
         video: Some(video.codec),
         audio: a_codec,
@@ -1213,7 +1241,7 @@ unsafe fn run(
                     nls,
                     hevc,
                     (*pkt).flags & AV_PKT_FLAG_KEY != 0,
-                    drop_dv,
+                    dv7,
                     &param,
                     &mut au_buf,
                 );
@@ -1475,11 +1503,11 @@ mod tests {
         let mut out = vec![];
         // an IDR slice (type 5), 4-byte length
         let idr = [0, 0, 0, 3, 0x65, 0xAA, 0xBB];
-        assert!(annexb(&idr, 4, false, true, false, &param, &mut out));
+        assert!(annexb(&idr, 4, false, true, Dv7::Off, &param, &mut out));
         assert_eq!(out, [0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x65, 0xAA, 0xBB]);
         // a P slice (type 1) is no keyframe and gets no parameter sets; first_mb ue=0 ('1'), type ue=0 ('1')
         let p = [0, 0, 0, 3, 0x41, 0xC0, 0];
-        assert!(!annexb(&p, 4, false, true, false, &param, &mut out));
+        assert!(!annexb(&p, 4, false, true, Dv7::Off, &param, &mut out));
         assert_eq!(out, [0, 0, 0, 1, 0x41, 0xC0, 0]);
     }
 
@@ -1488,10 +1516,48 @@ mod tests {
         // HEVC NAL header byte 0 holds type<<1: IDR_W_RADL = 19, RPU = 62, EL = 63.
         let pkt = [0, 0, 0, 2, 19 << 1, 1, 0, 0, 0, 2, 62 << 1, 1, 0, 0, 0, 2, 63 << 1, 1];
         let mut out = vec![];
-        assert!(annexb(&pkt, 4, true, true, true, &[], &mut out));
+        assert!(annexb(&pkt, 4, true, true, Dv7::Drop, &[], &mut out));
         assert_eq!(out, [0, 0, 0, 1, 19 << 1, 1]);
-        annexb(&pkt, 4, true, true, false, &[], &mut out);
+        annexb(&pkt, 4, true, true, Dv7::Off, &[], &mut out);
         assert_eq!(out.len(), 18, "kept when not profile 7");
+    }
+
+    /// A length-prefixed packet (4-byte lengths) of these NALs.
+    fn packet(nals: &[&[u8]]) -> Vec<u8> {
+        nals.iter()
+            .flat_map(|n| (n.len() as u32).to_be_bytes().into_iter().chain(n.iter().copied()))
+            .collect()
+    }
+
+    #[test]
+    fn a_profile_7_picture_keeps_its_base_and_gets_an_8_1_rpu() {
+        let mel = &dolby::tests::nal(include_bytes!("dovi-assets/dovi-p7-mel-rpu.bin"));
+        let want = &dolby::tests::nal(include_bytes!("dovi-assets/dovi-p7-mel-to-81-rpu.bin"));
+        let base = [19 << 1, 1, 0xAA];
+        let pkt = packet(&[&base, mel, &[63 << 1, 1, 0xBB], &[2, 9, 0xCC]]);
+        let mut out = vec![];
+        annexb(&pkt, 4, true, true, Dv7::Convert, &[], &mut out);
+        let mut expect = vec![0, 0, 0, 1, 19 << 1, 1, 0xAA, 0, 0, 0, 1];
+        expect.extend_from_slice(want);
+        assert_eq!(out, expect);
+        let junk = packet(&[&base, &[0x7c, 1, 0, 0, 0]]);
+        annexb(&junk, 4, true, true, Dv7::Convert, &[], &mut out);
+        assert_eq!(
+            out,
+            [0, 0, 0, 1, 19 << 1, 1, 0xAA],
+            "an RPU that cannot convert is dropped"
+        );
+    }
+
+    #[test]
+    fn hdr10_plus_is_cut_from_every_hevc_picture_but_not_h264() {
+        let plus = [39 << 1, 1, 4, 7, 0xb5, 0, 0x3c, 0, 1, 4, 1, 0x80];
+        let pkt = packet(&[&plus, &[19 << 1, 1, 0xAA]]);
+        let mut out = vec![];
+        annexb(&pkt, 4, true, true, Dv7::Off, &[], &mut out);
+        assert_eq!(out, [0, 0, 0, 1, 19 << 1, 1, 0xAA]);
+        annexb(&pkt, 4, false, true, Dv7::Off, &[], &mut out);
+        assert_eq!(out.len(), 4 + plus.len() + 4 + 3, "an H.264 stream is left alone");
     }
 
     #[test]
