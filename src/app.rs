@@ -559,17 +559,17 @@ impl App {
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
-        let mut player = vec![
-            entry(
-                Act::JfPlayer,
-                "Play in the launcher",
-                "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
-                Value::Switch(self.prefs.jf_player),
-            ),
+        let player = vec![entry(
+            Act::JfPlayer,
+            "Play in the launcher",
+            "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
+            Value::Switch(self.prefs.jf_player),
+        )];
+        let mut audio = vec![
             entry(
                 Act::Lossless,
                 "Lossless audio to a receiver",
-                "Sends DTS, DTS-HD, DTS:X and Dolby TrueHD (Atmos) unconverted to an AV receiver on HDMI ARC or optical. Only while the TV's sound output is that receiver; on TV speakers the server converts them as before.",
+                "Sends DTS, DTS-HD, DTS:X and Dolby TrueHD (Atmos) in films unconverted to an AV receiver on HDMI ARC or optical. Only while the TV's sound output is that receiver; on TV speakers the server converts them as before.",
                 Value::Switch(self.prefs.lossless),
             ),
         ];
@@ -582,7 +582,7 @@ impl App {
                 Some(s) if s.contains("REFUSED") => "Refused",
                 _ => "Unknown",
             };
-            player.push(entry(
+            audio.push(entry(
                 Act::Hbr,
                 "Atmos, TrueHD and DTS:X (root)",
                 "Full-rate DTS-HD and TrueHD need an 8-channel eARC link, which LG only opens for its own apps. This installs a small kernel module (tested on an LG C1 with firmware 03.53.45 only; other TVs refuse it and keep the stereo link). It loads again at every start.",
@@ -655,6 +655,7 @@ impl App {
             .chain([("Jellyfin", jellyfin), ("Plex", plex)])
             .chain(player)
             .chain([
+                ("Audio", audio),
                 ("YouTube", youtube),
                 ("Live TV", tv),
                 ("Ads and privacy", privacy),
