@@ -1,4 +1,4 @@
-//! What the viewer sees and presses while a title plays: the remote, the bar at the bottom, the track menu and the
+//! What the viewer sees and presses while a title plays: the remote, the bar and its buttons, the panels and the
 //! subtitles (text, and the bitmaps of PGS and DVD tracks).
 use super::super::*;
 use crate::ff::demux::{Bitmap, SubEv, SubWhat};
@@ -15,13 +15,17 @@ pub enum Fk {
     Pause,
     /// The next (1) or the previous (-1) chapter.
     Chapter(i32),
+    /// Left (-1) or Right (1) went down; held, the key comes again (the caller tells a hold from a tap).
+    Step(i64),
+    /// Left or Right came up.
+    Release,
+    /// The rewind and fast-forward buttons: seconds.
     Seek(i64),
     Up,
     Down,
 }
 
-/// The remote while a title plays. Seconds are what a key seeks by: Left and Right 10, the rewind and fast-forward
-/// buttons 30.
+/// The remote while a title plays.
 pub fn fkey() -> Option<Fk> {
     if STOP.load(Ordering::SeqCst) || crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
         return Some(Fk::Back);
@@ -32,11 +36,13 @@ pub fn fkey() -> Option<Fk> {
             unsafe { SDL_PushEvent(&mut Event::new(QUIT)) };
             return Some(Fk::Back);
         }
+        let (sym, wcode) = (e.key_sym(), e.key_wcode());
+        if e.kind() == KEYUP && (sym == K_LEFT || sym == K_RIGHT) {
+            return Some(Fk::Release);
+        }
         if e.kind() != KEYDOWN {
             continue;
         }
-        let (sym, wcode) = (e.key_sym(), e.key_wcode());
-        log(&format!("film: key {sym} wcode {wcode}"));
         // 413 is the remote's Stop
         if sym == K_ESCAPE || wcode == WCODE_BACK || wcode == 413 {
             return Some(Fk::Back);
@@ -45,19 +51,83 @@ pub fn fkey() -> Option<Fk> {
             // 415 and 19 are the remote's Play and Pause
             (K_RETURN | K_KP_ENTER, _) => return Some(Fk::Toggle),
             (_, 415 | 19) => return Some(Fk::Pause),
-            // 427 and 428 are the remote's channel up and down
-            (K_PAGEDOWN, _) | (_, 427) => return Some(Fk::Chapter(1)),
-            (K_PAGEUP, _) | (_, 428) => return Some(Fk::Chapter(-1)),
-            (K_LEFT, _) => return Some(Fk::Seek(-10)),
-            (K_RIGHT, _) => return Some(Fk::Seek(10)),
+            (K_PAGEDOWN, _) => return Some(Fk::Chapter(1)),
+            (K_PAGEUP, _) => return Some(Fk::Chapter(-1)),
+            (K_LEFT, _) => return Some(Fk::Step(-1)),
+            (K_RIGHT, _) => return Some(Fk::Step(1)),
             (_, 412) => return Some(Fk::Seek(-30)),
             (_, 417) => return Some(Fk::Seek(30)),
             (K_UP, _) => return Some(Fk::Up),
             (K_DOWN, _) => return Some(Fk::Down),
-            _ => {}
+            _ => log(&format!("film: key {sym} wcode {wcode}")),
         }
     }
     None
+}
+
+// ---- the look of subtitles, and the skip step ---------------------------------------------------------------------
+
+/// The choices of Options: subtitle sizes (pixels), how far above the usual place they stand, and the skip steps.
+pub const SIZES: [(&str, c_int); 4] = [("Small", 36), ("Normal", 44), ("Large", 56), ("Huge", 68)];
+pub const RAISES: [(&str, f32); 3] = [("Low", 0.0), ("Higher", 90.0), ("Highest", 180.0)];
+pub const SKIPS: [i64; 5] = [5, 10, 15, 30, 60];
+
+pub use crate::data::Look;
+
+/// Keeps a look read from a hand-edited file inside the lists.
+pub fn clamp_look(l: Look) -> Look {
+    Look {
+        sub_size: l.sub_size.min(SIZES.len() - 1),
+        sub_pos: l.sub_pos.min(RAISES.len() - 1),
+        skip: l.skip.min(SKIPS.len() - 1),
+        ..l
+    }
+}
+
+// ---- seeking ------------------------------------------------------------------------------------------------------
+
+/// A held Left or Right: the place it has reached, in seconds, and since when it is held.
+pub struct Scrub {
+    pub dir: i64,
+    pub at: f64,
+    since: Instant,
+    last: Instant,
+}
+
+impl Scrub {
+    pub fn new(dir: i64, at: f64) -> Scrub {
+        Scrub {
+            dir,
+            at,
+            since: Instant::now(),
+            last: Instant::now(),
+        }
+    }
+
+    /// Seconds of film a second of holding moves, by how long the key has been held: none at first (a tap), then
+    /// faster in steps, so that a whole film takes a quarter of a minute.
+    fn rate(held: f64) -> (f64, u8) {
+        match held {
+            h if h < 0.45 => (0.0, 0),
+            h if h < 2.0 => (20.0, 1),
+            h if h < 4.0 => (60.0, 2),
+            h if h < 6.0 => (180.0, 3),
+            _ => (480.0, 4),
+        }
+    }
+
+    /// Moves on by the time since the last frame, inside `0..=top`. Gives the speed step (0 to 4), or None when the
+    /// key has been held so long that its release must have been lost.
+    pub fn advance(&mut self, top: i64) -> Option<u8> {
+        let held = self.since.elapsed().as_secs_f64();
+        if held > 120.0 {
+            return None;
+        }
+        let (rate, level) = Scrub::rate(held);
+        self.at = (self.at + self.dir as f64 * rate * self.last.elapsed().as_secs_f64()).clamp(0.0, top as f64);
+        self.last = Instant::now();
+        Some(level)
+    }
 }
 
 // ---- the bar ------------------------------------------------------------------------------------------------------
@@ -70,14 +140,59 @@ pub struct Bar {
     frac: f32,
 }
 
-/// The title, the bar and the times, at the bottom of the picture for a few seconds, and while paused.
+/// The buttons on the bar, each opening a panel.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Btn {
+    Subs,
+    Audio,
+    Chapters,
+    Options,
+    Info,
+}
+
+impl Btn {
+    fn label(self) -> &'static str {
+        match self {
+            Btn::Subs => "Subtitles",
+            Btn::Audio => "Audio",
+            Btn::Chapters => "Chapters",
+            Btn::Options => "Options",
+            Btn::Info => "Info",
+        }
+    }
+}
+
+/// Where a seek is going: the place in seconds, where it began, and the speed step of a held key (0 to 4).
+#[derive(Clone, Copy)]
+pub struct Seeking {
+    pub to: i64,
+    pub from: i64,
+    pub level: u8,
+}
+
+/// A text and its picture, made again only when the text changes.
+#[derive(Default)]
+struct Label(String, Option<Tex>);
+
+impl Label {
+    fn set(&mut self, g: &Gfx, font: *mut Opaque, s: &str) -> Option<&Tex> {
+        if self.0 != s {
+            *self = Label(s.to_string(), g.text(font, s, 0));
+        }
+        self.1.as_ref()
+    }
+}
+
+/// The title, the bar, the times and the buttons, at the bottom of the picture for a few seconds, and while paused.
 pub struct Osd {
     name: Option<Tex>,
     sub: Option<Tex>,
     paused: Option<Tex>,
     total: Option<Tex>,
     total_s: i64,
-    at: (String, Option<Tex>),
+    at: Label,
+    ends: Label,
+    delta: Label,
     status: Option<Tex>,
     chapters: Vec<Chapter>,
     /// The chapter whose name is drawn, and the name.
@@ -86,25 +201,58 @@ pub struct Osd {
     /// A status that goes by itself (a failed subtitle download), unlike an error that stays until Back.
     status_until: Option<Instant>,
     until: Instant,
+    buttons: Vec<(Btn, Option<Tex>)>,
+    /// The focused button, when the focus is on the buttons rather than on the bar.
+    pub focus: Option<usize>,
 }
 
 impl Osd {
     pub fn new(g: &Gfx, it: &Item) -> Osd {
         let total_s = it.total / TICKS;
         Osd {
-            name: g.text(g.f_row, &it.name, 1500),
-            sub: g.text(g.f_sub, &it.sub, 1500),
+            name: g.text(g.f_row, &crate::jellyfin::clip(&it.name, 40), 0),
+            sub: g.text(g.f_sub, &it.sub, 1000),
             paused: g.text(g.f_sub, "Paused", 0),
             total: g.text(g.f_sub, &film::clock(total_s), 0),
             total_s,
-            at: (String::new(), None),
+            at: Label::default(),
+            ends: Label::default(),
+            delta: Label::default(),
             status: None,
             chapters: it.chapters.clone(),
             chapter: (None, None),
             skip: None,
             status_until: None,
             until: Instant::now() + Duration::from_secs(6),
+            buttons: vec![],
+            focus: None,
         }
+    }
+
+    pub fn set_buttons(&mut self, g: &Gfx, list: &[Btn]) {
+        if self.buttons.iter().map(|b| b.0).ne(list.iter().copied()) {
+            self.buttons = list.iter().map(|b| (*b, g.text(g.f_label, b.label(), 0))).collect();
+            self.focus = None;
+        }
+    }
+
+    pub fn button(&self) -> Option<Btn> {
+        self.buttons.get(self.focus?).map(|b| b.0)
+    }
+
+    /// Down: the focus goes to the first button (or stays where it is).
+    pub fn focus_buttons(&mut self) {
+        self.show();
+        if self.focus.is_none() && !self.buttons.is_empty() {
+            self.focus = Some(0);
+        }
+    }
+
+    pub fn step(&mut self, d: i64) {
+        if let Some(f) = self.focus {
+            self.focus = Some((f as i64 + d).clamp(0, self.buttons.len() as i64 - 1) as usize);
+        }
+        self.show();
     }
 
     pub fn show(&mut self) {
@@ -123,24 +271,46 @@ impl Osd {
     }
 
     /// Where the bar is, when it was drawn.
-    fn draw(&mut self, g: &Gfx, pos_s: i64, paused: bool, seeking: Option<i64>) -> Option<Bar> {
+    fn draw(&mut self, g: &Gfx, pos_s: i64, paused: bool, seeking: Option<Seeking>) -> Option<Bar> {
         if self.status_until.is_some_and(|t| Instant::now() > t) {
             (self.status, self.status_until) = (None, None);
         }
         if !(paused || seeking.is_some() || self.status.is_some() || Instant::now() < self.until) {
+            self.focus = None;
             return None;
         }
-        let shown = seeking.unwrap_or(pos_s);
-        let label = film::clock(shown);
-        if self.at.0 != label {
-            self.at = (label.clone(), g.text(g.f_sub, &label, 0));
-        }
-        let (x, w, h) = (MARGIN, W - 2.0 * MARGIN, 210.0);
+        let shown = seeking.map_or(pos_s, |s| s.to);
+        let (x, w, h) = (MARGIN, W - 2.0 * MARGIN, 230.0);
         let y = H - h - 64.0;
         g.rounded(x, y, w, h, 28.0, PANEL, 0.94);
         g.put(self.name.as_ref(), x + 48.0, y + 28.0, TEXT, 1.0);
-        g.put(self.sub.as_ref(), x + 48.0, y + 82.0, DIM, 1.0);
-        let (bx, bw, by) = (x + 48.0, w - 96.0, y + h - 72.0);
+        g.put(self.sub.as_ref(), x + 48.0, y + 88.0, DIM, 1.0);
+        let mut bx = x + w - 48.0;
+        for (i, (_, t)) in self.buttons.iter().enumerate().rev() {
+            let tw = t.as_ref().map_or(0.0, |t| t.w as f32);
+            let (pw, ph) = (tw + 56.0, 60.0);
+            bx -= pw;
+            let on = self.focus == Some(i);
+            g.rounded(
+                bx,
+                y + 28.0,
+                pw,
+                ph,
+                ph / 2.0,
+                if on { TEXT } else { rgb(70, 74, 80) },
+                1.0,
+            );
+            let th = t.as_ref().map_or(0.0, |t| t.h as f32);
+            g.put(
+                t.as_ref(),
+                bx + 28.0,
+                y + 28.0 + (ph - th) / 2.0,
+                if on { rgb(20, 22, 25) } else { TEXT },
+                1.0,
+            );
+            bx -= 14.0;
+        }
+        let (bx, bw, by) = (x + 48.0, w - 96.0, y + h - 76.0);
         let frac = if self.total_s > 0 {
             (shown as f32 / self.total_s as f32).clamp(0.0, 1.0)
         } else {
@@ -153,11 +323,11 @@ impl Osd {
             frac,
         });
         if let Some(s) = &self.status {
-            g.put(Some(s), x + 48.0, y + 132.0, DIM, 1.0);
+            g.put(Some(s), x + 48.0, y + 146.0, DIM, 1.0);
             return bar;
         }
         if let Some(p) = self.paused.as_ref().filter(|_| paused) {
-            g.put(Some(p), x + w - 48.0 - p.w as f32, y + 34.0, TEXT, 1.0);
+            g.put(Some(p), x + w - 48.0 - p.w as f32, y + 100.0, TEXT, 1.0);
         }
         g.rounded(bx, by, bw, 8.0, 4.0, BLACK, 0.5);
         if bw * frac >= 8.0 {
@@ -169,18 +339,56 @@ impl Osd {
                 g.rounded(bx + bw * f - 2.0, by - 6.0, 4.0, 20.0, 2.0, DIM, 1.0);
             }
         }
-        g.put(self.at.1.as_ref(), bx, by + 22.0, TEXT, 1.0);
+        if let Some(s) = seeking {
+            let head = bx + bw * frac;
+            g.rounded(head - 12.0, by - 8.0, 24.0, 24.0, 12.0, TEXT, 1.0);
+            let d = s.to - s.from;
+            let text = format!("{}{}", if d < 0 { "-" } else { "+" }, film::clock(d.abs()));
+            let dots = if s.level > 0 { 4.0 * 18.0 + 12.0 } else { 0.0 };
+            if let Some(t) = self.delta.set(g, g.f_sub, &text) {
+                let tw = t.w as f32 + dots;
+                let tx = (head - tw / 2.0).clamp(bx, bx + bw - tw);
+                let ty = by - 18.0 - t.h as f32;
+                g.put(Some(t), tx, ty, TEXT, 1.0);
+                for i in 0..if s.level > 0 { 4u8 } else { 0 } {
+                    let on = i < s.level;
+                    let dx = tx + t.w as f32 + 12.0 + f32::from(i) * 18.0;
+                    g.rounded(
+                        dx,
+                        ty + t.h as f32 / 2.0 - 6.0,
+                        12.0,
+                        12.0,
+                        6.0,
+                        if on { YELLOW } else { DIM },
+                        1.0,
+                    );
+                }
+            }
+        }
+        let at = self.at.set(g, g.f_sub, &film::clock(shown)).map(|t| (t.w as f32, t));
+        if let Some((_, t)) = at {
+            g.put(Some(t), bx, by + 24.0, TEXT, 1.0);
+        }
+        let at_w = at.map_or(0.0, |a| a.0);
         let now = chapter_at(&self.chapters, shown * TICKS);
         if self.chapter.0 != now {
             let name = now.map(|i| crate::jellyfin::clip(&self.chapters[i].name, 60));
             self.chapter = (now, name.and_then(|n| g.text(g.f_sub, &n, 0)));
         }
         if let Some(n) = &self.chapter.1 {
-            let at_w = self.at.1.as_ref().map_or(0, |t| t.w) as f32;
-            g.put(Some(n), bx + at_w + 40.0, by + 22.0, DIM, 1.0);
+            g.put(Some(n), bx + at_w + 40.0, by + 24.0, DIM, 1.0);
         }
+        let total_w = self.total.as_ref().map_or(0.0, |t| t.w as f32);
         if let Some(t) = &self.total {
-            g.put(Some(t), bx + bw - t.w as f32, by + 22.0, DIM, 1.0);
+            g.put(Some(t), bx + bw - total_w, by + 24.0, DIM, 1.0);
+        }
+        if self.total_s > 0 {
+            let left = (self.total_s - shown).max(0);
+            let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
+            let text = format!("Ends at {}", super::super::hm(now + left));
+            if let Some(t) = self.ends.set(g, g.f_sub, &text) {
+                g.put(Some(t), bx + bw - total_w - 40.0 - t.w as f32, by + 24.0, DIM, 1.0);
+            }
         }
         bar
     }
@@ -223,6 +431,9 @@ pub struct Choice {
     pub init: bool,
     pub audio: Option<i64>,
     pub sub: Option<SubSel>,
+    /// Options: the look (saved) and how much later than the file says subtitles show, in ms (this film only).
+    pub look: Look,
+    pub delay_ms: i64,
 }
 
 pub struct Ev {
@@ -419,12 +630,25 @@ static FONT_ROOT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new()
 /// Where the TV's fonts are looked for (`<root>/usr/share/fonts`).
 pub fn set_font_root(root: &str) {
     *FONT_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root.to_string();
-    let f = crate::font(root, "LG_Smart_UI-SemiBold.ttf", SUB_SIZE);
+    let f = crate::font(root, "LG_Smart_UI-SemiBold.ttf", SUB_PX.load(Ordering::SeqCst));
     MAIN.store(f, Ordering::SeqCst);
 }
 
+/// The root the player runs under: where `state.json` is.
+pub fn root() -> String {
+    FONT_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The text subtitles' size in pixels (Options): the fonts are opened again at it.
+pub fn set_sub_size(px: c_int) {
+    if SUB_PX.swap(px, Ordering::SeqCst) != px {
+        set_font_root(&root());
+        *FONTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Subtitles are bigger than the UI's text: they are read from the sofa.
-const SUB_SIZE: c_int = 44;
+static SUB_PX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(44);
 static MAIN: std::sync::atomic::AtomicPtr<Opaque> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// The font of subtitles: the UI font at `SUB_SIZE`, or the UI's row font where there is none (a desktop shot).
@@ -501,7 +725,8 @@ fn font_for(g: &Gfx, line: &str) -> *mut Opaque {
         let f = match cached {
             Some(f) => f,
             None => {
-                let f = unsafe { TTF_OpenFont(cstr(&fonts.files[i].to_string_lossy()).as_ptr(), SUB_SIZE) };
+                let px = SUB_PX.load(Ordering::SeqCst);
+                let f = unsafe { TTF_OpenFont(cstr(&fonts.files[i].to_string_lossy()).as_ptr(), px) };
                 fonts.open.push((i, f));
                 f
             }
@@ -520,7 +745,7 @@ fn font_for(g: &Gfx, line: &str) -> *mut Opaque {
     best
 }
 
-// ---- the track menu -----------------------------------------------------------------------------------------------
+// ---- the panels ---------------------------------------------------------------------------------------------------
 
 pub struct AudioRow {
     pub index: i64,
@@ -539,97 +764,211 @@ pub struct Tracks {
     pub subs: Vec<SubRow>,
 }
 
+/// A row of Options: Left and Right change it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Opt {
+    Size,
+    Raise,
+    Bg,
+    Delay,
+    Skip,
+}
+
 pub enum Pick {
-    Head,
+    /// A line that is shown and not chosen: a heading, or a fact of Info.
+    Line,
     Sub(Option<SubSel>),
     Audio(i64),
     /// A chapter's start, in ticks.
     Chapter(i64),
+    Opt(Opt),
 }
 
-/// Subtitles and audio tracks to choose from, with Down.
-pub struct Menu {
-    pub rows: Vec<(Option<Tex>, Pick, bool)>,
-    pub sel: usize,
+pub struct Row {
+    tex: Option<Tex>,
+    value: Option<Tex>,
+    pub pick: Pick,
+    current: bool,
 }
+
+/// The panel a button opens, at the right of the picture.
+pub struct Menu {
+    pub btn: Btn,
+    title: Option<Tex>,
+    hint: Option<Tex>,
+    pub rows: Vec<Row>,
+    pub sel: Option<usize>,
+}
+
+/// What a panel's row says: its name, its value (Options and Info), what it does, and whether it is the current one.
+type RowSpec = (String, Option<String>, Pick, bool);
 
 impl Menu {
-    /// None when there is nothing to choose: no subtitles and at most one audio track.
-    pub fn new(g: &Gfx, t: &Tracks, c: &Choice, chapters: &[Chapter], pos: i64) -> Option<Menu> {
-        let mut rows = vec![];
-        let mut row = |name: &str, pick, current| {
-            rows.push((g.text(g.f_sub, &crate::jellyfin::clip(name, 46), 0), pick, current))
-        };
-        if !t.subs.is_empty() {
-            row("Subtitles", Pick::Head, false);
-            row("Off", Pick::Sub(None), c.sub.is_none());
-            for s in &t.subs {
-                let sel = SubSel {
-                    index: s.index,
-                    server: s.server,
-                };
-                row(&s.name, Pick::Sub(Some(sel)), c.sub.is_some_and(|x| x.index == s.index));
-            }
+    fn build(g: &Gfx, btn: Btn, hint: &str, rows: Vec<RowSpec>, sel: Option<usize>) -> Menu {
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .map(|(name, value, pick, current)| Row {
+                tex: g.text(g.f_sub, &crate::jellyfin::clip(&name, 46), 0),
+                value: value.and_then(|v| g.text(g.f_sub, &crate::jellyfin::clip(&v, 40), 0)),
+                pick,
+                current,
+            })
+            .collect();
+        let can = |i: usize| rows.get(i).is_some_and(|r| !matches!(r.pick, Pick::Line));
+        let sel = sel
+            .filter(|i| can(*i))
+            .or_else(|| (0..rows.len()).find(|i| can(*i) && rows[*i].current))
+            .or_else(|| (0..rows.len()).find(|i| can(*i)));
+        Menu {
+            btn,
+            title: g.text(g.f_label, btn.label(), 0),
+            hint: (!hint.is_empty()).then(|| g.text(g.f_label, hint, 0)).flatten(),
+            rows,
+            sel,
         }
-        if t.audio.len() > 1 {
-            row("Audio", Pick::Head, false);
-            for (n, a) in t.audio.iter().enumerate() {
-                row(
-                    &a.name,
-                    Pick::Audio(a.index),
-                    c.audio == Some(a.index) || (c.audio.is_none() && n == 0),
-                );
-            }
+    }
+
+    pub fn subs(g: &Gfx, t: &Tracks, c: &Choice) -> Menu {
+        let mut rows = vec![("Off".into(), None, Pick::Sub(None), c.sub.is_none())];
+        for s in &t.subs {
+            let sel = SubSel {
+                index: s.index,
+                server: s.server,
+            };
+            let on = c.sub.is_some_and(|x| x.index == s.index);
+            rows.push((s.name.clone(), None, Pick::Sub(Some(sel)), on));
         }
-        if !chapters.is_empty() {
-            row("Chapters", Pick::Head, false);
-            let now = chapter_at(chapters, pos);
-            for (n, ch) in chapters.iter().enumerate() {
+        Menu::build(g, Btn::Subs, "", rows, None)
+    }
+
+    pub fn audio(g: &Gfx, t: &Tracks, c: &Choice) -> Menu {
+        let rows = t
+            .audio
+            .iter()
+            .enumerate()
+            .map(|(n, a)| {
+                let on = c.audio == Some(a.index) || (c.audio.is_none() && n == 0);
+                (a.name.clone(), None, Pick::Audio(a.index), on)
+            })
+            .collect();
+        Menu::build(g, Btn::Audio, "", rows, None)
+    }
+
+    pub fn chapters(g: &Gfx, chapters: &[Chapter], pos: i64) -> Menu {
+        let now = chapter_at(chapters, pos);
+        let rows = chapters
+            .iter()
+            .enumerate()
+            .map(|(n, ch)| {
                 let name = format!("{}   {}", film::clock(ch.start / TICKS), ch.name);
-                row(&name, Pick::Chapter(ch.start), now == Some(n));
-            }
-        }
-        let sel = rows.iter().position(|r| r.2 && !matches!(r.1, Pick::Head))?;
-        Some(Menu { rows, sel })
+                (name, None, Pick::Chapter(ch.start), now == Some(n))
+            })
+            .collect();
+        Menu::build(g, Btn::Chapters, "", rows, None)
+    }
+
+    /// `delay_ms`: how much later than the file says subtitles are shown (earlier when negative).
+    pub fn options(g: &Gfx, look: &Look, delay_ms: i64, sel: Option<usize>) -> Menu {
+        let delay = match delay_ms {
+            0 => "0.0 s".to_string(),
+            d => format!("{}{:.1} s", if d > 0 { "+" } else { "-" }, d.abs() as f64 / 1000.0),
+        };
+        let rows = vec![
+            (
+                "Subtitle size".into(),
+                Some(SIZES[look.sub_size].0.into()),
+                Pick::Opt(Opt::Size),
+                false,
+            ),
+            (
+                "Subtitle position".into(),
+                Some(RAISES[look.sub_pos].0.into()),
+                Pick::Opt(Opt::Raise),
+                false,
+            ),
+            (
+                "Subtitle background".into(),
+                Some(if look.sub_bg { "Box" } else { "Outline" }.into()),
+                Pick::Opt(Opt::Bg),
+                false,
+            ),
+            ("Subtitle timing".into(), Some(delay), Pick::Opt(Opt::Delay), false),
+            (
+                "Skip by".into(),
+                Some(format!("{} s", SKIPS[look.skip])),
+                Pick::Opt(Opt::Skip),
+                false,
+            ),
+        ];
+        Menu::build(g, Btn::Options, "Left and Right change it", rows, sel.or(Some(0)))
+    }
+
+    /// Facts about what plays: (name, value).
+    pub fn info(g: &Gfx, lines: Vec<(String, String)>) -> Menu {
+        let rows = lines
+            .into_iter()
+            .map(|(k, v)| (k, Some(v), Pick::Line, false))
+            .collect();
+        Menu::build(g, Btn::Info, "", rows, None)
+    }
+
+    pub fn picked(&self) -> Option<&Pick> {
+        self.rows.get(self.sel?).map(|r| &r.pick)
     }
 
     pub fn step(&mut self, d: i32) {
-        let mut i = self.sel as i32;
+        let Some(mut i) = self.sel.map(|s| s as i32) else {
+            return;
+        };
         loop {
             i += d;
             match self.rows.get(i as usize).filter(|_| i >= 0) {
                 None => return,
-                Some((_, Pick::Head, _)) => {}
-                Some(_) => return self.sel = i as usize,
+                Some(Row { pick: Pick::Line, .. }) => {}
+                Some(_) => return self.sel = Some(i as usize),
             }
         }
     }
 
     fn draw(&self, g: &Gfx) {
         const ROW: f32 = 64.0;
-        let shown = self.rows.len().min(9);
-        let first = (self.sel + 1).saturating_sub(shown).min(self.rows.len() - shown);
-        let (w, h) = (760.0, shown as f32 * ROW + 32.0);
-        let (x, y) = (W - MARGIN - w, (H - h) / 2.0);
+        let shown = self.rows.len().clamp(1, 9);
+        let at = self.sel.unwrap_or(0);
+        let first = (at + 1)
+            .saturating_sub(shown)
+            .min(self.rows.len().saturating_sub(shown));
+        let head = 64.0;
+        let foot = if self.hint.is_some() { 52.0 } else { 0.0 };
+        let w = if self.btn == Btn::Info { 1000.0 } else { 820.0 };
+        let h = head + shown as f32 * ROW + foot + 24.0;
+        let (x, y) = (W - MARGIN - w, ((H - 340.0 - h) / 2.0).max(40.0));
         g.rounded(x, y, w, h, 28.0, PANEL, 0.96);
-        for (n, (tex, pick, current)) in self.rows.iter().enumerate().skip(first).take(shown) {
-            let ry = y + 16.0 + (n - first) as f32 * ROW;
-            let on = n == self.sel;
+        g.put(self.title.as_ref(), x + 36.0, y + 24.0, DIM, 1.0);
+        for (n, row) in self.rows.iter().enumerate().skip(first).take(shown) {
+            let ry = y + head + (n - first) as f32 * ROW;
+            let on = self.sel == Some(n);
             if on {
                 g.rounded(x + 16.0, ry + 4.0, w - 32.0, ROW - 8.0, 16.0, TEXT, 1.0);
             }
-            let ink = if on {
-                rgb(20, 22, 25)
-            } else if matches!(pick, Pick::Head) {
-                DIM
-            } else {
-                TEXT
-            };
-            if *current {
+            let ink = if on { rgb(20, 22, 25) } else { TEXT };
+            if row.current {
                 g.rounded(x + 36.0, ry + ROW / 2.0 - 7.0, 14.0, 14.0, 7.0, ink, 1.0);
             }
-            let th = tex.as_ref().map_or(0, |t| t.h) as f32;
-            g.put(tex.as_ref(), x + 68.0, ry + (ROW - th) / 2.0, ink, 1.0);
+            let th = row.tex.as_ref().map_or(0, |t| t.h) as f32;
+            let name_ink = if matches!(row.pick, Pick::Line) { DIM } else { ink };
+            g.put(row.tex.as_ref(), x + 68.0, ry + (ROW - th) / 2.0, name_ink, 1.0);
+            if let Some(v) = &row.value {
+                g.put(
+                    Some(v),
+                    x + w - 48.0 - v.w as f32,
+                    ry + (ROW - v.h as f32) / 2.0,
+                    ink,
+                    1.0,
+                );
+            }
+        }
+        if let Some(t) = &self.hint {
+            g.put(Some(t), x + 36.0, y + h - foot - 8.0, DIM, 1.0);
         }
     }
 }
@@ -645,10 +984,11 @@ pub struct Over<'a> {
     pub skip: Option<SegKind>,
     pub thumb: Option<&'a Tex>,
     pub ass: Option<&'a AssLayer>,
+    pub look: Look,
 }
 
-/// A transparent frame, so the video plane shows, with the subtitle, the controls and the track menu over it.
-pub fn vframe(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i64>, over: Over) {
+/// A transparent frame, so the video plane shows, with the subtitle, the controls and the panel over it.
+pub fn vframe(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<Seeking>, over: Over) {
     unsafe {
         SDL_SetRenderDrawColor(g.ren, 0, 0, 0, 0);
         SDL_RenderClear(g.ren);
@@ -657,7 +997,7 @@ pub fn vframe(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<
     unsafe { SDL_RenderPresent(g.ren) };
 }
 
-fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i64>, over: Over) {
+fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<Seeking>, over: Over) {
     // The subtitle stands above the controls when they are up.
     let geom = osd.draw(g, pos_s, paused, seeking);
     let bar = geom.is_some();
@@ -677,10 +1017,20 @@ fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i
             g.copy(t, None, *dst);
         }
     }
+    let look = clamp_look(over.look);
+    let raise = RAISES[look.sub_pos].1;
     if let Some(s) = over.shown.filter(|_| seeking.is_none()) {
-        for (t, dst) in &s.images {
+        // A picture subtitle grows with the size from the bottom middle of the screen, as text does.
+        let k = SIZES[look.sub_size].1 as f32 / 44.0;
+        for (t, d) in &s.images {
+            let dst = FRect {
+                x: W / 2.0 + (d.x - W / 2.0) * k,
+                y: (H - (H - d.y) * k - raise).max(0.0),
+                w: d.w * k,
+                h: d.h * k,
+            };
             g.tint(t, rgb(255, 255, 255), 1.0);
-            g.copy(t, None, *dst);
+            g.copy(t, None, dst);
         }
         if !s.lines.is_empty() {
             let w = s.lines.iter().map(|t| t.w).max().unwrap_or(0) as f32;
@@ -688,12 +1038,29 @@ fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i
             let top = if s.top {
                 70.0
             } else {
-                (if bar { H - 300.0 } else { H - 120.0 }) - h
+                (if bar { H - 320.0 } else { H - 120.0 - raise }) - h
             };
-            g.rounded((W - w) / 2.0 - 20.0, top - 10.0, w + 40.0, h + 20.0, 16.0, BLACK, 0.6);
+            if look.sub_bg {
+                g.rounded((W - w) / 2.0 - 20.0, top - 10.0, w + 40.0, h + 20.0, 16.0, BLACK, 0.6);
+            }
             let mut y = top;
             for t in &s.lines {
-                g.put(Some(t), (W - t.w as f32) / 2.0, y, TEXT, 1.0);
+                let x = (W - t.w as f32) / 2.0;
+                if !look.sub_bg {
+                    for (dx, dy) in [
+                        (-3.0, 0.0),
+                        (3.0, 0.0),
+                        (0.0, -3.0),
+                        (0.0, 3.0),
+                        (-2.0, -2.0),
+                        (2.0, 2.0),
+                        (-2.0, 2.0),
+                        (2.0, -2.0),
+                    ] {
+                        g.put(Some(t), x + dx, y + dy, BLACK, 1.0);
+                    }
+                }
+                g.put(Some(t), x, y, TEXT, 1.0);
                 y += t.h as f32;
             }
         }
@@ -703,7 +1070,8 @@ fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i
     }
 }
 
-/// `--film-shot` on a desktop: the controls, a subtitle and the track menu over a stand-in picture (no player).
+/// `--film-shot` on a desktop: the controls, a subtitle and a panel over a stand-in picture (no player). `menu`
+/// opens Options with the focus on its button; without it, a seek is under way.
 pub fn shot(g: &Gfx, menu: bool) {
     let it = Item {
         backend: film::Backend::Jellyfin(crate::jellyfin::Config::default()),
@@ -736,40 +1104,16 @@ pub fn shot(g: &Gfx, menu: bool) {
         session: String::new(),
     };
     let mut osd = Osd::new(g, &it);
-    let tracks = Tracks {
-        audio: vec![
-            AudioRow {
-                index: 1,
-                name: "French - AC3 5.1".into(),
-            },
-            AudioRow {
-                index: 2,
-                name: "English - AAC Stereo".into(),
-            },
-        ],
-        subs: vec![
-            SubRow {
-                index: 3,
-                name: "French - SUBRIP".into(),
-                server: false,
-            },
-            SubRow {
-                index: 4,
-                name: "English - PGS".into(),
-                server: false,
-            },
-        ],
+    osd.set_buttons(g, &[Btn::Subs, Btn::Audio, Btn::Chapters, Btn::Options, Btn::Info]);
+    let look = Look {
+        sub_bg: !menu,
+        ..Look::default()
     };
-    let choice = Choice {
-        sub: Some(SubSel {
-            index: 3,
-            server: false,
-        }),
-        ..Choice::default()
-    };
-    let menu = menu
-        .then(|| Menu::new(g, &tracks, &choice, &it.chapters, 1234 * TICKS))
-        .flatten();
+    let menu = menu.then(|| {
+        osd.focus_buttons();
+        osd.step(3);
+        Menu::options(g, &look, 300, Some(3))
+    });
     let mut events = Events::default();
     events.insert(SubEv {
         start_ns: 0,
@@ -796,21 +1140,20 @@ pub fn shot(g: &Gfx, menu: bool) {
         .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
         .collect();
     let thumb = Tex::rgba(g.ren, w, h, &px);
+    let seeking = menu.is_none().then_some(Seeking {
+        to: 2410,
+        from: 1234,
+        level: 2,
+    });
     let over = Over {
         shown: Some(&shown),
         menu: menu.as_ref(),
         skip: menu.is_none().then_some(SegKind::Intro),
         thumb: thumb.as_ref(),
         ass: None,
+        look,
     };
-    draw_over(
-        g,
-        &mut osd,
-        1234,
-        true,
-        (thumb.is_some() && menu.is_none()).then_some(2410),
-        over,
-    );
+    draw_over(g, &mut osd, 1234, menu.is_some(), seeking, over);
 }
 
 #[cfg(test)]
@@ -841,6 +1184,25 @@ mod tests {
             SubWhat::Text { text, .. } => text.clone(),
             _ => "?".into(),
         })
+    }
+
+    #[test]
+    fn a_hold_speeds_up_and_stays_inside_the_film() {
+        assert_eq!(Scrub::rate(0.2), (0.0, 0), "a tap does not scrub");
+        let rates: Vec<f64> = [1.0, 3.0, 5.0, 9.0].iter().map(|h| Scrub::rate(*h).0).collect();
+        assert!(rates.windows(2).all(|w| w[0] < w[1]), "{rates:?}");
+        let mut s = Scrub::new(1, 100.0);
+        s.since -= Duration::from_secs(8);
+        s.last -= Duration::from_millis(500);
+        assert_eq!(s.advance(150), Some(4));
+        assert_eq!(s.at, 150.0, "stops at the end");
+        let mut s = Scrub::new(-1, 10.0);
+        s.since -= Duration::from_secs(3);
+        s.last -= Duration::from_secs(1);
+        s.advance(150);
+        assert_eq!(s.at, 0.0, "stops at the start");
+        s.since -= Duration::from_secs(200);
+        assert_eq!(s.advance(150), None, "a lost release ends the hold");
     }
 
     #[test]

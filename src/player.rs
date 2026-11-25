@@ -273,6 +273,8 @@ static ERROR: Mutex<Option<String>> = Mutex::new(None);
 static UNLOADED: AtomicBool = AtomicBool::new(false);
 /// The picture's size, from the video info (event 4), as width << 16 | height.
 static SIZE: AtomicU32 = AtomicU32::new(0);
+/// The picture's dynamic range as the TV reports it (event 4's `hdrType`), for Info.
+static HDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// The pipeline's events, from its own threads: the first few of each type go to the log.
 extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
@@ -300,6 +302,9 @@ extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
             let (w, h) = (v["video"]["width"].as_u64(), v["video"]["height"].as_u64());
             if let (Some(w @ 1..=8192), Some(h @ 1..=8192)) = (w, h) {
                 SIZE.store((w as u32) << 16 | h as u32, Ordering::SeqCst);
+            }
+            if let Some(t) = v["video"]["hdrType"].as_str() {
+                *HDR.lock().unwrap_or_else(|e| e.into_inner()) = t.to_string();
             }
         }
     }

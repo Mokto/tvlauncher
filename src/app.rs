@@ -1011,6 +1011,7 @@ impl App {
         }
         let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
         let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
+        self.prefs.look = Prefs::load(&self.luna.root).look;
         // What was watched moves up in Continue watching and in the libraries.
         self.refresh_jellyfin();
         self.refresh_plex();

@@ -475,6 +475,28 @@ pub struct Prefs {
     pub sub_lang: String,
     /// How the library tabs are sorted: "name" or "added".
     pub lib_sort: String,
+    /// The film player's Options, which it saves itself (see [`Prefs::save_look`]).
+    pub look: Look,
+}
+
+/// The film player's subtitle look and skip step: indexes into the player's lists of choices.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Look {
+    pub sub_size: usize,
+    pub sub_pos: usize,
+    pub sub_bg: bool,
+    pub skip: usize,
+}
+
+impl Default for Look {
+    fn default() -> Look {
+        Look {
+            sub_size: 1,
+            sub_pos: 0,
+            sub_bg: true,
+            skip: 1,
+        }
+    }
 }
 
 /// The groups `debloat.sh` knows, with what each stops.
@@ -520,13 +542,31 @@ impl Prefs {
             sub_lang: v["subLang"].as_str().unwrap_or_default().into(),
             tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
             lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
+            look: {
+                let d = Look::default();
+                let n = |k: &str, d: usize| v[k].as_u64().map_or(d, |n| n as usize);
+                Look {
+                    sub_size: n("subSize", d.sub_size),
+                    sub_pos: n("subPos", d.sub_pos),
+                    sub_bg: v["subBg"].as_bool().unwrap_or(d.sub_bg),
+                    skip: n("skipBy", d.skip),
+                }
+            },
             path,
         }
     }
 
+    /// The player process saves its Options over what is on disk now, so it keeps the launcher's other settings; the
+    /// launcher reads them back when the player ends.
+    pub fn save_look(root: &str, look: Look) {
+        let mut p = Prefs::load(root);
+        p.look = look;
+        p.save();
+    }
+
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort, "subSize": self.look.sub_size, "subPos": self.look.sub_pos, "subBg": self.look.sub_bg, "skipBy": self.look.skip })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

@@ -102,7 +102,11 @@ impl Player {
                 }
             }
         };
-        let mut choice = Choice::default();
+        let mut choice = Choice {
+            look: clamp_look(crate::data::Prefs::load(&root()).look),
+            ..Choice::default()
+        };
+        set_sub_size(SIZES[choice.look.sub_size].1);
         let mut events = Events::default();
         let mut thumbs = Thumbs::new(it.trick.clone());
         let mut at = it.resume;
@@ -250,6 +254,18 @@ impl Player {
     ) -> Vod {
         let direct = matches!(src, Source::File(_));
         let tracks = self.tracks(it, src);
+        let mut btns = vec![];
+        if !tracks.subs.is_empty() {
+            btns.push(Btn::Subs);
+        }
+        if tracks.audio.len() > 1 {
+            btns.push(Btn::Audio);
+        }
+        if !it.chapters.is_empty() {
+            btns.push(Btn::Chapters);
+        }
+        btns.extend([Btn::Options, Btn::Info]);
+        osd.set_buttons(g, &btns);
         let mut shown = Shown::default();
         // The first run picks the tracks the viewer's language settings and the server's choice lead to.
         if !choice.init {
@@ -439,6 +455,9 @@ impl Player {
         let (mut paused, mut eof) = (false, false);
         let mut seek: Option<(i64, Instant)> = None;
         let mut menu: Option<Menu> = None;
+        // A held Left or Right, its speed step, where the seek began, and when Info was last made.
+        let (mut scrub, mut level, mut seek_from) = (None::<Scrub>, 0u8, 0i64);
+        let mut info_at = Instant::now();
         // The time in the file of the run's time 0: what was asked for, then the keyframe it began on.
         let mut origin = start;
         let mut ass: Option<Ass> = None;
@@ -459,118 +478,232 @@ impl Player {
                 ));
             }
             let skip = extras::segment_at(&it.segments, pos).filter(|_| clock.running());
-            match (fkey(), menu.is_some()) {
-                (Some(Fk::Back), true) => menu = None,
-                (Some(Fk::Up), true) => menu.iter_mut().for_each(|m| m.step(-1)),
-                (Some(Fk::Down), true) => menu.iter_mut().for_each(|m| m.step(1)),
-                (Some(Fk::Toggle), true) => {
-                    let pick = menu.take().and_then(|m| m.rows.into_iter().nth(m.sel)).map(|r| r.1);
-                    match pick {
-                        Some(Pick::Sub(None)) => {
-                            let embedded = choice.sub.is_some_and(|s| !s.server);
-                            choice.sub = None;
-                            events.clear();
+            let top = if it.total > 0 {
+                (it.total / TICKS - 5).max(0)
+            } else {
+                i64::MAX / 4
+            };
+            let had_seek = seek.is_some();
+            let key = fkey();
+            if menu.is_some() {
+                osd.show();
+            }
+            if let Some(m) = menu.as_mut() {
+                let opt = match m.picked() {
+                    Some(Pick::Opt(o)) => Some(*o),
+                    _ => None,
+                };
+                // OK on an option goes round its choices; Left and Right stop at the ends.
+                let change = match (key.as_ref(), opt) {
+                    (Some(Fk::Step(d)), Some(o)) => Some((o, *d, false)),
+                    (Some(Fk::Toggle), Some(o)) => Some((o, 1, true)),
+                    _ => None,
+                };
+                match (key, change) {
+                    (_, Some((o, d, wrap))) => {
+                        let l = &mut choice.look;
+                        let next = |v: usize, n: usize| {
+                            let v = v as i64 + d;
+                            (if wrap {
+                                v.rem_euclid(n as i64)
+                            } else {
+                                v.clamp(0, n as i64 - 1)
+                            }) as usize
+                        };
+                        match o {
+                            Opt::Size => l.sub_size = next(l.sub_size, SIZES.len()),
+                            Opt::Raise => l.sub_pos = next(l.sub_pos, RAISES.len()),
+                            Opt::Bg => l.sub_bg = !l.sub_bg,
+                            Opt::Skip => l.skip = next(l.skip, SKIPS.len()),
+                            Opt::Delay if wrap => choice.delay_ms = 0,
+                            Opt::Delay => choice.delay_ms = (choice.delay_ms + d * 100).clamp(-30_000, 30_000),
+                        }
+                        if o == Opt::Size {
+                            set_sub_size(SIZES[choice.look.sub_size].1);
                             shown.reset();
-                            if embedded {
+                        }
+                        if o != Opt::Delay {
+                            crate::data::Prefs::save_look(&root(), choice.look);
+                        }
+                        *m = Menu::options(g, &choice.look, choice.delay_ms, m.sel);
+                    }
+                    (Some(Fk::Back), _) | (Some(Fk::Step(-1)), _) => menu = None,
+                    (Some(Fk::Up), _) => m.step(-1),
+                    (Some(Fk::Down), _) => m.step(1),
+                    (Some(Fk::Toggle), _) => {
+                        let pick = menu.take().and_then(|m| m.rows.into_iter().nth(m.sel?)).map(|r| r.pick);
+                        match pick {
+                            Some(Pick::Sub(None)) => {
+                                let embedded = choice.sub.is_some_and(|s| !s.server);
+                                choice.sub = None;
+                                events.clear();
+                                shown.reset();
+                                if embedded {
+                                    smp.retire();
+                                    return Vod::Seek(pos);
+                                }
+                            }
+                            Some(Pick::Sub(Some(sel))) if sel.server => {
+                                osd.note(g, "Loading subtitles...");
+                                loading = Some(fetch(sel));
+                            }
+                            Some(Pick::Sub(Some(sel))) => {
+                                // A track of the file is read with the video: the run starts again here with it.
+                                choice.sub = Some(sel);
+                                events.clear();
                                 smp.retire();
                                 return Vod::Seek(pos);
                             }
+                            Some(Pick::Chapter(t)) => {
+                                smp.retire();
+                                return Vod::Seek(t);
+                            }
+                            Some(Pick::Audio(i)) if choice.audio != Some(i) => {
+                                choice.audio = Some(i);
+                                smp.retire();
+                                let can = match src {
+                                    Source::File(d) => {
+                                        d.info.audio.iter().any(|a| i64::from(a.stream) == i && a.playable())
+                                    }
+                                    Source::Server => true,
+                                };
+                                return if can {
+                                    Vod::Seek(pos)
+                                } else {
+                                    Vod::Server(pos, "the TV cannot decode that audio track".into())
+                                };
+                            }
+                            _ => {}
                         }
-                        Some(Pick::Sub(Some(sel))) if sel.server => {
-                            osd.note(g, "Loading subtitles...");
-                            loading = Some(fetch(sel));
-                        }
-                        Some(Pick::Sub(Some(sel))) => {
-                            // A track of the file is read with the video: the run starts again here with it.
-                            choice.sub = Some(sel);
-                            events.clear();
-                            smp.retire();
-                            return Vod::Seek(pos);
-                        }
-                        Some(Pick::Chapter(t)) => {
-                            smp.retire();
-                            return Vod::Seek(t);
-                        }
-                        Some(Pick::Audio(i)) if choice.audio != Some(i) => {
-                            choice.audio = Some(i);
-                            smp.retire();
-                            let can = match src {
-                                Source::File(d) => {
-                                    d.info.audio.iter().any(|a| i64::from(a.stream) == i && a.playable())
-                                }
-                                Source::Server => true,
-                            };
-                            return if can {
-                                Vod::Seek(pos)
-                            } else {
-                                Vod::Server(pos, "the TV cannot decode that audio track".into())
-                            };
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                (_, true) => {}
-                (Some(Fk::Back), false) => break Vod::Exit(pos, false),
-                (Some(Fk::Up), false) => osd.show(),
-                (Some(Fk::Down), false) => match Menu::new(g, &tracks, choice, &it.chapters, pos) {
-                    Some(m) => menu = Some(m),
-                    None => osd.note(g, "No subtitles, other audio tracks or chapters"),
-                },
-                (Some(Fk::Chapter(d)), false) if !it.chapters.is_empty() => {
-                    let cur = seek.map_or(pos, |s| s.0 * TICKS);
-                    let now = extras::chapter_at(&it.chapters, cur);
-                    // Back goes to the start of this chapter, unless it began just now.
-                    let to = match (d, now) {
-                        (d, Some(i)) if d < 0 && cur - it.chapters[i].start > 4 * TICKS => Some(i),
-                        (d, Some(i)) if d < 0 => i.checked_sub(1),
-                        (_, i) => Some(i.map_or(0, |i| i + 1)).filter(|i| *i < it.chapters.len()),
-                    };
-                    if let Some(c) = to.map(|i| &it.chapters[i]) {
-                        seek = Some((c.start / TICKS, Instant::now()));
-                        osd.show();
-                    }
-                }
-                (Some(Fk::Toggle), false) if skip.is_some() => {
-                    if let Some(s) = skip {
-                        log(&format!("film: skips {:?} to {} s", s.kind, s.end / TICKS));
-                        let near_end = it.total > 0 && s.end + 3 * TICKS >= it.total;
-                        if near_end {
-                            break Vod::Exit(it.total, true);
-                        }
-                        seek = Some((s.end / TICKS, Instant::now()));
-                        osd.show();
-                    }
-                }
-                (Some(Fk::Toggle | Fk::Pause), false) if clock.running() || paused => {
-                    paused = !paused;
-                    log(&format!(
-                        "film: {} at {} s",
-                        if paused { "paused" } else { "resumed" },
-                        pos / TICKS
+                if matches!(menu.as_ref().map(|m| m.btn), Some(Btn::Info)) && info_at.elapsed() > Duration::from_secs(1)
+                {
+                    info_at = Instant::now();
+                    let ahead = (last[1] - clock.now().as_nanos() as i64) as f64 / 1e9;
+                    menu = Some(Menu::info(
+                        g,
+                        info_lines(src, &tracks, choice, video, profile, lossless_mode, ahead),
                     ));
-                    if paused {
-                        unsafe { (smp.pause)(smp.obj) };
-                        clock.hold();
-                    } else {
-                        unsafe { (smp.play)(smp.obj) };
-                        clock.run();
+                }
+            } else if osd.focus.is_some() {
+                match key {
+                    Some(Fk::Step(d)) => osd.step(d),
+                    Some(Fk::Up | Fk::Back) => {
+                        osd.focus = None;
+                        osd.show();
                     }
-                    film::report(it, Note::Progress, pos, paused, direct, false);
-                    osd.show();
+                    Some(Fk::Toggle) => {
+                        info_at = Instant::now();
+                        let ahead = (last[1] - clock.now().as_nanos() as i64) as f64 / 1e9;
+                        menu = match osd.button() {
+                            Some(Btn::Subs) => Some(Menu::subs(g, &tracks, choice)),
+                            Some(Btn::Audio) => Some(Menu::audio(g, &tracks, choice)),
+                            Some(Btn::Chapters) => Some(Menu::chapters(g, &it.chapters, pos)),
+                            Some(Btn::Options) => Some(Menu::options(g, &choice.look, choice.delay_ms, None)),
+                            Some(Btn::Info) => Some(Menu::info(
+                                g,
+                                info_lines(src, &tracks, choice, video, profile, lossless_mode, ahead),
+                            )),
+                            None => None,
+                        };
+                    }
+                    _ => {}
                 }
-                (Some(Fk::Seek(d)), false) => {
-                    let top = if it.total > 0 {
-                        (it.total / TICKS - 5).max(0)
-                    } else {
-                        i64::MAX
-                    };
-                    let base = seek.map_or(pos / TICKS, |s| s.0);
-                    seek = Some(((base + d).clamp(0, top), Instant::now()));
-                    osd.show();
+            } else {
+                match key {
+                    Some(Fk::Back) if seek.is_some() => {
+                        (seek, scrub, level) = (None, None, 0);
+                        osd.show();
+                    }
+                    Some(Fk::Back) => break Vod::Exit(pos, false),
+                    Some(Fk::Up) => osd.show(),
+                    Some(Fk::Down) => osd.focus_buttons(),
+                    Some(Fk::Chapter(d)) if !it.chapters.is_empty() => {
+                        let cur = seek.map_or(pos, |s| s.0 * TICKS);
+                        let now = extras::chapter_at(&it.chapters, cur);
+                        // Back goes to the start of this chapter, unless it began just now.
+                        let to = match (d, now) {
+                            (d, Some(i)) if d < 0 && cur - it.chapters[i].start > 4 * TICKS => Some(i),
+                            (d, Some(i)) if d < 0 => i.checked_sub(1),
+                            (_, i) => Some(i.map_or(0, |i| i + 1)).filter(|i| *i < it.chapters.len()),
+                        };
+                        if let Some(c) = to.map(|i| &it.chapters[i]) {
+                            seek = Some((c.start / TICKS, Instant::now()));
+                            osd.show();
+                        }
+                    }
+                    Some(Fk::Toggle) if seek.is_some() => {
+                        let to = scrub.as_ref().map_or(seek.map_or(0, |s| s.0), |s| s.at as i64);
+                        log(&format!("film: seek from {} s to {to} s (OK)", pos / TICKS));
+                        smp.retire();
+                        return Vod::Seek(to * TICKS);
+                    }
+                    Some(Fk::Toggle) if skip.is_some() => {
+                        if let Some(s) = skip {
+                            log(&format!("film: skips {:?} to {} s", s.kind, s.end / TICKS));
+                            let near_end = it.total > 0 && s.end + 3 * TICKS >= it.total;
+                            if near_end {
+                                break Vod::Exit(it.total, true);
+                            }
+                            seek = Some((s.end / TICKS, Instant::now()));
+                            osd.show();
+                        }
+                    }
+                    Some(Fk::Toggle | Fk::Pause) if clock.running() || paused => {
+                        paused = !paused;
+                        log(&format!(
+                            "film: {} at {} s",
+                            if paused { "paused" } else { "resumed" },
+                            pos / TICKS
+                        ));
+                        if paused {
+                            unsafe { (smp.pause)(smp.obj) };
+                            clock.hold();
+                        } else {
+                            unsafe { (smp.play)(smp.obj) };
+                            clock.run();
+                        }
+                        film::report(it, Note::Progress, pos, paused, direct, false);
+                        osd.show();
+                    }
+                    // The key comes again while it is held: the hold is already scrubbing.
+                    Some(Fk::Step(d)) if scrub.as_ref().is_some_and(|s| s.dir == d) => {}
+                    Some(Fk::Step(d)) => {
+                        let base = seek.map_or(pos / TICKS, |s| s.0);
+                        let to = (base + d * SKIPS[choice.look.skip]).clamp(0, top);
+                        seek = Some((to, Instant::now()));
+                        scrub = Some(Scrub::new(d, to as f64));
+                        osd.show();
+                    }
+                    Some(Fk::Release) => {
+                        (scrub, level) = (None, 0);
+                        if let Some(s) = seek.as_mut() {
+                            s.1 = Instant::now();
+                        }
+                    }
+                    Some(Fk::Seek(d)) => {
+                        let base = seek.map_or(pos / TICKS, |s| s.0);
+                        seek = Some(((base + d).clamp(0, top), Instant::now()));
+                        osd.show();
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-            if let Some((to, _)) = seek.filter(|s| s.1.elapsed() > Duration::from_millis(600)) {
+            if let Some(s) = scrub.as_mut() {
+                match s.advance(top) {
+                    Some(l) => {
+                        level = l;
+                        seek = Some((s.at as i64, Instant::now()));
+                    }
+                    None => (scrub, level) = (None, 0),
+                }
+            }
+            if seek.is_some() && !had_seek {
+                seek_from = pos / TICKS;
+            }
+            if let Some((to, _)) = seek.filter(|s| scrub.is_none() && s.1.elapsed() > Duration::from_millis(600)) {
                 log(&format!("film: seek from {} s to {to} s", pos / TICKS));
                 smp.retire();
                 return Vod::Seek(to * TICKS);
@@ -682,7 +815,7 @@ impl Player {
             if eof && pending.is_none() && clock.now().as_nanos() as i64 + 300_000_000 >= last[1] {
                 break Vod::Exit(it.total, true);
             }
-            let ms = pos / 10_000;
+            let ms = pos / 10_000 - choice.delay_ms;
             if choice.sub.is_some_and(|s| !s.server) {
                 events.prune(ms);
             }
@@ -693,9 +826,9 @@ impl Player {
                 // A script's own timing: look at most every 33 ms.
                 if last_ass.elapsed() >= Duration::from_millis(33) {
                     last_ass = Instant::now();
-                    if let Some(pics) = a.render(pos / 10_000) {
+                    if let Some(pics) = a.render(ms) {
                         if !pics.is_empty() {
-                            log(&format!("film: ass {} pictures at {} ms", pics.len(), pos / 10_000));
+                            log(&format!("film: ass {} pictures at {ms} ms", pics.len()));
                         }
                         ass_layer.set(g, &pics, ass_off.0, ass_off.1);
                     }
@@ -708,8 +841,14 @@ impl Player {
                 skip: skip.map(|s| s.kind).filter(|_| seek.is_none()),
                 thumb,
                 ass: ass.as_ref().map(|_| &ass_layer),
+                look: choice.look,
             };
-            vframe(g, osd, pos / TICKS, paused, seek.map(|s| s.0), over);
+            let seeking = seek.map(|s| Seeking {
+                to: s.0,
+                from: seek_from,
+                level,
+            });
+            vframe(g, osd, pos / TICKS, paused, seeking, over);
             if !clock.running() && !paused && t.elapsed() > Duration::from_secs(40) {
                 smp.retire();
                 return if direct {
@@ -826,7 +965,8 @@ impl Player {
     }
 }
 
-/// `FILM_KEYS="3:enter,6:right,9:down"` on a desktop run: presses these keys that many seconds in (Back is `esc`).
+/// `FILM_KEYS="3:enter,6:right,9:down"` on a desktop run: presses these keys that many seconds in (Back is `esc`,
+/// `rightup` lets go of Right).
 pub fn film_sim_keys() {
     let script = std::env::var("FILM_KEYS").unwrap_or_default();
     let keys: Vec<(u64, i32)> = script
@@ -840,6 +980,8 @@ pub fn film_sim_keys() {
                 "up" => K_UP,
                 "down" => K_DOWN,
                 "esc" => K_ESCAPE,
+                "leftup" => -K_LEFT,
+                "rightup" => -K_RIGHT,
                 "pgdn" => K_PAGEDOWN,
                 "pgup" => K_PAGEUP,
                 _ => return None,
@@ -851,10 +993,75 @@ pub fn film_sim_keys() {
         let t = Instant::now();
         for (at, sym) in keys {
             std::thread::sleep(Duration::from_secs(at).saturating_sub(t.elapsed()));
-            let mut e = Event::new(KEYDOWN);
-            e.0[20..24].copy_from_slice(&sym.to_ne_bytes());
+            let mut e = Event::new(if sym < 0 { KEYUP } else { KEYDOWN });
+            e.0[20..24].copy_from_slice(&sym.abs().to_ne_bytes());
             unsafe { SDL_PushEvent(&mut e) };
             log(&format!("sim: key {sym} at {at} s"));
         }
     });
+}
+
+/// What Info says about what plays: how it comes, the picture, the sound and its way to the speakers, the subtitles
+/// and how far ahead the TV has it.
+fn info_lines(
+    src: &Source,
+    tracks: &Tracks,
+    choice: &Choice,
+    video: crate::ts::Codec,
+    dv_profile: Option<u8>,
+    mode: lossless::Mode,
+    ahead_s: f64,
+) -> Vec<(String, String)> {
+    let size = SIZE.load(Ordering::SeqCst);
+    let hdr = HDR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let range = match (dv_profile, hdr.as_str()) {
+        (Some(p), _) => format!("   ·   Dolby Vision profile {p}"),
+        (None, "" | "none") => String::new(),
+        (None, h) => format!("   ·   {h}"),
+    };
+    let codec = match video {
+        crate::ts::Codec::H265 => "H.265",
+        _ => "H.264",
+    };
+    let audio_name = tracks
+        .audio
+        .iter()
+        .find(|a| Some(a.index) == choice.audio)
+        .or(tracks.audio.first())
+        .map_or("None".to_string(), |a| a.name.clone());
+    let route = match (src, mode) {
+        (Source::Server, _) => "as the server sends it",
+        (_, lossless::Mode::TrueHd) => "unconverted to the receiver (TrueHD as MAT)",
+        (_, lossless::Mode::Dts) => "unconverted to the receiver (DTS)",
+        (_, lossless::Mode::DtsCore) => "the DTS core, unconverted to the receiver",
+        (Source::File(d), _) => match d.info.audio.iter().find(|a| Some(i64::from(a.stream)) == choice.audio) {
+            Some(a) if a.how == crate::ff::demux::How::Convert => "converted to Dolby Digital on the TV",
+            _ => "as it is",
+        },
+    };
+    let sub = choice
+        .sub
+        .and_then(|s| tracks.subs.iter().find(|t| t.index == s.index))
+        .map_or("Off".to_string(), |t| t.name.clone());
+    let timing = match choice.delay_ms {
+        0 => String::new(),
+        d => format!("   ·   {:+.1} s", d as f64 / 1000.0),
+    };
+    vec![
+        (
+            "Playing".into(),
+            match src {
+                Source::File(_) => "the file as it is (Direct Play)".into(),
+                Source::Server => "converted by the server".into(),
+            },
+        ),
+        (
+            "Picture".into(),
+            format!("{codec}   ·   {}x{}{range}", size >> 16, size & 0xffff),
+        ),
+        ("Sound".into(), audio_name),
+        ("Sent".into(), route.into()),
+        ("Subtitles".into(), format!("{sub}{timing}")),
+        ("Buffered".into(), format!("{:.1} s ahead", ahead_s.max(0.0))),
+    ]
 }
