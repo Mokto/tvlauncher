@@ -161,6 +161,15 @@ impl Player {
         Ok(Some(d))
     }
 
+    /// A failure of the file played as it is hands the film to the server; a failure of that ends the viewing.
+    fn or_server(&self, g: &Gfx, osd: &mut Osd, direct: bool, why: &str, at: i64) -> Vod {
+        if direct {
+            Vod::Server(at, why.to_string())
+        } else {
+            self.vod_fail(g, osd, why, at)
+        }
+    }
+
     /// Shows why the title does not play until the viewer leaves.
     fn vod_fail(&self, g: &Gfx, osd: &mut Osd, why: &str, at: i64) -> Vod {
         log(&format!("film: {why}"));
@@ -322,7 +331,7 @@ impl Player {
         let profile = profile.filter(|_| dolby_vision_tv());
         let p = cstr(&payload_dv(APP, &window.0.to_string_lossy(), video, audio, profile));
         if unsafe { (smp.load)(smp.obj, p.as_ptr(), on_event) } & 0xff == 0 {
-            return self.vod_fail(g, osd, "The TV's player refused the video.", start);
+            return self.or_server(g, osd, direct, "The TV's player refused the video.", start);
         }
         foreground();
         let t = Instant::now();
@@ -333,7 +342,10 @@ impl Player {
                 smp.retire();
                 return match k {
                     Some(Fk::Back) => Vod::Exit(start, false),
-                    _ => self.vod_fail(g, osd, &err.unwrap_or("The TV's player did not start.".into()), start),
+                    _ => {
+                        let why = err.unwrap_or("The TV's player did not start.".into());
+                        self.or_server(g, osd, direct, &why, start)
+                    }
                 };
             }
             vframe(g, osd, start_s, false, None, Over::default());
@@ -467,7 +479,7 @@ impl Player {
             }
             if let Some(e) = ERROR.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 smp.retire();
-                return self.vod_fail(g, osd, &e, pos);
+                return self.or_server(g, osd, direct, &e, pos);
             }
             if let Some((sel, got)) = loading.as_ref().and_then(|rx| rx.try_recv().ok()) {
                 loading = None;
