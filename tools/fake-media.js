@@ -1,8 +1,15 @@
-// A small Jellyfin for `sh tools/film-sim.sh`: one film with the user's views, byte ranges for the file, a subtitle
-// track and the playback reports (printed). Usage: node fake-media.js <media dir> <port>
+// A small Jellyfin for `sh tools/film-sim.sh` and `sh tools/tv-test.sh`: films with the user's views, byte ranges for
+// the file, a subtitle track and the playback reports (printed). Item `m1` is `<dir>/film.mkv`; any other id `x` is
+// `<dir>/x.mkv`. Runs on the TV's Node 8 too. Usage: node fake-media.js <media dir> <port>
 const http = require('http'), fs = require('fs'), path = require('path');
 const dir = process.argv[2] || '.', port = +process.argv[3] || 8780;
-const file = path.join(dir, 'film.mkv');
+const fileOf = (id) => {
+  if (id === 'm1') return path.join(dir, 'film.mkv');
+  const mkv = path.join(dir, id + '.mkv');
+  return fs.existsSync(mkv) ? mkv : path.join(dir, id + '.mp4');
+};
+// `<id>.item.json` (from tools/tv-catalog.py) replaces the item's length, chapters and streams.
+const over = (id) => { try { return JSON.parse(fs.readFileSync(path.join(dir, id + '.item.json'), 'utf8')); } catch (e) { return {}; } };
 const item = (id, name) => ({
   Id: id, Name: name, Type: 'Movie', ProductionYear: 2001, RunTimeTicks: 300000000,
   UserData: { PlaybackPositionTicks: +process.env.RESUME_TICKS || 0 },
@@ -20,9 +27,10 @@ const item = (id, name) => ({
 http.createServer((req, res) => {
   const u = req.url.split('?')[0];
   const json = (o) => { const b = JSON.stringify(o); res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b); };
-  if (/^\/Users\/u1\/Items\/m1$/.test(u)) return json(item('m1', 'The Test Film'));
-  if (u === '/MediaSegments/m1') return json({ Items: [{ Type: 'Intro', StartTicks: 20000000, EndTicks: 80000000 }, { Type: 'Outro', StartTicks: 270000000, EndTicks: 300000000 }] });
-  if (/^\/Videos\/m1\/Trickplay\/320\/0\.jpg$/.test(u)) {
+  let m;
+  if ((m = /^\/Users\/u1\/Items\/(\w+)$/.exec(u)) && fs.existsSync(fileOf(m[1]))) return json(Object.assign(item(m[1], m[1] === 'm1' ? 'The Test Film' : 'Test ' + m[1]), over(m[1])));
+  if (/^\/MediaSegments\/\w+$/.test(u)) return json({ Items: [{ Type: 'Intro', StartTicks: 20000000, EndTicks: 80000000 }, { Type: 'Outro', StartTicks: 270000000, EndTicks: 300000000 }] });
+  if (/^\/Videos\/\w+\/Trickplay\/320\/0\.jpg$/.test(u)) {
     const b = fs.readFileSync(path.join(dir, 'tile.jpg')); console.log('TILE', u);
     res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': b.length }); return res.end(b);
   }
@@ -33,7 +41,8 @@ http.createServer((req, res) => {
     const b = '1\n00:00:08,000 --> 00:00:12,000\nSidecar subtitle\n';
     res.writeHead(200, { 'Content-Length': b.length }); return res.end(b);
   }
-  if (u === '/Videos/m1/stream') {
+  if ((m = /^\/Videos\/(\w+)\/stream$/.exec(u)) && fs.existsSync(fileOf(m[1]))) {
+    const file = fileOf(m[1]);
     const st = fs.statSync(file); const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
     if (!m) { res.writeHead(200, { 'Content-Length': st.size, 'Accept-Ranges': 'bytes' }); return fs.createReadStream(file).pipe(res); }
     const a = +m[1], b = m[2] ? Math.min(+m[2], st.size - 1) : st.size - 1;

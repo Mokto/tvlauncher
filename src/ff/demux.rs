@@ -1373,6 +1373,9 @@ unsafe fn run(
             break Ok(());
         }
     };
+    if let Some(s) = dolby::summary() {
+        log(&format!("ff: {s}"));
+    }
     log(&format!(
         "ff: run from {} s ended: {videos} pictures, {audios} audio frames, {subs_n} subtitles, {} MB read",
         at_ns / 1_000_000_000,
@@ -1462,6 +1465,9 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
     }
     println!("base {base:?} ms: {v} pictures ({keys} keyframes, last {} ms), {au} audio frames (last {} ms), {subs} subtitles",
         last_v / 1_000_000, last_a / 1_000_000);
+    if let Some(s) = dolby::summary() {
+        println!("{s}");
+    }
 }
 
 #[cfg(test)]

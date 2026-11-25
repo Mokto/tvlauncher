@@ -30,6 +30,22 @@ pub fn tv_shows_dv() -> bool {
     })
 }
 
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+static EL_DROPPED: AtomicU32 = AtomicU32::new(0);
+static RPU_CONVERTED: AtomicU32 = AtomicU32::new(0);
+static RPU_FAILED: AtomicU32 = AtomicU32::new(0);
+static PLUS_CUT: AtomicU32 = AtomicU32::new(0);
+
+/// What the picture feed did to the metadata so far, for the log (None when it touched none).
+pub fn summary() -> Option<String> {
+    let n = |c: &AtomicU32| c.load(Relaxed);
+    let (el, ok, bad, cut) = (n(&EL_DROPPED), n(&RPU_CONVERTED), n(&RPU_FAILED), n(&PLUS_CUT));
+    (el + ok + bad + cut > 0).then(|| {
+        format!("dolby vision: {el} enhancement-layer NALs dropped, {ok} RPUs converted, {bad} RPUs unconvertible; HDR10+: {cut} messages cut")
+    })
+}
+
 /// What to do with a profile 7 picture's extra layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Dv7 {
@@ -59,7 +75,11 @@ fn layer_id(nal: &[u8]) -> u8 {
 
 /// The enhancement layer: wrapped in NAL 63 (as a single-track dual layer stores it) or in a layer above the base.
 pub fn is_el(nal: &[u8]) -> bool {
-    nal.len() >= 2 && (nal_type(nal) == NAL_EL || layer_id(nal) > 0)
+    let el = nal.len() >= 2 && (nal_type(nal) == NAL_EL || layer_id(nal) > 0);
+    if el {
+        EL_DROPPED.fetch_add(1, Relaxed);
+    }
+    el
 }
 
 /// An RPU NAL (2-byte header, emulation prevention still in) as profile 8.1. A profile 8 RPU comes back as it was. None
@@ -67,11 +87,16 @@ pub fn is_el(nal: &[u8]) -> bool {
 /// which beats a profile 8 declaration followed by a profile 7 RPU.
 pub fn rpu_to_p81(nal: &[u8]) -> Option<Vec<u8>> {
     let mut rpu = dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(nal).ok()?;
-    if rpu.dovi_profile != 7 {
-        return (rpu.dovi_profile == 8).then(|| nal.to_vec());
-    }
-    rpu.convert_with_mode(dolby_vision::rpu::ConversionMode::To81).ok()?;
-    rpu.write_hevc_unspec62_nalu().ok()
+    let out = if rpu.dovi_profile != 7 {
+        (rpu.dovi_profile == 8).then(|| nal.to_vec())
+    } else {
+        rpu.convert_with_mode(dolby_vision::rpu::ConversionMode::To81)
+            .ok()
+            .and_then(|_| rpu.write_hevc_unspec62_nalu().ok())
+    };
+    let c = if out.is_some() { &RPU_CONVERTED } else { &RPU_FAILED };
+    c.fetch_add(1, Relaxed);
+    out
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +153,7 @@ pub fn strip_hdr10plus(nal: &[u8]) -> Sei {
     if !found {
         return Sei::Keep;
     }
+    PLUS_CUT.fetch_add(1, Relaxed);
     if !clean || kept.is_empty() {
         return Sei::Drop;
     }

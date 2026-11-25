@@ -272,7 +272,7 @@ extern "C" fn on_event(kind: c_int, num: i64, s: *const c_char) {
             unsafe { CStr::from_ptr(s) }
                 .to_string_lossy()
                 .chars()
-                .take(300)
+                .take(600)
                 .collect()
         };
         log(&format!("smp event {kind} {num} {s}"));
