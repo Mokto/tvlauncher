@@ -21,6 +21,7 @@ mod player;
 mod plex;
 mod sdl;
 mod settings;
+mod subs;
 mod ts;
 mod tv;
 mod youtube;
@@ -135,6 +136,13 @@ fn main() -> ExitCode {
     });
     if on_tv && std::path::Path::new(&format!("{DIR}/register")).exists() {
         lifecycle::register(wake);
+    }
+    if args
+        .get(1)
+        .is_some_and(|a| a == "--film-shot" || a == "--film-menu-shot")
+    {
+        player::film_shot(&g, args[1] == "--film-menu-shot");
+        return save_bmp(ren, args.get(2).map_or("build/film.bmp", String::as_str));
     }
     let mut app = App::new(
         g,

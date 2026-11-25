@@ -10,8 +10,19 @@ pub const TICKS: i64 = 10_000_000;
 pub const ELSEWHERE: u8 = 3;
 const DEVICE: &str = "tvlauncher-c1";
 
+/// An audio or a subtitle track, as the server names it (for example "French - AC3 5.1 - Default").
+#[derive(Clone)]
+pub struct Track {
+    pub index: i64,
+    pub name: String,
+}
+
 /// What is played: a film or one episode.
 pub struct Item {
+    pub audio: Vec<Track>,
+    /// Text subtitles only: the server can hand those over as SRT; picture subtitles (PGS, VobSub) it would have
+    /// to burn into the video.
+    pub subs: Vec<Track>,
     pub id: String,
     pub source: String,
     pub name: String,
@@ -86,7 +97,23 @@ pub fn item_from(o: &Value) -> Option<Item> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    let tracks = |kind: &str, text_only: bool| -> Vec<Track> {
+        o["MediaSources"][0]["MediaStreams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["Type"] == kind && (!text_only || s["IsTextSubtitleStream"] == true))
+            .filter_map(|s| {
+                Some(Track {
+                    index: s["Index"].as_i64()?,
+                    name: s["DisplayTitle"].as_str().or(s["Language"].as_str())?.to_string(),
+                })
+            })
+            .collect()
+    };
     Some(Item {
+        audio: tracks("Audio", false),
+        subs: tracks("Subtitle", true),
         source: o["MediaSources"][0]["Id"].as_str().unwrap_or(&id).to_string(),
         name: o["Name"].as_str().unwrap_or("Video").to_string(),
         sub,
@@ -104,14 +131,29 @@ pub fn item_from(o: &Value) -> Option<Item> {
 
 /// The playlist of the server's remux of the film, from `start` ticks in. The server copies H.264 and H.265 and
 /// converts audio the TV cannot decode (DTS, TrueHD) to AC-3.
-pub fn master_url(cfg: &Config, it: &Item, start: i64) -> String {
+pub fn master_url(cfg: &Config, it: &Item, start: i64, audio: Option<i64>) -> String {
+    let audio = audio.map_or(String::new(), |i| format!("&AudioStreamIndex={i}"));
     format!(
         "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={DEVICE}&VideoCodec=h264,hevc\
          &AudioCodec=aac,ac3,eac3&TranscodingMaxAudioChannels=6&SegmentContainer=ts&MinSegments=1\
          &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true&StartTimeTicks={start}\
-         &api_key={}",
+         &api_key={}{audio}",
         cfg.server, it.id, it.source, it.session, cfg.token
     )
+}
+
+/// A subtitle track as SRT, from the server.
+pub fn subtitles(cfg: &Config, id: &str, source: &str, index: i64) -> Result<Vec<crate::subs::Cue>, String> {
+    let url = format!("{}/Videos/{id}/{source}/Subtitles/{index}/0/Stream.srt", cfg.server);
+    let auth = format!(
+        "MediaBrowser Token=\"{}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"",
+        cfg.token
+    );
+    let r = crate::net::send(&url, None, &[("Authorization", auth)], 20)?;
+    if r.status != 200 {
+        return Err(format!("HTTP {}", r.status));
+    }
+    Ok(crate::subs::parse_srt(&String::from_utf8_lossy(&r.body)))
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -227,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn tracks_keep_text_subtitles_only() {
+        let it = item_from(&json!({ "Id": "m1", "MediaSources": [{ "Id": "s", "MediaStreams": [
+            { "Type": "Video", "Index": 0 },
+            { "Type": "Audio", "Index": 1, "DisplayTitle": "French - AC3 5.1" },
+            { "Type": "Audio", "Index": 2, "Language": "eng" },
+            { "Type": "Subtitle", "Index": 3, "DisplayTitle": "French - SRT", "IsTextSubtitleStream": true },
+            { "Type": "Subtitle", "Index": 4, "DisplayTitle": "English - PGS", "IsTextSubtitleStream": false },
+        ] }] }))
+        .unwrap();
+        let names = |t: &[Track]| t.iter().map(|t| (t.index, t.name.clone())).collect::<Vec<_>>();
+        assert_eq!(names(&it.audio), [(1, "French - AC3 5.1".into()), (2, "eng".into())]);
+        assert_eq!(names(&it.subs), [(3, "French - SRT".into())]);
+    }
+
+    #[test]
     fn episodes_say_season_and_number() {
         let it = item_from(
             &json!({ "Id": "e1", "Name": "Pilot", "Type": "Episode", "SeriesName": "The Show",
@@ -240,7 +297,7 @@ mod tests {
     #[test]
     fn master_url_asks_for_a_remux_from_the_start_point() {
         let it = item_from(&json!({ "Id": "m1", "MediaSources": [{ "Id": "src9" }] })).unwrap();
-        let u = master_url(&cfg(), &it, 42 * TICKS);
+        let u = master_url(&cfg(), &it, 42 * TICKS, Some(3));
         assert!(u.starts_with("https://jf.example/Videos/m1/master.m3u8?MediaSourceId=src9&PlaySessionId="));
         for part in [
             "VideoCodec=h264,hevc",
@@ -248,6 +305,7 @@ mod tests {
             "AllowVideoStreamCopy=true",
             "StartTimeTicks=420000000",
             "api_key=tok",
+            "&AudioStreamIndex=3",
         ] {
             assert!(u.contains(part), "{part}");
         }

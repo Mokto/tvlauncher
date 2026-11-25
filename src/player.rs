@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 pub const TRIGGER: &str = "/tmp/tvlauncher-play";
 const AHEAD_NS: i64 = 1_600_000_000;
 mod vod;
-pub use vod::child as film_child;
+pub use vod::{child as film_child, shot as film_shot};
 
 /// For testing without the remote: `film:<item id>` or a stream address in this file makes the running launcher
 /// start the player process for it.
