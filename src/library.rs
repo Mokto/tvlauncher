@@ -608,8 +608,8 @@ impl Page {
     /// The posters on screen: (line, position in it, title).
     fn shown(&self) -> Vec<(usize, usize, usize)> {
         let mut out = vec![];
-        for r in self.cur.saturating_sub(1)..(self.cur + 3).min(self.lines.len()) {
-            let l = &self.lines[r];
+        let first = self.cur.saturating_sub(1);
+        for (r, l) in self.lines.iter().enumerate().skip(first).take(self.cur + 3 - first) {
             let from = if l.grid { 0 } else { l.col.saturating_sub(1) };
             out.extend(l.idx.iter().enumerate().skip(from).take(9).map(|(c, i)| (r, c, *i)));
         }
