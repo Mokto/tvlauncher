@@ -130,16 +130,23 @@ pub fn next(cfg: &Config, series: &str, current: &str) -> Option<Item> {
 /// converts audio the TV cannot decode (DTS, TrueHD) to AC-3.
 pub fn master_url(cfg: &Config, it: &Item, audio: Option<i64>) -> String {
     let audio = audio.map_or(String::new(), |i| format!("&AudioStreamIndex={i}"));
-    let max = match MAX_KBPS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => String::new(),
-        k => format!("&MaxStreamingBitrate={}", u64::from(k) * 1000),
-    };
+    // Jellyfin sizes a conversion from VideoBitrate: without it, it converts to 416x234. 120 Mbit/s is the most its
+    // own web client asks for.
+    let bps = u64::from(match MAX_KBPS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 120_000,
+        k => k,
+    }) * 1000;
+    let max = format!(
+        "&MaxStreamingBitrate={bps}&VideoBitrate={}&AudioBitrate=384000",
+        bps.saturating_sub(384_000)
+    );
     // `ApiKey`, not `api_key`: Jellyfin 12 answers 401 to the latter on the playlists (the file stream still takes it),
     // and passes the former on to the segment addresses in them.
     format!(
         "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={DEVICE}&VideoCodec=h264,hevc\
          &AudioCodec=aac,ac3,eac3&TranscodingMaxAudioChannels=6&SegmentContainer=ts&MinSegments=1\
          &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true\
+         &h264-profile=high,main,baseline,constrainedbaseline&h264-videobitdepth=8\
          &ApiKey={}{audio}{max}",
         cfg.server, it.id, it.source, it.session, cfg.token
     )
@@ -266,6 +273,8 @@ mod tests {
             "VideoCodec=h264,hevc",
             "SegmentContainer=ts",
             "AllowVideoStreamCopy=true",
+            "&h264-videobitdepth=8&",
+            "&MaxStreamingBitrate=120000000&VideoBitrate=119616000&",
             "ApiKey=tok",
             "&AudioStreamIndex=3",
         ] {

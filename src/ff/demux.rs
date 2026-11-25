@@ -444,6 +444,7 @@ fn video_refusal(name: &str, profile: c_int, bits: c_int) -> Option<String> {
         "h264" if matches!(profile, 66 | 77 | 88 | 100 | 578 | 579 | 580 | 581 | 583) || profile < 0 => {
             (bits > 8).then(|| "the TV does not decode 10-bit H.264".to_string())
         }
+        "h264" if profile == 110 => Some("the TV does not decode 10-bit H.264 (High 10)".into()),
         "h264" => Some(format!("the TV does not decode H.264 profile {profile}")),
         "hevc" if matches!(profile, 1 | 2 | -99 | -1) => None,
         "hevc" => Some(format!("the TV does not decode H.265 profile {profile}")),

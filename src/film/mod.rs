@@ -113,7 +113,7 @@ pub fn resolve(root: &str, spec: &str) -> Result<Item, Why> {
     match spec.strip_prefix("plex:").and_then(|r| r.split_once(':')) {
         Some((server, key)) => {
             let cfg = crate::plex::Config::load(root).ok_or_else(|| Why::Failed("Not signed in to Plex.".into()))?;
-            plex::resolve(&cfg, server, key)
+            plex::resolve(root, &cfg, server, key)
         }
         None => {
             let cfg =

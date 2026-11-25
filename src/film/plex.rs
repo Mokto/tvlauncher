@@ -32,9 +32,24 @@ fn next_episode(list: &[Value]) -> Option<&Value> {
         .or(list.first())
 }
 
-pub fn resolve(cfg: &crate::plex::Config, server: &str, key: &str) -> Result<Item, Why> {
-    let conn = crate::plex::connect(cfg, server).map_err(Why::Failed)?;
-    let o = meta(&conn, key)?;
+pub fn resolve(root: &str, cfg: &crate::plex::Config, server: &str, key: &str) -> Result<Item, Why> {
+    // The address the library tab last reached the server at first: asking plex.tv and trying each address again
+    // takes seconds.
+    let known = crate::library::cached_views(root, crate::library::PLEX)
+        .into_iter()
+        .find_map(|v| match v.src {
+            crate::library::Source::Plex { base, token } if v.server == server => Some(cfg.conn(&base, &token)),
+            _ => None,
+        })
+        .filter(|c| c.get_json("/identity", 3).is_ok())
+        .and_then(|c| Some((meta(&c, key).ok()?, c)));
+    let (o, conn) = match known {
+        Some(k) => k,
+        None => {
+            let conn = crate::plex::connect(cfg, server).map_err(Why::Failed)?;
+            (meta(&conn, key)?, conn)
+        }
+    };
     let target = match o["type"].as_str().unwrap_or_default() {
         "movie" | "episode" | "clip" => o,
         t @ ("show" | "season") => {
@@ -140,6 +155,13 @@ pub fn next(conn: &Conn, series: &str, current: &str) -> Option<Item> {
     item_from(conn, &meta(conn, e["ratingKey"].as_str()?).ok()?)
 }
 
+/// What the TV takes from the transcoder. Plex has no profile for this client, so without it every HLS request is
+/// refused (400); the limits make it convert the H.264 the TV does not decode instead of copying it.
+const PROFILE: &str = "add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mpegts\
+    &videoCodec=h264,hevc&audioCodec=aac,ac3,eac3)\
+    +add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.bitDepth&value=8)\
+    +add-limitation(scope=videoCodec&scopeName=h264&type=match&name=video.profile&list=high|main|baseline|constrained baseline)";
+
 /// The server's HLS transcode of the film, from `start` ticks in. It copies what the TV plays (the transcoder is
 /// asked for direct streaming) and converts the rest.
 pub fn hls_url(conn: &Conn, it: &Item, start: i64, audio: Option<i64>) -> String {
@@ -154,13 +176,15 @@ pub fn hls_url(conn: &Conn, it: &Item, start: i64, audio: Option<i64>) -> String
         "{}/video/:/transcode/universal/start.m3u8?path=/library/metadata/{}&mediaIndex=0&partIndex=0&protocol=hls\
          &offset={}&fastSeek=1&directPlay=0&directStream=1&directStreamAudio=1&videoQuality=100&subtitles=none\
          &audioBoost=100&session={}&X-Plex-Session-Identifier={}&X-Plex-Client-Identifier={}&X-Plex-Product=tvlauncher\
-         &X-Plex-Platform=webOS&X-Plex-Token={}{stream}",
+         &X-Plex-Platform=webOS&X-Plex-Client-Profile-Name=Generic&X-Plex-Client-Profile-Extra={}\
+         &X-Plex-Token={}{stream}",
         conn.base,
         it.id,
         start / TICKS,
         it.session,
         it.session,
         conn.client_id,
+        crate::plex::encode(PROFILE),
         conn.token
     )
 }
@@ -270,6 +294,8 @@ mod tests {
             "audioStreamID=3",
             "X-Plex-Token=tok",
             "X-Plex-Client-Identifier=cid",
+            "X-Plex-Client-Profile-Name=Generic",
+            "%2Badd-limitation%28scope%3DvideoCodec%26scopeName%3Dh264%26type%3DupperBound%26name%3Dvideo.bitDepth%26value%3D8%29",
         ] {
             assert!(u.contains(p), "{p}");
         }
