@@ -2,6 +2,7 @@
 //! choices (which apps are hidden, in what order).
 use crate::sdl::{Color, FRect, Rect, Tex};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 
 /// Everything the launcher keeps on the TV's storage lives here (under `LAUNCHER_ROOT` in the simulator).
@@ -167,29 +168,33 @@ pub fn set_boot(root: &str, on: bool) {
     }
 }
 
+#[derive(Clone)]
 pub struct Luna {
     pub root: String,
 }
 
+const APPS_URI: &str = "luna://com.webos.applicationManager/listLaunchPoints";
+const INPUTS_URI: &str = "luna://com.webos.service.eim/getAllInputStatus";
+
 impl Luna {
-    /// No shell is involved, so ids and params need no quoting.
-    pub fn call(&self, uri: &str) -> Option<Value> {
-        let out = if self.root.is_empty() {
-            let o = Command::new("/usr/bin/luna-send")
+    /// Raw reply from a luna call, or a fixture file in the simulator.
+    pub fn fetch(&self, uri: &str) -> Vec<u8> {
+        if self.root.is_empty() {
+            Command::new("/usr/bin/luna-send")
                 .args(["-n", "1", "-w", "5000", uri, "{}"])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
-                .ok()?;
-            o.stdout
+                .map(|o| o.stdout)
+                .unwrap_or_default()
         } else {
-            std::fs::read(format!("{}/luna/{}.json", self.root, uri.rsplit('/').next()?)).ok()?
-        };
-        let v = serde_json::from_slice(&out).ok();
-        if v.is_none() {
-            crate::sdl::log(&format!("{uri}: no reply"));
+            std::fs::read(format!(
+                "{}/luna/{}.json",
+                self.root,
+                uri.rsplit('/').next().unwrap_or("")
+            ))
+            .unwrap_or_default()
         }
-        v
     }
 
     /// Asks the app installer to remove an app, then waits (up to 60 s) until it is gone from the launch points.
@@ -294,8 +299,46 @@ fn id_of(o: &Value) -> String {
     s(o, "id").unwrap_or_default()
 }
 
-pub fn apps(luna: &Luna) -> Vec<Item> {
-    let j = luna.call("luna://com.webos.applicationManager/listLaunchPoints");
+/// Apps and inputs from the bus. On the TV the two luna calls run together.
+pub fn launch_lists(luna: &Luna) -> (Vec<Item>, Vec<Item>) {
+    if !luna.root.is_empty() {
+        return lists_from_bytes(&luna.fetch(APPS_URI), &luna.fetch(INPUTS_URI));
+    }
+    let luna2 = luna.clone();
+    let (apps, inputs) = std::thread::scope(|s| {
+        let t1 = s.spawn(|| luna.fetch(APPS_URI));
+        let t2 = s.spawn(|| luna2.fetch(INPUTS_URI));
+        (t1.join().unwrap_or_default(), t2.join().unwrap_or_default())
+    });
+    lists_from_bytes(&apps, &inputs)
+}
+
+/// Turns raw luna replies into items on the main thread (items carry SDL textures).
+pub fn lists_from_bytes(apps: &[u8], inputs: &[u8]) -> (Vec<Item>, Vec<Item>) {
+    (apps_from_bytes(apps), inputs_from_bytes(inputs))
+}
+
+/// Starts fetching apps and inputs on a thread; the bytes are parsed when they arrive.
+pub fn fetch_launch_lists(luna: Luna) -> std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if luna.root.is_empty() {
+            let luna2 = luna.clone();
+            let (apps, inputs) = std::thread::scope(|s| {
+                let t1 = s.spawn(move || luna.fetch(APPS_URI));
+                let t2 = s.spawn(move || luna2.fetch(INPUTS_URI));
+                (t1.join().unwrap_or_default(), t2.join().unwrap_or_default())
+            });
+            let _ = tx.send((apps, inputs));
+        } else {
+            let _ = tx.send((luna.fetch(APPS_URI), luna.fetch(INPUTS_URI)));
+        }
+    });
+    rx
+}
+
+fn apps_from_bytes(out: &[u8]) -> Vec<Item> {
+    let j = serde_json::from_slice::<Value>(out).ok();
     let Some(points) = j.as_ref().and_then(|j| j["launchPoints"].as_array()) else {
         return vec![];
     };
@@ -324,8 +367,8 @@ pub fn apps(luna: &Luna) -> Vec<Item> {
         .collect()
 }
 
-pub fn inputs(luna: &Luna) -> Vec<Item> {
-    let j = luna.call("luna://com.webos.service.eim/getAllInputStatus");
+fn inputs_from_bytes(out: &[u8]) -> Vec<Item> {
+    let j = serde_json::from_slice::<Value>(out).ok();
     let Some(devices) = j.as_ref().and_then(|j| j["devices"].as_array()) else {
         return vec![];
     };
@@ -381,6 +424,15 @@ pub struct Prefs {
     pub debloat: Vec<String>,
     /// Channels in the TV tab's Favourites, by `iptv::Channel::key`.
     pub tv_favs: Vec<String>,
+    /// The tabs after Home in the user's order ("tv" or a library's id), and the ones hidden.
+    pub tabs: Vec<String>,
+    pub tabs_off: Vec<String>,
+    /// Names the user gave tabs, by the same keys.
+    pub tab_names: BTreeMap<String, String>,
+    /// The Continue watching rows turned off: "jellyfin", "plex".
+    pub rows_off: Vec<String>,
+    /// How the library tabs are sorted: "name" or "added".
+    pub lib_sort: String,
 }
 
 /// The groups `debloat.sh` knows, with what each stops.
@@ -414,13 +466,18 @@ impl Prefs {
             plex_app: v["plexApp"].as_str().map(String::from),
             debloat: list("debloat"),
             tv_favs: list("tvFavs"),
+            tabs: list("tabs"),
+            tabs_off: list("tabsOff"),
+            rows_off: list("rowsOff"),
+            tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
+            lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
             path,
         }
     }
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "libSort": self.lib_sort })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

@@ -12,6 +12,7 @@ mod hls;
 mod iptv;
 mod jellyfin;
 mod keyboard;
+mod library;
 mod lifecycle;
 mod login;
 mod net;

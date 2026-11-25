@@ -637,49 +637,6 @@ pub fn logo_path(url: &str) -> String {
     format!("{DIR}/cache/iptv-logo-{h:016x}.img")
 }
 
-/// Starts the logo thread: send it the logos a page shows (only the latest list is worked on); each one that is
-/// saved comes back as its address, followed by `wake`.
-pub fn logos(root: String, wake: u32) -> (Sender<Vec<String>>, Receiver<String>) {
-    let (req_tx, req_rx) = channel::<Vec<String>>();
-    let (res_tx, res_rx) = channel();
-    std::thread::spawn(move || {
-        let mut todo: Vec<String> = vec![];
-        loop {
-            let next = if todo.is_empty() {
-                req_rx.recv().ok()
-            } else {
-                req_rx.try_recv().ok()
-            };
-            if let Some(list) = next {
-                todo = list;
-                todo.reverse();
-                continue;
-            }
-            let Some(url) = todo.pop() else { continue };
-            let path = format!("{root}{}", logo_path(&url));
-            if std::path::Path::new(&path).exists() {
-                continue;
-            }
-            match net::send(&url, None, &[], 10) {
-                Ok(r) if r.status < 400 && !r.body.is_empty() => {
-                    let _ = std::fs::create_dir_all(format!("{root}{DIR}/cache"));
-                    if std::fs::write(&path, &r.body).is_ok() {
-                        if res_tx.send(url).is_err() {
-                            return;
-                        }
-                        unsafe { crate::sdl::SDL_PushEvent(&mut Event::new(wake)) };
-                    }
-                }
-                _ => {
-                    // An empty file stops it being asked for again.
-                    let _ = std::fs::write(&path, b"");
-                }
-            }
-        }
-    });
-    (req_tx, res_rx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

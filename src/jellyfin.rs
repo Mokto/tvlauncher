@@ -41,7 +41,22 @@ fn auth(token: Option<&str>) -> String {
 
 /// A request with a 6 s timeout: the server may be asleep, and the launcher never waits long for it.
 fn request(server: &str, post: Option<&str>, path: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    let r = net::send(&format!("{server}{path}"), post, &[("Authorization", auth(token))], 6)?;
+    request_within(server, post, path, token, 6)
+}
+
+fn request_within(
+    server: &str,
+    post: Option<&str>,
+    path: &str,
+    token: Option<&str>,
+    secs: u64,
+) -> Result<Vec<u8>, String> {
+    let r = net::send(
+        &format!("{server}{path}"),
+        post,
+        &[("Authorization", auth(token))],
+        secs,
+    )?;
     if (200..300).contains(&r.status) {
         Ok(r.body)
     } else {
@@ -69,8 +84,13 @@ impl Config {
         write_private(&format!("{root}{DIR}/jellyfin.json"), body.to_string().as_bytes())
     }
 
-    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn get(&self, path: &str) -> Result<Vec<u8>, String> {
         request(&self.server, None, path, Some(&self.token))
+    }
+
+    /// For a long answer (a whole library), once `get` has shown that the server is awake.
+    pub(crate) fn get_within(&self, path: &str, secs: u64) -> Result<Vec<u8>, String> {
+        request_within(&self.server, None, path, Some(&self.token), secs)
     }
 
     /// `app` is the app that opens the item.
@@ -116,7 +136,9 @@ pub fn sign_out(root: &str, cfg: &Config) {
 
 /// The cache holds YouTube's files too: these are Jellyfin's.
 fn is_ours(name: &str) -> bool {
-    name == "watching.json" || name == "backdrops.json" || ["card-", "bg-", "home-"].iter().any(|p| name.starts_with(p))
+    name == "watching.json"
+        || name == "backdrops.json"
+        || ["card-", "bg-", "home-", "lib-"].iter().any(|p| name.starts_with(p))
 }
 
 /// What the sign-in thread tells the dialog.
@@ -670,6 +692,7 @@ fn save(root: &str, list: &[Watch]) {
         let name = e.file_name().to_string_lossy().into_owned();
         if is_ours(&name)
             && !name.starts_with("home-")
+            && !name.starts_with("lib-")
             && name.ends_with(".img")
             && !used.iter().any(|u| u.ends_with(&name))
         {

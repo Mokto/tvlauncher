@@ -11,12 +11,16 @@ pub enum Act {
     Youtube,
     Plex,
     PlexApp,
+    /// The switch of a Continue watching row on Home: WATCH (Jellyfin) or PLEX.
+    Watching(usize),
     /// Where the TV channels come from, and the guide.
     TvSource,
     TvGuide,
     /// One group of `debloat.sh`.
     Debloat(&'static str),
     Boot,
+    /// A tab after Home, by its place in the order.
+    Tab(usize),
 }
 
 pub enum Value {
@@ -95,6 +99,10 @@ fn entry_rect(i: usize) -> FRect {
 
 impl Page {
     /// `cat`, `row` and `pane` say where the focus was, when the page is built again after a change.
+    pub fn cat_count(&self) -> usize {
+        self.cats.len()
+    }
+
     pub fn new(g: &Gfx, cats: Vec<Category>, cat: usize, row: usize, pane: bool) -> Page {
         let cats: Vec<CatTex> = cats
             .into_iter()
