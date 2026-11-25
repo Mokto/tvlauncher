@@ -20,6 +20,14 @@ use std::time::{Duration, Instant};
 /// (for testing without the remote).
 pub const TRIGGER: &str = "/tmp/tvlauncher-play";
 const AHEAD_NS: i64 = 1_600_000_000;
+mod vod;
+pub use vod::child as film_child;
+
+/// For testing without the remote: `film:<item id>` or a stream address in this file makes the running launcher
+/// start the player process for it.
+pub const SPAWN: &str = "/tmp/tvlauncher-spawn";
+/// What a finished HLS playlist ends with: a film's end, an error for a channel.
+const ENDED: &str = "The stream ended.";
 /// The pipeline's app id. The media resource manager never gives a decoder to com.webos.app.home.
 const APP: &str = "tvlauncher";
 
@@ -103,7 +111,7 @@ fn read(url: &str) -> Reader {
         let r = if hls::is_hls(&url) {
             read_hls(&url, &shared.stop, &mut pump)
         } else {
-            pump(&url).and_then(|more| if more { Err("The stream ended.".into()) } else { Ok(()) })
+            pump(&url).and_then(|more| if more { Err(ENDED.into()) } else { Ok(()) })
         };
         if let Err(e) = r {
             let _ = tx.send(Msg::End(e));
@@ -112,8 +120,8 @@ fn read(url: &str) -> Reader {
     Reader { rx, curl }
 }
 
-/// A live HLS stream: the variant with the most bandwidth, from three segments before the live edge, then
-/// each new segment as the playlist lists it.
+/// An HLS stream: the variant with the most bandwidth, from three segments before the live edge (or from the
+/// start for a complete playlist), then each new segment as the playlist lists it.
 // ponytail: no switching between variants on a slow network, and a gap or a discontinuity (an inserted
 // advert) jumps the timestamps, which the feed throttle then waits out.
 fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<bool, String>) -> Result<(), String> {
@@ -148,7 +156,8 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
                 end,
             } => {
                 let last = seq + segs.len() as u64;
-                let from = next.unwrap_or(last.saturating_sub(3)).max(seq);
+                // A film's playlist is complete from the start: play it from its first segment.
+                let from = next.unwrap_or(if end { seq } else { last.saturating_sub(3) }).max(seq);
                 for (n, seg) in (seq..).zip(&segs).skip((from - seq) as usize) {
                     match pump(seg) {
                         Ok(true) => failed = 0,
@@ -162,7 +171,7 @@ fn read_hls(url: &str, stop: &AtomicBool, pump: &mut impl FnMut(&str) -> Result<
                     next = Some(n + 1);
                 }
                 if end && next.unwrap_or(0) >= last {
-                    return Err("The stream ended.".into());
+                    return Err(ENDED.into());
                 }
                 let wait = Duration::from_millis(target_s.clamp(1, 10) * 500);
                 if let Some(rest) = wait.checked_sub(t.elapsed()) {
@@ -220,6 +229,7 @@ struct Smp {
     // Returns a std::string through the hidden pointer in the first argument.
     feed: unsafe extern "C" fn(*mut c_void, Obj, *const c_char),
     play: unsafe extern "C" fn(Obj) -> c_int,
+    pause: unsafe extern "C" fn(Obj) -> c_int,
     unload: unsafe extern "C" fn(Obj) -> c_int,
     loaded: unsafe extern "C" fn(Obj) -> c_int,
     delete: unsafe extern "C" fn(*mut c_void),
@@ -307,6 +317,7 @@ impl Smp {
                 load: sym(lib, c"_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_E")?,
                 feed: sym(lib, c"_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc")?,
                 play: sym(lib, c"_ZN17StarfishMediaAPIs4PlayEv")?,
+                pause: sym(lib, c"_ZN17StarfishMediaAPIs5PauseEv")?,
                 unload: sym(lib, c"_ZN17StarfishMediaAPIs6UnloadEv")?,
                 loaded: sym(lib, c"_ZN17StarfishMediaAPIs15isLoadCompletedEv")?,
                 delete: sym(libc::RTLD_DEFAULT, c"_ZdlPv")?,
@@ -401,6 +412,9 @@ const K_PAGEDOWN: i32 = 0x4000_004e;
 /// The remote, while a channel plays: Back (or Home, or quitting) leaves, Up and Down change channel, OK shows
 /// the banner. A quit is put back for the main loop.
 fn key() -> Option<Key> {
+    if STOP.load(Ordering::SeqCst) {
+        return Some(Key::Back);
+    }
     let mut e = Event::new(0);
     while unsafe { SDL_PollEvent(&mut e) } != 0 {
         if e.kind() == QUIT {
@@ -735,6 +749,86 @@ impl Player {
         end
     }
 }
+/// Set by SIGTERM in the `--player` process: Home wants the screen back, and playback ends as on Back.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// POC: the `--player` process. Opens its own window and plays `url` until Back.
+pub fn child(url: &str) -> ExitCode {
+    unsafe { libc::signal(libc::SIGTERM, on_term as *const () as usize) };
+    let Some((_win, ren)) = crate::start("", false) else {
+        return ExitCode::FAILURE;
+    };
+    let g = Gfx::new("", ren, |name, size| crate::font("", name, size));
+    let mut p = match Player::new() {
+        Ok(p) => p,
+        Err(e) => {
+            log(&format!("player: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let ch = Channel {
+        name: "Test".into(),
+        group: String::new(),
+        url: url.into(),
+        logo: None,
+        epg: String::new(),
+    };
+    p.watch(&g, &[ch], 0, &Guide::new());
+    log("player: done");
+    ExitCode::SUCCESS
+}
+
+/// Starts this program as the player process with `args` and waits for it, swallowing the launcher window's events
+/// meanwhile. The Home key (a relaunch, once registered) stops it: SIGTERM first, so LG's pipeline is released, and a
+/// kill after two seconds. Gives its exit status, None when a signal ended it. The launcher's window is raised again
+/// afterwards: the TV leaves it hidden.
+pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let t = Instant::now();
+    let mut child = match std::process::Command::new(&exe).args(args).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!("player: {}: {e}", exe.display()));
+            return Some(1);
+        }
+    };
+    log(&format!(
+        "player: pid {} for {}",
+        child.id(),
+        args.first().unwrap_or(&"")
+    ));
+    // Only a registered Home hears the Home key (as a relaunch) while another window is in front.
+    crate::lifecycle::register(wake);
+    let mut asked: Option<Instant> = None;
+    let status = loop {
+        if asked.is_none() && crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
+            log("player: Home key, stopping the player");
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            asked = Some(Instant::now());
+        }
+        if asked.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+            log("player: it did not stop, killing it");
+            let _ = child.kill();
+        }
+        let mut e = Event::new(0);
+        while unsafe { SDL_PollEvent(&mut e) } != 0 {}
+        if let Ok(Some(st)) = child.try_wait() {
+            break st;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    log(&format!("player: ended {status} after {} ms", t.elapsed().as_millis()));
+    unsafe {
+        SDL_ShowWindow(win);
+        SDL_RaiseWindow(win);
+    }
+    status.code()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

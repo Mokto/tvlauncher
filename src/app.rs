@@ -514,6 +514,12 @@ impl App {
                 text(&app),
             ),
             entry(
+                Act::JfPlayer,
+                "Play in the launcher",
+                "Plays films and episodes with the launcher's own player instead of opening the Jellyfin app. Experimental: collections still open in the app.",
+                Value::Switch(self.prefs.jf_player),
+            ),
+            entry(
                 Act::Watching(WATCH),
                 "Continue watching",
                 "A row on Home with the films and episodes you are in the middle of.",
@@ -822,12 +828,56 @@ impl App {
                 bg: None,
             };
             self.luna.launch(&tile.item(&self.plex_app()));
-        } else if let Some(jf) = &self.jf {
-            let mut it = Item::new(format!("jf:{}", t.id), self.jf_app(), Kind::Watch, Some(t.name.clone()));
-            it.params =
-                Some(serde_json::json!({ "itemId": t.id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
-            self.luna.launch(&it);
+        } else {
+            let (id, name) = (t.id.clone(), t.name.clone());
+            if self.prefs.jf_player {
+                self.film(&id, &name);
+            } else {
+                self.open_in_jellyfin(&id, &name);
+            }
         }
+    }
+
+    /// The title's page in the Jellyfin app.
+    fn open_in_jellyfin(&mut self, id: &str, name: &str) {
+        let Some(jf) = &self.jf else { return };
+        let mut it = Item::new(format!("jf:{id}"), self.jf_app(), Kind::Watch, Some(name.to_string()));
+        it.params = Some(serde_json::json!({ "itemId": id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
+        self.luna.launch(&it);
+    }
+
+    /// Plays a Jellyfin title in the launcher's own player (a process of its own, see `player::run_child`). What it
+    /// cannot play (a collection) or cannot start opens in the Jellyfin app instead.
+    fn film(&mut self, id: &str, name: &str) {
+        if !self.luna.root.is_empty() {
+            return log("play: the simulator has no player");
+        }
+        let code = crate::player::run_child(self.win, self.wake, &["--film", id]);
+        if code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE)) {
+            self.open_in_jellyfin(id, name);
+        }
+        // What was watched moves up in Continue watching and in the libraries.
+        self.refresh_jellyfin();
+        for lib in self.libs.iter().filter(|l| !l.plex) {
+            let _ = lib.refresh.send(true);
+        }
+    }
+
+    /// For testing without the remote: what `player::SPAWN` holds, `film:<item id>` or a stream address.
+    pub fn spawn_file(&mut self) {
+        let Ok(what) = std::fs::read_to_string(crate::player::SPAWN) else {
+            return;
+        };
+        let _ = std::fs::remove_file(crate::player::SPAWN);
+        match what.trim().strip_prefix("film:") {
+            Some(id) => self.film(id, ""),
+            None => drop(crate::player::run_child(
+                self.win,
+                self.wake,
+                &["--player", what.trim()],
+            )),
+        }
+        self.animating = true;
     }
 
     /// The tabs after Home that can be shown, in the user's order: (key, name, shown).
@@ -1657,6 +1707,11 @@ impl App {
                 self.rebuild_apps();
                 self.refocus(key, col);
             }
+            Kind::Watch if self.prefs.jf_player && self.rows[r].items[c].key.starts_with("jf:") => {
+                let it = &self.rows[r].items[c];
+                let (id, name) = (it.key[3..].to_string(), it.title.clone());
+                self.film(&id, &name);
+            }
             _ => self.luna.launch(&self.rows[r].items[c]),
         }
     }
@@ -1725,6 +1780,11 @@ impl App {
         };
         if act == Act::Boot {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
+            return self.show_settings();
+        }
+        if act == Act::JfPlayer {
+            self.prefs.jf_player = !self.prefs.jf_player;
+            self.prefs.save();
             return self.show_settings();
         }
         if let Act::Watching(r) = act {

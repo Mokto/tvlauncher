@@ -7,6 +7,7 @@ mod app;
 #[cfg(target_arch = "arm")]
 mod compat;
 mod data;
+mod film;
 mod gfx;
 mod hls;
 mod iptv;
@@ -44,7 +45,7 @@ extern "C" fn log_line(_: *mut c_void, category: c_int, _: c_int, msg: *const c_
     }
 }
 
-fn font(root: &str, name: &str, size: c_int) -> *mut Opaque {
+pub(crate) fn font(root: &str, name: &str, size: c_int) -> *mut Opaque {
     let path = format!("{root}/usr/share/fonts/{name}");
     let f = unsafe { TTF_OpenFont(cstr(&path).as_ptr(), size) };
     if f.is_null() {
@@ -60,6 +61,23 @@ fn main() -> ExitCode {
     let on_tv = root.is_empty();
     if !on_tv && args.len() > 2 && args[1] == "--play" {
         return player::probe(&args[2]);
+    }
+    let child = on_tv && args.len() > 2 && matches!(args[1].as_str(), "--player" | "--film");
+    if child {
+        if let Ok(f) = std::fs::File::create("/tmp/tvlauncher-player.log") {
+            unsafe {
+                libc::dup2(f.as_raw_fd(), 2);
+                libc::dup2(f.as_raw_fd(), 1)
+            };
+        }
+        unsafe { SDL_LogSetOutputFunction(log_line, std::ptr::null_mut()) };
+        std::env::set_var("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
+        log(&format!("player start: {} APPID {:?}", args[1], std::env::var("APPID")));
+        return if args[1] == "--film" {
+            player::film_child(&args[2])
+        } else {
+            player::child(&args[2])
+        };
     }
     if on_tv {
         if let Ok(f) = std::fs::File::create("/tmp/tvlauncher.log") {
@@ -161,6 +179,7 @@ fn main() -> ExitCode {
         return save_bmp(ren, &file);
     }
 
+    let app_root_is_sim = !on_tv;
     let mut last = unsafe { SDL_GetTicks() };
     loop {
         let mut e = Event::new(0);
@@ -180,6 +199,9 @@ fn main() -> ExitCode {
         if lifecycle::RELAUNCH.swap(false, Ordering::SeqCst) {
             app.relaunch();
         }
+        if !app_root_is_sim {
+            app.spawn_file();
+        }
         let now = unsafe { SDL_GetTicks() };
         app.frame((now.wrapping_sub(last) as f32 / 1000.0).min(0.1));
         last = now;
@@ -188,7 +210,7 @@ fn main() -> ExitCode {
 }
 
 /// Initialises SDL and opens the window and renderer.
-fn start(root: &str, shot: bool) -> Option<(*mut Opaque, *mut Opaque)> {
+pub(crate) fn start(root: &str, shot: bool) -> Option<(*mut Opaque, *mut Opaque)> {
     let on_tv = root.is_empty();
     unsafe {
         SDL_SetHint(c"SDL_RENDER_SCALE_QUALITY".as_ptr(), c"1".as_ptr());

@@ -431,6 +431,8 @@ pub struct Prefs {
     pub tab_names: BTreeMap<String, String>,
     /// The Continue watching rows turned off: "jellyfin", "plex".
     pub rows_off: Vec<String>,
+    /// Jellyfin titles play in the launcher's own player rather than the Jellyfin app.
+    pub jf_player: bool,
     /// How the library tabs are sorted: "name" or "added".
     pub lib_sort: String,
 }
@@ -469,6 +471,7 @@ impl Prefs {
             tabs: list("tabs"),
             tabs_off: list("tabsOff"),
             rows_off: list("rowsOff"),
+            jf_player: v["jfPlayer"].as_bool().unwrap_or(false),
             tab_names: serde_json::from_value(v["tabNames"].clone()).unwrap_or_default(),
             lib_sort: v["libSort"].as_str().unwrap_or("name").into(),
             path,
@@ -477,7 +480,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "libSort": self.lib_sort })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "libSort": self.lib_sort })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         if std::fs::write(&tmp, body)

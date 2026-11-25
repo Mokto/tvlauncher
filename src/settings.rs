@@ -11,6 +11,8 @@ pub enum Act {
     Youtube,
     Plex,
     PlexApp,
+    /// Whether Jellyfin titles play in the launcher's own player.
+    JfPlayer,
     /// The switch of a Continue watching row on Home: WATCH (Jellyfin) or PLEX.
     Watching(usize),
     /// Where the TV channels come from, and the guide.

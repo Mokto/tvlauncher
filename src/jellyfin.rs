@@ -26,7 +26,7 @@ const FIELDS: &str = "Overview,ParentBackdropItemId,ParentBackdropImageTags,Pare
 #[derive(Clone)]
 pub struct Config {
     pub server: String,
-    token: String,
+    pub(crate) token: String,
     pub server_id: String,
     pub user_id: String,
     pub user: String,

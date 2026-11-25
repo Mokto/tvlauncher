@@ -155,6 +155,7 @@ extern "C" {
     pub fn SDL_RenderPresent(r: *mut Opaque);
     pub fn SDL_RaiseWindow(win: *mut Opaque);
     pub fn SDL_ShowWindow(win: *mut Opaque);
+    pub fn SDL_HideWindow(win: *mut Opaque);
     pub fn SDL_ShowCursor(toggle: c_int) -> c_int;
     pub fn SDL_RenderFillRectF(r: *mut Opaque, rect: *const FRect) -> c_int;
     pub fn SDL_RenderCopyF(r: *mut Opaque, t: *mut Opaque, src: *const Rect, dst: *const FRect) -> c_int;

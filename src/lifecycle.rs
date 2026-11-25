@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const CRASH_FILE: &CStr = c"/tmp/tvlauncher-crashes";
 
 pub static RELAUNCH: AtomicBool = AtomicBool::new(false);
+static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_crash(sig: c_int) {
     // Only async-signal-safe calls: open, write, close, signal, raise. One line per crash, the time in seconds;
@@ -58,6 +59,9 @@ pub fn note_failed_start() {
 ///
 /// Opt-in (`<DIR>/register`): not yet seen to bring the window to the front on a relaunch.
 pub fn register(wake: u32) {
+    if REGISTERED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(move || {
         let child = Command::new("/usr/bin/luna-send")
             .args([
