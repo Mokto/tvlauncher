@@ -112,8 +112,18 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
         resume: resume_point(at, total),
         total,
         session: session_id(),
+        series: text(&o["grandparentRatingKey"]).filter(|_| o["type"] == "episode"),
         id,
     })
+}
+
+/// The first episode of `series` not watched, if it is not `current`. `server` is the connection of `current`.
+pub fn next(conn: &Conn, series: &str, current: &str) -> Option<Item> {
+    let list = episodes(conn, series, "allLeaves").ok()?;
+    let e = list
+        .iter()
+        .find(|e| e["viewCount"].as_i64().unwrap_or(0) == 0 && e["ratingKey"] != current)?;
+    item_from(conn, &meta(conn, e["ratingKey"].as_str()?).ok()?)
 }
 
 /// The server's HLS transcode of the film, from `start` ticks in. It copies what the TV plays (the transcoder is

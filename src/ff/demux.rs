@@ -926,7 +926,7 @@ unsafe fn rect_to_rgba(r: *const AVSubtitleRect) -> Option<Bitmap> {
     Some(Bitmap { x, y, w, h, rgba })
 }
 
-/// Decodes one subtitle packet into an event at `start_ns` (relative to the run), if it holds one.
+/// Decodes one subtitle packet into an event at `start_ns` (the time in the file, not in the run), if it holds one.
 unsafe fn decode_sub(
     f: &Fns,
     dec: *mut AVCodecContext,
@@ -1198,7 +1198,7 @@ unsafe fn run(
                     } else {
                         0
                     };
-                    if let Some(ev) = decode_sub(f, sub_dec, &sub_name, pkt, pts - b, dur) {
+                    if let Some(ev) = decode_sub(f, sub_dec, &sub_name, pkt, pts, dur) {
                         subs_n += 1;
                         alive = q.push(Feed::Sub(ev));
                     }

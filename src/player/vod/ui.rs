@@ -242,6 +242,10 @@ impl Shown {
             return;
         }
         self.key = key;
+        log(&format!(
+            "film: subtitle {} at {ms} ms",
+            if at.is_some() { "on" } else { "off" }
+        ));
         self.lines.clear();
         self.images.clear();
         self.top = false;
@@ -440,6 +444,7 @@ pub fn shot(g: &Gfx, menu: bool) {
         default_audio: None,
         default_sub: None,
         id: "m1".into(),
+        series: None,
         source: "s".into(),
         direct: String::new(),
         name: "The Silent Harbour".into(),

@@ -64,6 +64,10 @@ fn main() -> ExitCode {
     if !on_tv && args.len() > 2 && args[1] == "--play" {
         return player::probe(&args[2]);
     }
+    if !on_tv && args.len() > 2 && args[1] == "--film-sim" {
+        player::film_sim_keys();
+        return player::film_child_in(&root, &args[2]);
+    }
     if args.get(1).is_some_and(|a| a == "--direct") && args.len() > 2 {
         let n = |i: usize| args.get(i).and_then(|s| s.parse::<i64>().ok());
         ff::demux::probe_cli(&args[2], n(3).unwrap_or(0), n(4), n(5));

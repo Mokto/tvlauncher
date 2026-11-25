@@ -361,6 +361,8 @@ impl Player {
         let mut clock = Clock::default();
         let (mut pending, mut refused) = (None::<crate::ts::Au>, 0);
         let (mut last, mut tick) = ([0i64; 2], Instant::now());
+        // The pipeline's own buffer filled with pictures: a very high bit rate reaches that before 0.7 s of them.
+        let mut video_full = false;
         let (mut paused, mut eof) = (false, false);
         let mut seek: Option<(i64, Instant)> = None;
         let mut menu: Option<Menu> = None;
@@ -519,6 +521,7 @@ impl Player {
                 match smp.feed(&au) {
                     Fed::Ok => last[au.video as usize] = au.pts_ns,
                     Fed::Full => {
+                        video_full |= au.video;
                         pending = Some(au);
                         break;
                     }
@@ -530,7 +533,8 @@ impl Player {
                     }
                 }
             }
-            if !clock.running() && !paused && last[1] >= 700_000_000 && (audio.is_none() || last[0] >= 300_000_000) {
+            let enough = last[1] >= 700_000_000 && (audio.is_none() || last[0] >= 300_000_000);
+            if !clock.running() && !paused && (enough || video_full) {
                 clock.run();
                 let ok = unsafe { (smp.play)(smp.obj) } & 0xff;
                 log(&format!("film: Play {ok}"));
@@ -573,8 +577,13 @@ impl Player {
 /// `--film <item>`: resolves the item, opens its own window and plays until Back. Exits with `film::ELSEWHERE` (or
 /// 1) before opening anything when Home should open the title in the media app instead.
 pub fn child(spec: &str) -> ExitCode {
+    child_in("", spec)
+}
+
+/// The same under `root`: a desktop run (`--film-sim`) with the fake player library of `tools/fake-starfish.c`.
+pub fn child_in(root: &str, spec: &str) -> ExitCode {
     unsafe { libc::signal(libc::SIGTERM, on_term as *const () as usize) };
-    let it = match film::resolve(spec) {
+    let it = match film::resolve(root, spec) {
         Ok(it) => it,
         Err(Why::Elsewhere) => return ExitCode::from(film::ELSEWHERE),
         Err(Why::Failed(e)) => {
@@ -592,10 +601,10 @@ pub fn child(spec: &str) -> ExitCode {
         },
         it.resume / TICKS
     ));
-    let Some((_win, ren)) = crate::start("", false) else {
+    let Some((_win, ren)) = crate::start(root, false) else {
         return ExitCode::from(1);
     };
-    let g = Gfx::new("", ren, |name, size| crate::font("", name, size));
+    let g = Gfx::new(root, ren, |name, size| crate::font(root, name, size));
     let mut p = match Player::new() {
         Ok(p) => p,
         Err(e) => {
@@ -603,11 +612,80 @@ pub fn child(spec: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let (pos, done) = p.film(&g, &it);
-    log(&format!(
-        "film: stopped at {} s{}",
-        pos / TICKS,
-        if done { " (finished)" } else { "" }
-    ));
+    let mut it = it;
+    loop {
+        let (pos, done) = p.film(&g, &it);
+        log(&format!(
+            "film: stopped at {} s{}",
+            pos / TICKS,
+            if done { " (finished)" } else { "" }
+        ));
+        if !done {
+            break;
+        }
+        match film::next(&it).filter(|n| p.next_up(&g, n)) {
+            Some(n) => it = n,
+            None => break,
+        }
+    }
     ExitCode::SUCCESS
+}
+
+impl Player {
+    /// After an episode: the next one starts in five seconds, or at once with OK; Back ends the viewing. Gives
+    /// whether to play it.
+    fn next_up(&self, g: &Gfx, next: &Item) -> bool {
+        let mut osd = Osd::new(g, next);
+        let (t, mut shown) = (Instant::now(), 0);
+        loop {
+            match fkey() {
+                Some(Fk::Back) => return false,
+                Some(Fk::Toggle) => return true,
+                _ => {}
+            }
+            let left = 5u64.saturating_sub(t.elapsed().as_secs());
+            if left == 0 {
+                return true;
+            }
+            if left != shown {
+                shown = left;
+                osd.say(
+                    g,
+                    Some(&format!("Next episode in {left} s. OK plays it now, Back stops.")),
+                );
+            }
+            vframe(g, &mut osd, 0, false, None, Over::default());
+        }
+    }
+}
+
+/// `FILM_KEYS="3:enter,6:right,9:down"` on a desktop run: presses these keys that many seconds in (Back is `esc`).
+pub fn film_sim_keys() {
+    let script = std::env::var("FILM_KEYS").unwrap_or_default();
+    let keys: Vec<(u64, i32)> = script
+        .split(',')
+        .filter_map(|k| {
+            let (t, name) = k.split_once(':')?;
+            let sym = match name {
+                "enter" => K_RETURN,
+                "left" => K_LEFT,
+                "right" => K_RIGHT,
+                "up" => K_UP,
+                "down" => K_DOWN,
+                "esc" => K_ESCAPE,
+                _ => return None,
+            };
+            Some((t.parse().ok()?, sym))
+        })
+        .collect();
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        for (at, sym) in keys {
+            std::thread::sleep(Duration::from_secs(at).saturating_sub(t.elapsed()));
+            let mut e = Event::new(KEYDOWN);
+            e.0[20..24].copy_from_slice(&sym.to_ne_bytes());
+            unsafe { SDL_PushEvent(&mut e) };
+            log(&format!("sim: key {sym} at {at} s"));
+        }
+    });
 }

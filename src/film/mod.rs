@@ -51,6 +51,8 @@ pub struct Item {
     pub default_audio: Option<i64>,
     pub default_sub: Option<i64>,
     pub id: String,
+    /// The series an episode belongs to, to find the next one.
+    pub series: Option<String>,
     /// Jellyfin: the media source. Plex: the part.
     pub source: String,
     /// Where the file is, ready to be read with byte ranges.
@@ -70,17 +72,27 @@ pub enum Why {
 }
 
 /// The item to play for what Home passes to the player process: a Jellyfin item id, or `plex:<server>:<rating key>`.
-pub fn resolve(spec: &str) -> Result<Item, Why> {
+pub fn resolve(root: &str, spec: &str) -> Result<Item, Why> {
     match spec.strip_prefix("plex:").and_then(|r| r.split_once(':')) {
         Some((server, key)) => {
-            let cfg = crate::plex::Config::load("").ok_or_else(|| Why::Failed("Not signed in to Plex.".into()))?;
+            let cfg = crate::plex::Config::load(root).ok_or_else(|| Why::Failed("Not signed in to Plex.".into()))?;
             plex::resolve(&cfg, server, key)
         }
         None => {
             let cfg =
-                crate::jellyfin::Config::load("").ok_or_else(|| Why::Failed("Not signed in to Jellyfin.".into()))?;
+                crate::jellyfin::Config::load(root).ok_or_else(|| Why::Failed("Not signed in to Jellyfin.".into()))?;
             jellyfin::resolve(&cfg, spec)
         }
+    }
+}
+
+/// The episode that follows `it` in its series, if it is an episode and there is one the viewer has not seen. Call it
+/// after the end was reported: the server has marked `it` watched by then.
+pub fn next(it: &Item) -> Option<Item> {
+    let series = it.series.as_deref()?;
+    match &it.backend {
+        Backend::Jellyfin(c) => jellyfin::next(c, series, &it.id),
+        Backend::Plex(c) => plex::next(c, series, &it.id),
     }
 }
 

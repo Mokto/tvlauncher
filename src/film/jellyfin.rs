@@ -96,8 +96,20 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
         resume: resume_point(at, total),
         total,
         session: session_id(),
+        series: o["SeriesId"]
+            .as_str()
+            .filter(|_| o["Type"] == "Episode")
+            .map(String::from),
         id,
     })
+}
+
+/// The next episode to watch of `series`, if it is not `current`.
+pub fn next(cfg: &Config, series: &str, current: &str) -> Option<Item> {
+    let user = &cfg.user_id;
+    let v = json_of(cfg, &format!("/Shows/NextUp?userId={user}&seriesId={series}&limit=1")).ok()?;
+    let id = v["Items"][0]["Id"].as_str().filter(|id| *id != current)?;
+    resolve(cfg, id).ok()
 }
 
 /// The playlist of the server's remux of the film, from `start` ticks in. The server copies H.264 and H.265 and
@@ -305,6 +317,22 @@ mod tests {
             ("/Items/s1", r#"{"Id":"s1","Type":"Series"}"#),
         ]);
         assert_eq!(resolve(&finished, "s1").ok().unwrap().id, "e1");
+    }
+
+    #[test]
+    fn the_next_episode_is_one_not_yet_watched_and_not_the_current() {
+        let cfg = serve(&[
+            ("/NextUp", r#"{"Items":[{"Id":"e8"}]}"#),
+            (
+                "/Items/e8",
+                r#"{"Id":"e8","Name":"Eight","Type":"Episode","SeriesId":"s1"}"#,
+            ),
+        ]);
+        assert_eq!(next(&cfg, "s1", "e7").map(|i| i.id), Some("e8".into()));
+        assert!(
+            next(&cfg, "s1", "e8").is_none(),
+            "the server still names the one just watched"
+        );
     }
 
     #[test]
