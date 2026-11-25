@@ -102,6 +102,14 @@ pub enum Why {
 
 /// The item to play for what Home passes to the player process: a Jellyfin item id, or `plex:<server>:<rating key>`.
 pub fn resolve(root: &str, spec: &str) -> Result<Item, Why> {
+    // `<spec>@<seconds>` starts there (a test hook for the spawn file). Playing reports progress, so the server's resume point moves.
+    if let Some((spec, at)) = spec.rsplit_once('@') {
+        let at: i64 = at.parse().map_err(|_| Why::Failed("Bad start time.".into()))?;
+        return resolve(root, spec).map(|it| Item {
+            resume: at * TICKS,
+            ..it
+        });
+    }
     match spec.strip_prefix("plex:").and_then(|r| r.split_once(':')) {
         Some((server, key)) => {
             let cfg = crate::plex::Config::load(root).ok_or_else(|| Why::Failed("Not signed in to Plex.".into()))?;
