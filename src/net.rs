@@ -1,13 +1,65 @@
 //! HTTP and HTTPS requests. Plain HTTP goes through minreq, which has no TLS: this binary carries no TLS
 //! library, so HTTPS goes through the TV's own `curl` (with the certificate store of the TV).
+use crate::sdl::Event;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct Reply {
     pub status: u16,
     pub body: Vec<u8>,
     /// The address that answered, after redirects.
     pub url: String,
+}
+
+/// Starts a picture thread: send it the pictures a page shows, as (address, path under `root`) pairs; only the
+/// latest list is worked on. Each picture saved comes back as its path, followed by `wake`. A picture the server
+/// refuses is saved empty so it is not asked for again; a server that does not answer is skipped until the
+/// next list.
+pub fn pictures(root: String, wake: u32) -> (Sender<Vec<(String, String)>>, Receiver<String>) {
+    let (req_tx, req_rx) = channel::<Vec<(String, String)>>();
+    let (res_tx, res_rx) = channel();
+    std::thread::spawn(move || {
+        let (mut todo, mut dead) = (Vec::<(String, String)>::new(), Vec::<String>::new());
+        loop {
+            let next = if todo.is_empty() {
+                match req_rx.recv() {
+                    Ok(l) => Some(l),
+                    Err(_) => return,
+                }
+            } else {
+                req_rx.try_recv().ok()
+            };
+            if let Some(list) = next {
+                todo = list;
+                todo.reverse();
+                dead.clear();
+                continue;
+            }
+            let Some((url, path)) = todo.pop() else { continue };
+            let full = format!("{root}{path}");
+            let host = url.split('/').nth(2).unwrap_or_default().to_string();
+            if std::path::Path::new(&full).exists() || dead.contains(&host) {
+                continue;
+            }
+            match send(&url, None, &[], 10) {
+                Ok(r) if r.status < 400 && !r.body.is_empty() => {
+                    if let Some(dir) = std::path::Path::new(&full).parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if std::fs::write(&full, &r.body).is_ok() {
+                        if res_tx.send(path).is_err() {
+                            return;
+                        }
+                        unsafe { crate::sdl::SDL_PushEvent(&mut Event::new(wake)) };
+                    }
+                }
+                Ok(_) => drop(std::fs::write(&full, b"")),
+                Err(_) => dead.push(host),
+            }
+        }
+    });
+    (req_tx, res_rx)
 }
 
 /// Live streams are fetched as a browser: some channels refuse other agents (and some a bare `Mozilla/5.0`).

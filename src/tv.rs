@@ -128,21 +128,20 @@ impl Page {
     }
 
     /// The logos of the channels on screen and around them, for the logo thread.
-    pub fn logos(&self, list: &[Channel]) -> Vec<String> {
+    pub fn logos(&self, list: &[Channel]) -> Vec<(String, String)> {
         let from = self.row.saturating_sub(ROWS);
         self.order
             .iter()
             .skip(from)
             .take(ROWS * 3)
-            .filter_map(|&i| list[i].logo.clone())
+            .filter_map(|&i| list[i].logo.as_ref().map(|l| (l.clone(), logo_path(l))))
             .collect()
     }
 
-    /// A logo arrived: the channels showing it load it again.
-    pub fn logo_saved(&mut self, url: &str) {
-        let path = logo_path(url);
+    /// A logo arrived (its path): the channels showing it load it again.
+    pub fn logo_saved(&mut self, path: &str) {
         for it in self.logos.values_mut() {
-            if it.icons.first() == Some(&path) {
+            if it.icons.first().is_some_and(|p| p == path) {
                 it.icon_tried = false;
             }
         }

@@ -179,7 +179,13 @@ impl Gfx {
     fn load_icon(&self, it: &mut Item) -> Option<Tex> {
         let s = it.icons.iter().find_map(|p| Surf::load(&self.rp(p)))?;
         if it.cover {
-            cover(&s, 640, 360, 28).and_then(|c| Tex::new(self.ren, &c))
+            // A poster stays upright; anything else becomes a 16:9 still.
+            let (w, h, r) = if s.size().1 > s.size().0 {
+                (300, 450, 22)
+            } else {
+                (640, 360, 28)
+            };
+            cover(&s, w, h, r).and_then(|c| Tex::new(self.ren, &c))
         } else {
             if it.kind == Kind::App {
                 if let Some((src, bg)) = logo_box(&s) {
@@ -277,7 +283,8 @@ impl Gfx {
             self.put(label, x0 + (w - lw) / 2.0, y0 + (h - lh) / 2.0, WHITE, a);
         }
         self.rounded(x0, y0, w, h, 14.0, BG, dim * a);
-        if !matches!(it.kind, Kind::Input | Kind::Toggle) {
+        // A poster carries its own title, and the page shows it above.
+        if !matches!(it.kind, Kind::Input | Kind::Toggle) && cw >= ch {
             self.put(label, x0, y0 + h + 16.0, TEXT, f);
         }
     }

@@ -7,10 +7,12 @@
 //! documented in its docs/launch-links.md.
 use crate::data::{write_private, Item, Kind, DIR};
 use crate::jellyfin::{clip, Qc};
+use crate::library::{self, Got, View, PLEX};
 use crate::net;
 use crate::sdl::{Color, Event};
 use crate::youtube::{device_id, now, sleep_unless};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -85,7 +87,8 @@ pub fn sign_out(root: &str) {
         .flatten()
         .flatten()
     {
-        if e.file_name().to_string_lossy().starts_with("plex-") {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("plex-") || name.starts_with("plib-") {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -248,6 +251,7 @@ struct Server {
     id: String,
     token: String,
     urls: Vec<String>,
+    owned: bool,
 }
 
 /// The addresses to try, best first: on the home network and plain HTTP (a server that requires secure
@@ -303,6 +307,7 @@ fn servers(cfg: &Config) -> Result<Vec<Server>, String> {
                 id: r["clientIdentifier"].as_str()?.into(),
                 token: r["accessToken"].as_str().unwrap_or(&cfg.token).into(),
                 urls: urls(r),
+                owned: r["owned"] == true,
             })
         })
         .take(MAX_SERVERS)
@@ -483,6 +488,83 @@ fn refresh(root: &str, cfg: &Config) -> Result<Vec<Tile>, String> {
     }
     save(root, &out);
     Ok(out)
+}
+
+/// The film and show libraries of the account's own servers, a tab each (see `library`). Shared servers are
+/// left out: they would add tabs nobody asked for and fetch whole libraries over the internet. When a server
+/// doesn't answer, the saved list of libraries stays, so its tabs don't go while it sleeps.
+pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool) -> Result<(), String> {
+    if !force && library::fresh(root, PLEX) {
+        return Ok(());
+    }
+    let h = |token: &str| {
+        [
+            ("Accept", "application/json".to_string()),
+            ("X-Plex-Token", token.to_string()),
+        ]
+    };
+    // (library, section key, address that answered, token)
+    let mut found: Vec<(View, String, String, String)> = vec![];
+    let mut all = true;
+    for server in servers(cfg)?.into_iter().filter(|s| s.owned) {
+        let hit = server.urls.iter().find_map(|base| {
+            get_json(&format!("{base}/library/sections"), &h(&server.token), TRY_SECS)
+                .ok()
+                .map(|v| (base.clone(), v))
+        });
+        let Some((base, v)) = hit else {
+            all = false;
+            continue;
+        };
+        for d in v["MediaContainer"]["Directory"].as_array().into_iter().flatten() {
+            let (Some("movie" | "show"), Some(key), Some(name)) =
+                (d["type"].as_str(), d["key"].as_str(), d["title"].as_str())
+            else {
+                continue;
+            };
+            let id = format!("{}{key}", server.id.chars().take(8).collect::<String>());
+            let view = View {
+                id,
+                name: name.into(),
+                server: server.id.clone(),
+                src: library::Source::Plex {
+                    base: base.clone(),
+                    token: server.token.clone(),
+                },
+            };
+            found.push((view, key.into(), base.clone(), server.token.clone()));
+        }
+    }
+    if found.is_empty() && !all {
+        return Err("no Plex server answered".into());
+    }
+    if all {
+        let views: Vec<View> = found.iter().map(|f| f.0.clone()).collect();
+        library::save_views(root, PLEX, &views)?;
+        if !send(Got::Views(views)) {
+            return Ok(());
+        }
+    }
+    let mut keep = HashSet::new();
+    for (view, key, base, token) in found {
+        let body = get_json(&format!("{base}/library/sections/{key}/all"), &h(&token), 60)?;
+        let list: Vec<library::Title> = body["MediaContainer"]["Metadata"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(library::plex_title)
+            .collect();
+        library::save_titles(root, PLEX, &view.id, &list);
+        keep.extend(list.iter().map(|t| t.id.clone()));
+        keep.insert(view.id.clone());
+        if !send(Got::Titles(view.id, list, library::Source::Plex { base, token })) {
+            return Ok(());
+        }
+    }
+    if all {
+        library::prune(root, PLEX, &keep);
+    }
+    Ok(())
 }
 
 /// Writes the list, and removes pictures that no entry uses any more.

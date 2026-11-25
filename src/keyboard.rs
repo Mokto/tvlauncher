@@ -65,7 +65,7 @@ const KEYS: [&[(&str, u32)]; 6] = [
         ("#", 1),
         ("!", 1),
     ],
-    &[("Shift", 2), ("http://", 2), ("Delete", 2), ("Done", 4)],
+    &[("Shift", 2), ("Space", 2), ("http://", 2), ("Delete", 2), ("Done", 2)],
 ];
 const KEY_W: f32 = 108.0;
 const KEY_H: f32 = 64.0;
@@ -157,6 +157,7 @@ impl Prompt {
         match key {
             "Done" => return Typed::Done(self.text.trim().to_string()),
             "Delete" => drop(self.text.pop()),
+            "Space" => self.text.push(' '),
             "Shift" => {
                 self.shift = !self.shift;
                 self.relabel(g);

@@ -4,12 +4,14 @@ use crate::gfx::*;
 use crate::iptv::{self, Channel, Got, Guide};
 use crate::jellyfin::{self, Watch, DEFAULT_APP};
 use crate::keyboard::{Prompt, Typed};
+use crate::library;
 use crate::login::{Login, Signed};
 use crate::plex::{self, Tile as PlexTile};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
 use crate::tv;
 use crate::youtube::{self, Tile};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
 /// How much of the background picture the rows cover: the rest shows through, as on Android TV.
@@ -67,6 +69,13 @@ enum Opt {
     Unfav(String),
     /// The details of the focused programme.
     TvDetails,
+    /// Sort the library tabs by "name" or by date "added".
+    LibSort(&'static str),
+    RefreshLib,
+    /// Show or hide a tab (its key), or move it left (-1) or right (1).
+    TabShow(String),
+    TabMove(String, i32),
+    TabRename(String),
     Close,
 }
 
@@ -77,6 +86,7 @@ enum Ask {
     XtUser(String),
     XtPass(String, String),
     Guide,
+    TabName(String),
 }
 
 struct Menu {
@@ -106,6 +116,20 @@ pub struct Jelly {
     pub res: Receiver<Option<Vec<Watch>>>,
 }
 
+/// The Jellyfin or the Plex libraries, a tab each: their pages and the threads that refresh them and fetch their
+/// pictures.
+struct Lib {
+    plex: bool,
+    refresh: Sender<bool>,
+    res: Receiver<library::Got>,
+    views: Vec<library::View>,
+    pages: HashMap<String, library::Page>,
+    pics: Sender<Vec<(String, String)>>,
+    saved: Receiver<String>,
+    /// The tab and title the pictures were last asked for.
+    asked: String,
+}
+
 /// The signed-in Plex account and its refresh thread.
 struct Px {
     cfg: plex::Config,
@@ -121,7 +145,7 @@ struct Tv {
     list: Vec<Channel>,
     guide: Guide,
     page: tv::Page,
-    logo_req: Sender<Vec<String>>,
+    logo_req: Sender<Vec<(String, String)>>,
     logo_res: Receiver<String>,
 }
 
@@ -175,11 +199,12 @@ pub struct App {
     px: Option<Px>,
     tv: Option<Tv>,
     tv_pending: bool,
-    /// The TV tab is shown instead of Home (only while live TV is set up).
-    on_tv: bool,
-    /// The focus is on the Home and TV tabs at the top.
+    libs: Vec<Lib>,
+    /// The tab shown: empty for Home, "tv", or a library's id.
+    tab: String,
+    /// The focus is on the tabs at the top.
     tabs_f: bool,
-    tab_tex: [Option<Tex>; 2],
+    tab_tex: HashMap<String, Option<Tex>>,
     /// Made when the first channel is played, and kept (see `player::Player`).
     player: Option<crate::player::Player>,
     /// Why the last channel could not start, shown on the TV tab.
@@ -249,9 +274,10 @@ impl App {
             px: None,
             tv: None,
             tv_pending: false,
-            on_tv: false,
+            libs: vec![],
+            tab: String::new(),
             tabs_f: false,
-            tab_tex: [None, None],
+            tab_tex: HashMap::new(),
             player: None,
             tv_note: None,
             clock: None,
@@ -273,8 +299,11 @@ impl App {
                 .iter()
                 .map(|w| jf.cfg.item(w, &jf_app))
                 .collect();
-            app.rows[WATCH].items = cached;
+            if !app.row_off(WATCH) {
+                app.rows[WATCH].items = cached;
+            }
             app.jf_pending = jf.refresh.send(()).is_ok();
+            app.start_lib(false);
         }
         if let Some(cfg) = youtube::Config::load(&app.luna.root) {
             app.rows[YOUTUBE].items = youtube::cached(&app.luna.root).iter().map(Tile::item).collect();
@@ -282,7 +311,9 @@ impl App {
         }
         if let Some(cfg) = plex::Config::load(&app.luna.root) {
             let plex_app = app.plex_app();
-            app.rows[PLEX].items = plex::cached(&app.luna.root).iter().map(|t| t.item(&plex_app)).collect();
+            if !app.row_off(PLEX) {
+                app.rows[PLEX].items = plex::cached(&app.luna.root).iter().map(|t| t.item(&plex_app)).collect();
+            }
             app.start_plex(cfg);
         }
         if let Some(cfg) = iptv::Config::load(&app.luna.root) {
@@ -304,7 +335,7 @@ impl App {
     fn start_tv(&mut self, cfg: iptv::Config, force: bool) {
         let root = self.luna.root.clone();
         let (refresh, res) = iptv::spawn(root.clone(), cfg.clone(), self.wake);
-        let (logo_req, logo_res) = iptv::logos(root.clone(), self.wake);
+        let (logo_req, logo_res) = crate::net::pictures(root.clone(), self.wake);
         let list = iptv::cached_channels(&root);
         let page = tv::Page::new(&self.g, &list, &self.prefs.tv_favs);
         let _ = logo_req.send(page.logos(&list));
@@ -330,7 +361,6 @@ impl App {
     fn remove_tv(&mut self) {
         self.tv = None;
         self.tv_pending = false;
-        self.on_tv = false;
         self.tabs_f = false;
         iptv::sign_out(&self.luna.root);
     }
@@ -471,7 +501,7 @@ impl App {
             entry(
                 Act::Jellyfin,
                 "Account",
-                "Where Continue watching and the background pictures come from.",
+                "Where Continue watching, the library tabs and the background pictures come from.",
                 match &self.jf {
                     Some(jf) => text(&jf.cfg.user),
                     None => text("Sign in"),
@@ -482,6 +512,12 @@ impl App {
                 "Open videos in",
                 "The app that opens what you pick in Continue watching.",
                 text(&app),
+            ),
+            entry(
+                Act::Watching(WATCH),
+                "Continue watching",
+                "A row on Home with the films and episodes you are in the middle of.",
+                Value::Switch(!self.row_off(WATCH)),
             ),
         ];
         let youtube = vec![entry(
@@ -499,7 +535,7 @@ impl App {
             entry(
                 Act::Plex,
                 "Account",
-                "Where Continue watching on Plex comes from. Sign in with a code you enter at plex.tv/link.",
+                "Where Continue watching on Plex and its library tabs come from. Sign in with a code you enter at plex.tv/link.",
                 match &self.px {
                     Some(px) => text(&px.cfg.user),
                     None => text("Sign in"),
@@ -510,6 +546,12 @@ impl App {
                 "Open videos in",
                 "The app that opens what you pick. PlxNative opens the title itself; other apps only start.",
                 text(&plex_title),
+            ),
+            entry(
+                Act::Watching(PLEX),
+                "Continue watching",
+                "A row on Home with the films and episodes you are in the middle of.",
+                Value::Switch(!self.row_off(PLEX)),
             ),
         ];
         let host = |url: &str| {
@@ -557,29 +599,47 @@ impl App {
             "Opens this launcher as the Home screen every time the TV starts. If it keeps crashing, LG's Home comes back.",
             Value::Switch(boot_on(&self.luna.root)),
         )];
-        [
-            ("Jellyfin", jellyfin),
-            ("Plex", plex),
-            ("YouTube", youtube),
-            ("Live TV", tv),
-            ("Ads and privacy", privacy),
-            ("Startup", startup),
-        ]
-        .into_iter()
-        .map(|(name, entries)| Category {
-            name: name.into(),
-            entries,
-        })
-        .collect()
+        let tabs = self
+            .all_tabs()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (key, name, on))| {
+                let plex = self.libs.iter().any(|l| l.plex && l.views.iter().any(|v| v.id == key));
+                let what = match (key.as_str(), plex) {
+                    ("tv", _) => "The live TV guide.",
+                    (_, true) => "A library on your Plex server.",
+                    _ => "A library on your Jellyfin server.",
+                };
+                let desc = format!("{what} OK to show, hide, move or rename it.");
+                entry(Act::Tab(i), &name, &desc, Value::Switch(on))
+            })
+            .collect::<Vec<_>>();
+        let tabs = (!tabs.is_empty()).then_some(("Tabs", tabs));
+        tabs.into_iter()
+            .chain([
+                ("Jellyfin", jellyfin),
+                ("Plex", plex),
+                ("YouTube", youtube),
+                ("Live TV", tv),
+                ("Ads and privacy", privacy),
+                ("Startup", startup),
+            ])
+            .map(|(name, entries)| Category {
+                name: name.into(),
+                entries,
+            })
+            .collect()
     }
 
     /// Opens the settings page, or builds it again after a change, with the focus where it was.
     fn show_settings(&mut self) {
+        let cats = self.settings_cats();
         let (cat, row, pane) = match &self.mode {
-            Mode::Settings(p) => (p.cat, p.row, p.pane),
+            // The Tabs category comes and goes at the top with the first and the last library.
+            Mode::Settings(p) => ((p.cat + cats.len()).saturating_sub(p.cat_count()), p.row, p.pane),
             _ => self.last_settings,
         };
-        let page = Page::new(&self.g, self.settings_cats(), cat, row, pane);
+        let page = Page::new(&self.g, cats, cat, row, pane);
         self.in_settings = true;
         self.mode = Mode::Settings(Box::new(page));
     }
@@ -607,6 +667,7 @@ impl App {
                 let (refresh, res) = jellyfin::spawn(self.luna.root.clone(), cfg.clone(), self.wake);
                 self.jf_pending = refresh.send(()).is_ok();
                 self.jf = Some(Jelly { cfg, refresh, res });
+                self.start_lib(false);
             }
             Signed::Youtube => {
                 if let Some(cfg) = youtube::Config::load(&self.luna.root) {
@@ -626,10 +687,12 @@ impl App {
         let (refresh, res) = plex::spawn(self.luna.root.clone(), cfg.clone(), self.wake);
         self.px_pending = refresh.send(()).is_ok();
         self.px = Some(Px { cfg, refresh, res });
+        self.start_lib(true);
     }
 
     fn sign_out_plex(&mut self) {
         self.px = None;
+        self.libs.retain(|l| !l.plex);
         plex::sign_out(&self.luna.root);
         self.px_pending = false;
         self.rows[PLEX].items.clear();
@@ -639,6 +702,9 @@ impl App {
     fn refresh_plex(&mut self) {
         if let Some(px) = &self.px {
             self.px_pending = px.refresh.send(()).is_ok();
+        }
+        for lib in self.libs.iter().filter(|l| l.plex) {
+            let _ = lib.refresh.send(false);
         }
     }
 
@@ -664,7 +730,148 @@ impl App {
         }
     }
 
+    /// Shows the cached libraries of Jellyfin or Plex at once and asks for new lists when they are old.
+    fn start_lib(&mut self, plex: bool) {
+        let root = self.luna.root.clone();
+        let (pre, src, (refresh, res)) = match (plex, &self.jf, &self.px) {
+            (false, Some(jf), _) => {
+                let (r, cfg) = (root.clone(), jf.cfg.clone());
+                let src = library::Source::Jellyfin(cfg.server.clone());
+                let thread = library::spawn(move |f, s| library::refresh(&r, &cfg, f, s), self.wake);
+                (library::JELLYFIN, src, thread)
+            }
+            (true, _, Some(px)) => {
+                let (r, cfg) = (root.clone(), px.cfg.clone());
+                let thread = library::spawn(move |f, s| plex::libraries(&r, &cfg, f, s), self.wake);
+                (library::PLEX, library::Source::None, thread)
+            }
+            _ => return,
+        };
+        let (pics, saved) = crate::net::pictures(root.clone(), self.wake);
+        let by_name = self.prefs.lib_sort != "added";
+        let views = library::cached_views(&root, pre);
+        let pages = views
+            .iter()
+            .map(|v| {
+                let titles = library::cached_titles(&root, pre, &v.id);
+                let src = if plex { v.src.clone() } else { src.clone() };
+                (v.id.clone(), library::Page::new(&self.g, pre, src, titles, by_name))
+            })
+            .collect();
+        let _ = refresh.send(false);
+        self.libs.retain(|l| l.plex != plex);
+        self.libs.push(Lib {
+            plex,
+            refresh,
+            res,
+            views,
+            pages,
+            pics,
+            saved,
+            asked: String::new(),
+        });
+    }
+
+    /// The library tab shown, if one is.
+    fn lib_page(&self) -> Option<&library::Page> {
+        self.libs.iter().find_map(|l| l.pages.get(&self.tab))
+    }
+
+    fn lib_page_mut(&mut self) -> Option<&mut library::Page> {
+        let tab = &self.tab;
+        self.libs.iter_mut().find_map(|l| l.pages.get_mut(tab))
+    }
+
+    /// A library's titles arrived, or the sort changed: its page is made again, with the focus kept. `src` None
+    /// keeps where the page's pictures come from.
+    fn set_titles(&mut self, lib: usize, view: &str, titles: Vec<library::Title>, src: Option<library::Source>) {
+        let by_name = self.prefs.lib_sort != "added";
+        let lib = &mut self.libs[lib];
+        let old = lib.pages.get(view);
+        let src = src
+            .or_else(|| old.map(library::Page::source))
+            .unwrap_or(library::Source::None);
+        let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
+        let mut page = library::Page::new(&self.g, pre, src, titles, by_name);
+        if let Some(old) = old {
+            page.keep(old);
+        }
+        lib.pages.insert(view.to_string(), page);
+        lib.asked.clear();
+    }
+
+    /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
+    fn open_title(&mut self) {
+        let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
+            return;
+        };
+        let Some(t) = lib.pages[&self.tab].title() else { return };
+        if lib.plex {
+            let tile = plex::Tile {
+                server: lib
+                    .views
+                    .iter()
+                    .find(|v| v.id == self.tab)
+                    .map(|v| v.server.clone())
+                    .unwrap_or_default(),
+                rating_key: t.id.clone(),
+                title: t.name.clone(),
+                sub: String::new(),
+                progress: 0.0,
+                card: None,
+                bg: None,
+            };
+            self.luna.launch(&tile.item(&self.plex_app()));
+        } else if let Some(jf) = &self.jf {
+            let mut it = Item::new(format!("jf:{}", t.id), self.jf_app(), Kind::Watch, Some(t.name.clone()));
+            it.params =
+                Some(serde_json::json!({ "itemId": t.id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
+            self.luna.launch(&it);
+        }
+    }
+
+    /// The tabs after Home that can be shown, in the user's order: (key, name, shown).
+    fn all_tabs(&self) -> Vec<(String, String, bool)> {
+        let mut v: Vec<(String, String)> = self
+            .libs
+            .iter()
+            .flat_map(|l| &l.views)
+            .map(|v| (v.id.clone(), v.name.clone()))
+            .collect();
+        if self.tv.is_some() {
+            v.push(("tv".into(), "Live TV".into()));
+        }
+        for (k, name) in &mut v {
+            if let Some(n) = self.prefs.tab_names.get(k) {
+                name.clone_from(n);
+            }
+        }
+        // A library that is new since the tabs were moved goes just before Live TV, which stays last.
+        let pos = |k: &str| self.prefs.tabs.iter().position(|t| t == k);
+        let new = pos("tv").unwrap_or(usize::MAX);
+        v.sort_by_key(|(k, _)| pos(k).unwrap_or(new));
+        v.into_iter()
+            .map(|(k, n)| {
+                let on = !self.prefs.tabs_off.contains(&k);
+                (k, n, on)
+            })
+            .collect()
+    }
+
+    /// The tabs at the top: Home, then the shown ones. Just Home means there is no tab bar.
+    fn tabs(&self) -> Vec<(String, String)> {
+        let rest = self.all_tabs().into_iter().filter(|t| t.2).map(|(k, n, _)| (k, n));
+        std::iter::once((String::new(), "Home".to_string()))
+            .chain(rest)
+            .collect()
+    }
+
+    fn on_tv(&self) -> bool {
+        self.tab == "tv"
+    }
+
     fn sign_out(&mut self) {
+        self.libs.retain(|l| l.plex);
         if let Some(jf) = self.jf.take() {
             jellyfin::sign_out(&self.luna.root, &jf.cfg);
         }
@@ -677,11 +884,14 @@ impl App {
         if let Some(jf) = &self.jf {
             self.jf_pending = jf.refresh.send(()).is_ok();
         }
+        for lib in self.libs.iter().filter(|l| !l.plex) {
+            let _ = lib.refresh.send(false);
+        }
     }
 
     fn focused(&self) -> Option<(usize, usize)> {
         let r = &self.rows[self.cur_row];
-        (!r.items.is_empty() && !self.top() && !self.on_tv).then_some((self.cur_row, r.col))
+        (!r.items.is_empty() && !self.top() && self.tab.is_empty()).then_some((self.cur_row, r.col))
     }
 
     fn focused_key(&self) -> Option<String> {
@@ -830,6 +1040,9 @@ impl App {
     /// Replaces a row of videos, keeping what is already drawn for the cards that stay. The first list takes the
     /// focus unless a key was pressed before it arrived, or the user just signed in.
     fn set_row(&mut self, r: usize, mut items: Vec<Item>) {
+        if self.row_off(r) {
+            items.clear();
+        }
         let (key, col) = (self.focused_key(), self.rows[self.cur_row].col);
         let mut old = std::mem::take(&mut self.rows[r].items);
         for it in &mut items {
@@ -856,6 +1069,16 @@ impl App {
         } else {
             self.refocus(key, col);
         }
+    }
+
+    /// A Continue watching row the user turned off in Settings.
+    fn row_off(&self, r: usize) -> bool {
+        let key = match r {
+            WATCH => "jellyfin",
+            PLEX => "plex",
+            _ => return false,
+        };
+        self.prefs.rows_off.iter().any(|k| k == key)
     }
 
     fn request_bg(&mut self, p: Option<&str>) {
@@ -940,8 +1163,43 @@ impl App {
             }
         }
         while let Some(tv) = &mut self.tv {
-            let Ok(url) = tv.logo_res.try_recv() else { break };
-            tv.page.logo_saved(&url);
+            let Ok(path) = tv.logo_res.try_recv() else { break };
+            tv.page.logo_saved(&path);
+        }
+        let mut new_tabs = false;
+        for i in 0..self.libs.len() {
+            while let Ok(got) = self.libs[i].res.try_recv() {
+                match got {
+                    library::Got::Views(views) => {
+                        let lib = &mut self.libs[i];
+                        new_tabs |= lib.views.iter().map(|v| &v.id).ne(views.iter().map(|v| &v.id));
+                        lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
+                        lib.views = views;
+                    }
+                    library::Got::Titles(view, titles, src) => self.set_titles(i, &view, titles, Some(src)),
+                }
+            }
+        }
+        if new_tabs && matches!(self.mode, Mode::Settings(_)) {
+            self.show_settings();
+        }
+        if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
+            self.tab.clear();
+        }
+        let tab = self.tab.clone();
+        for lib in &mut self.libs {
+            while let Ok(path) = lib.saved.try_recv() {
+                if let Some(p) = lib.pages.get_mut(&tab) {
+                    p.saved(&path);
+                }
+            }
+            if let Some(p) = lib.pages.get(&tab) {
+                let asked = format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str()));
+                if lib.asked != asked {
+                    let _ = lib.pics.send(p.wanted());
+                    lib.asked = asked;
+                }
+            }
         }
         let focus = self.focused();
         if matches!(self.mode, Mode::Browse)
@@ -958,10 +1216,17 @@ impl App {
             self.hero_key = focus_key;
             self.hero_a = 0.0;
         }
-        let bg = focus
-            .and_then(|(r, c)| self.rows[r].items[c].bg.clone())
-            .or_else(|| self.home_bg.as_ref().map(|b| b.path.clone()));
-        self.request_bg(bg.as_deref());
+        match self.lib_page().map(|p| p.backdrop(&self.g)) {
+            Some(Some(bg)) => self.request_bg(bg.as_deref()),
+            // The focused title's backdrop is on its way: the one shown stays until it is here.
+            Some(None) => {}
+            None => {
+                let bg = focus
+                    .and_then(|(r, c)| self.rows[r].items[c].bg.clone())
+                    .or_else(|| self.home_bg.as_ref().map(|b| b.path.clone()));
+                self.request_bg(bg.as_deref());
+            }
+        }
         self.take_bg();
         if self
             .ok_down
@@ -986,6 +1251,14 @@ impl App {
         let top = self.top();
         if let Some(tv) = &mut self.tv {
             anim |= tv.page.animate(dt);
+        }
+        let active = !top && matches!(self.mode, Mode::Browse);
+        for (id, p) in self.libs.iter_mut().flat_map(|l| &mut l.pages) {
+            if *id == self.tab {
+                anim |= p.animate(dt, active);
+            } else {
+                p.sleep();
+            }
         }
         for (r, row) in self.rows.iter_mut().enumerate() {
             anim |= ease(&mut row.scroll, row.col as f32 * (card_size(r).0 + GAP), dt, 12.0);
@@ -1021,7 +1294,7 @@ impl App {
             b: self.glow[2] as u8,
             a: 255,
         };
-        if self.on_tv {
+        if self.on_tv() {
             return self.draw_tv();
         }
         g.tint(&g.soft, glow, 0.45);
@@ -1082,12 +1355,12 @@ impl App {
                 h: H,
             },
         );
-        g.tint(&g.vgrad, BG, 0.6);
+        g.tint(&g.vgrad, BG, 0.85);
         let top = FRect {
             x: 0.0,
             y: 0.0,
             w: W,
-            h: 180.0,
+            h: 280.0,
         };
         unsafe {
             SDL_RenderCopyExF(
@@ -1100,6 +1373,12 @@ impl App {
                 FLIP_VERTICAL,
             )
         };
+
+        if let Some(p) = self.libs.iter_mut().find_map(|l| l.pages.get_mut(&self.tab)) {
+            p.draw(g);
+            self.draw_top();
+            return self.draw_dialog();
+        }
 
         let featured = self.featured(focus).cloned();
         if let Some(b) = featured {
@@ -1224,8 +1503,11 @@ impl App {
 
     /// The clock, the cog and, once live TV is set up, the Home and TV tabs.
     fn draw_top(&mut self) {
-        if self.tv.is_some() && self.tab_tex[0].is_none() {
-            self.tab_tex = [self.g.text(self.g.f_row, "Home", 0), self.g.text(self.g.f_row, "TV", 0)];
+        let tabs = self.tabs();
+        for (_, name) in &tabs {
+            if !self.tab_tex.contains_key(name) {
+                self.tab_tex.insert(name.clone(), self.g.text(self.g.f_row, name, 0));
+            }
         }
         let g = &self.g;
         let (hour, min) = local_time();
@@ -1255,17 +1537,14 @@ impl App {
             },
         );
 
-        if self.tv.is_none() {
+        if tabs.len() < 2 {
             return;
         }
-        let widths: Vec<f32> = self
-            .tab_tex
-            .iter()
-            .map(|t| t.as_ref().map_or(0.0, |t| t.w as f32) + 64.0)
-            .collect();
+        let texs: Vec<Option<&Tex>> = tabs.iter().map(|(_, n)| self.tab_tex[n].as_ref()).collect();
+        let widths: Vec<f32> = texs.iter().map(|t| t.map_or(0.0, |t| t.w as f32) + 64.0).collect();
         let mut x = (W - widths.iter().sum::<f32>() - 16.0) / 2.0;
-        for (i, t) in self.tab_tex.iter().enumerate() {
-            let current = usize::from(self.on_tv) == i;
+        for (i, t) in texs.into_iter().enumerate() {
+            let current = tabs[i].0 == self.tab;
             let th = t.as_ref().map_or(0.0, |t| t.h as f32);
             let colour = if current && self.tabs_f {
                 g.rounded(x, cy - 32.0, widths[i], 64.0, 32.0, WHITE, 1.0);
@@ -1276,7 +1555,7 @@ impl App {
             } else {
                 DIM
             };
-            g.put(t.as_ref(), x + 32.0, cy - th / 2.0, colour, 1.0);
+            g.put(t, x + 32.0, cy - th / 2.0, colour, 1.0);
             x += widths[i] + 16.0;
         }
     }
@@ -1287,8 +1566,13 @@ impl App {
         if let Some(tv) = &mut self.tv {
             tv.page.draw(&self.g, &tv.list, &tv.guide, active);
         }
+        self.g.put(self.tv_note.as_ref(), MARGIN, H - 80.0, YELLOW, 1.0);
+        self.draw_dialog();
+    }
+
+    /// The menu, settings, prompt or sign-in over a tab other than Home.
+    fn draw_dialog(&self) {
         let g = &self.g;
-        g.put(self.tv_note.as_ref(), MARGIN, H - 80.0, YELLOW, 1.0);
         match &self.mode {
             Mode::Menu(m) => draw_menu(g, m),
             Mode::Settings(p) => p.draw(g),
@@ -1328,21 +1612,21 @@ impl App {
     }
 
     fn focus_top(&mut self) {
-        if self.tv.is_some() {
+        if self.tabs().len() > 1 {
             self.tabs_f = true;
         } else {
             self.cog = true;
         }
     }
 
-    /// The keys while the focus is on the top bar: Left and Right go between Home, TV and the cog.
+    /// The keys while the focus is on the top bar: Left and Right go through the tabs and on to the cog.
     fn top_key(&mut self, dx: i32, dy: i32, ok: bool) {
         if self.cog {
             if ok {
                 self.open_settings();
             } else if dy > 0 {
                 self.cog = false;
-            } else if dx < 0 && self.tv.is_some() {
+            } else if dx < 0 && self.tabs().len() > 1 {
                 self.cog = false;
                 self.tabs_f = true;
             }
@@ -1352,12 +1636,16 @@ impl App {
             self.tabs_f = false;
             return;
         }
-        let to = i32::from(self.on_tv) + dx;
-        if to > 1 {
+        let tabs = self.tabs();
+        let to = tabs.iter().position(|(k, _)| *k == self.tab).unwrap_or(0) as i32 + dx;
+        if to >= tabs.len() as i32 {
             self.tabs_f = false;
             self.cog = true;
         } else if to >= 0 {
-            self.on_tv = to == 1;
+            self.tab = tabs[to as usize].0.clone();
+            if let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) {
+                let _ = lib.refresh.send(false);
+            }
         }
     }
 
@@ -1386,7 +1674,16 @@ impl App {
     }
 
     fn open_menu(&mut self) {
-        if self.on_tv {
+        if let Some(t) = self.lib_page().and_then(library::Page::title) {
+            let name = t.name.clone();
+            let sort = if self.prefs.lib_sort == "added" {
+                (Opt::LibSort("name"), "Sort by name".to_string())
+            } else {
+                (Opt::LibSort("added"), "Sort by date added".to_string())
+            };
+            return self.show_menu(&name, vec![sort, (Opt::RefreshLib, "Refresh the libraries".into())], 0);
+        }
+        if self.on_tv() {
             let Some(tv) = &self.tv else { return };
             let Some(i) = tv.page.channel() else { return };
             let (name, key) = (tv.list[i].name.clone(), tv.list[i].key());
@@ -1430,6 +1727,25 @@ impl App {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
             return self.show_settings();
         }
+        if let Act::Watching(r) = act {
+            let key = if r == PLEX { "plex" } else { "jellyfin" };
+            let off = &mut self.prefs.rows_off;
+            match off.iter().position(|k| k == key) {
+                Some(i) => drop(off.remove(i)),
+                None => off.push(key.into()),
+            }
+            self.prefs.save();
+            let root = self.luna.root.clone();
+            if r == PLEX {
+                self.apply_plex(plex::cached(&root));
+            } else {
+                self.apply_watching(jellyfin::cached(&root));
+            }
+            if !self.rows[r].items.is_empty() && self.rows[..r].iter().all(|row| row.items.is_empty()) {
+                (self.cur_row, self.rows[r].col) = (r, 0);
+            }
+            return self.show_settings();
+        }
         if let Act::Debloat(group) = act {
             let on = &mut self.prefs.debloat;
             match on.iter().position(|g| g == group) {
@@ -1439,6 +1755,23 @@ impl App {
             self.prefs.save();
             apply_debloat(&self.luna.root);
             return self.show_settings();
+        }
+        if let Act::Tab(i) = act {
+            let tabs = self.all_tabs();
+            let Some((key, name, on)) = tabs.get(i).cloned() else {
+                return;
+            };
+            let mut list = vec![
+                (Opt::TabShow(key.clone()), if on { "Hide" } else { "Show" }.to_string()),
+                (Opt::TabRename(key.clone()), "Rename".into()),
+            ];
+            if i > 0 {
+                list.push((Opt::TabMove(key.clone(), -1), "Move left".into()));
+            }
+            if i + 1 < tabs.len() {
+                list.push((Opt::TabMove(key, 1), "Move right".into()));
+            }
+            return self.show_menu(&name, list, 0);
         }
         if act == Act::TvSource {
             let mut list = vec![
@@ -1627,6 +1960,54 @@ impl App {
                 self.prefs.save();
                 return self.rebuild_tv();
             }
+            Opt::LibSort(by) => {
+                self.prefs.lib_sort = by.to_string();
+                self.prefs.save();
+                let root = self.luna.root.clone();
+                let views: Vec<(usize, String, &str)> = (self.libs.iter().enumerate())
+                    .flat_map(|(i, l)| {
+                        let pre = if l.plex { library::PLEX } else { library::JELLYFIN };
+                        l.views.iter().map(move |v| (i, v.id.clone(), pre))
+                    })
+                    .collect();
+                for (i, v, pre) in views {
+                    self.set_titles(i, &v, library::cached_titles(&root, pre, &v), None);
+                }
+                return;
+            }
+            Opt::RefreshLib => {
+                for lib in &self.libs {
+                    let _ = lib.refresh.send(true);
+                }
+                return;
+            }
+            Opt::TabShow(k) => {
+                let off = &mut self.prefs.tabs_off;
+                match off.iter().position(|t| t == k) {
+                    Some(i) => drop(off.remove(i)),
+                    None => off.push(k.clone()),
+                }
+                self.prefs.save();
+                return;
+            }
+            Opt::TabRename(k) => {
+                let own = self.libs.iter().flat_map(|l| &l.views).find(|v| v.id == *k);
+                let own = own.map_or("Live TV", |v| v.name.as_str()).to_string();
+                let now = self.prefs.tab_names.get(k).cloned().unwrap_or_default();
+                let body = format!("Leave it empty for the library's own name, {own}.");
+                return self.ask(Ask::TabName(k.clone()), "Rename tab", &body, &own, &now);
+            }
+            Opt::TabMove(k, d) => {
+                let mut keys: Vec<String> = self.all_tabs().into_iter().map(|t| t.0).collect();
+                if let Some(i) = keys.iter().position(|t| t == k) {
+                    let j = (i as i32 + d).clamp(0, keys.len() as i32 - 1) as usize;
+                    keys.swap(i, j);
+                    self.last_settings.1 = j;
+                }
+                self.prefs.tabs = keys;
+                self.prefs.save();
+                return;
+            }
             Opt::TvDetails => {
                 if let Some(tv) = &mut self.tv {
                     tv.page.open_details(&tv.list, &tv.guide);
@@ -1708,6 +2089,13 @@ impl App {
                 None,
             ),
             Ask::Guide => self.set_tv(None, Some((!text.is_empty()).then(|| url(&text)))),
+            Ask::TabName(k) => {
+                match text.is_empty() {
+                    true => drop(self.prefs.tab_names.remove(&k)),
+                    false => drop(self.prefs.tab_names.insert(k, text)),
+                }
+                self.prefs.save();
+            }
             _ => {}
         }
         self.close_dialog();
@@ -1799,7 +2187,7 @@ impl App {
         }
         match &mut self.mode {
             Mode::Browse => {
-                let details = self.tv.as_ref().is_some_and(|t| self.on_tv && t.page.details);
+                let details = self.tv.as_ref().is_some_and(|t| self.on_tv() && t.page.details);
                 // The programme details: Back closes them, OK (below) watches the channel.
                 if details && (back || options || dx != 0 || dy != 0) {
                     if let (true, Some(tv)) = (back, &mut self.tv) {
@@ -1807,15 +2195,24 @@ impl App {
                     }
                     return true;
                 }
-                if back && self.on_tv && !self.top() {
+                // Back goes to the start of a tab, then to Home.
+                if back && self.on_tv() && !self.top() {
                     if let Some(tv) = &mut self.tv {
                         if tv.page.rewind(&tv.list, &tv.guide) {
                             return true;
                         }
                     }
                 }
-                if back && self.on_tv {
-                    self.on_tv = false;
+                if back && !self.top() {
+                    let tab = self.tab.clone();
+                    if let Some(p) = self.libs.iter_mut().find_map(|l| l.pages.get_mut(&tab)) {
+                        if p.rewind() {
+                            return true;
+                        }
+                    }
+                }
+                if back && !self.tab.is_empty() {
+                    self.tab.clear();
                     self.tabs_f = false;
                     return true;
                 }
@@ -1825,8 +2222,10 @@ impl App {
                 }
                 if self.top() {
                     self.top_key(dx, dy, ok);
-                } else if self.on_tv {
+                } else if self.on_tv() {
                     self.tv_key(dx, dy, ok, options);
+                } else if !self.tab.is_empty() {
+                    self.lib_key(dx, dy, ok, options);
                 } else if options {
                     self.open_menu();
                 } else if ok {
@@ -1898,6 +2297,22 @@ impl App {
         }
     }
 
+    /// The keys on a library tab. OK waits for its release: a tap opens the title, a hold opens the options.
+    fn lib_key(&mut self, dx: i32, dy: i32, ok: bool, options: bool) {
+        let Some(p) = self.lib_page_mut() else {
+            return;
+        };
+        if options {
+            self.open_menu();
+        } else if ok {
+            if p.title().is_some() {
+                self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
+            }
+        } else if p.key(dx, dy) {
+            self.tabs_f = true;
+        }
+    }
+
     /// For testing without the remote: plays what `player::TRIGGER` names, a channel number or a stream address.
     pub fn play_file(&mut self) {
         let Ok(what) = std::fs::read_to_string(crate::player::TRIGGER) else {
@@ -1906,7 +2321,7 @@ impl App {
         let _ = std::fs::remove_file(crate::player::TRIGGER);
         let what = what.trim();
         if let Ok(n) = what.parse::<usize>() {
-            self.on_tv = true;
+            self.tab = "tv".into();
             if let Some(tv) = &mut self.tv {
                 while tv.list.is_empty() {
                     match tv.res.recv_timeout(std::time::Duration::from_secs(30)) {
@@ -1959,7 +2374,13 @@ impl App {
 
     /// OK was released: a tap on an app launches it (a hold already opened its options).
     fn ok_up(&mut self) {
-        if self.on_tv {
+        if !self.tab.is_empty() && !self.on_tv() {
+            if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
+                self.open_title();
+            }
+            return;
+        }
+        if self.on_tv() {
             if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
                 let out = self.tv.as_mut().map(|t| t.page.tap(&t.list, &t.guide));
                 if let Some(tv::Out::Ok(i)) = out {
@@ -1986,7 +2407,7 @@ impl App {
         self.ok_down = None;
         self.cog = false;
         self.tabs_f = false;
-        self.on_tv = false;
+        self.tab.clear();
         self.refresh_tv(false);
         self.load();
         for r in &mut self.rows {
