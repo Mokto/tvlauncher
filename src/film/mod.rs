@@ -4,6 +4,7 @@
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+pub mod extras;
 pub mod jellyfin;
 pub mod pick;
 pub mod plex;
@@ -63,6 +64,11 @@ pub struct Item {
     /// The tracks the server would start with.
     pub default_audio: Option<i64>,
     pub default_sub: Option<i64>,
+    pub chapters: Vec<extras::Chapter>,
+    /// What the viewer may skip: an intro, a recap, the credits.
+    pub segments: Vec<extras::Segment>,
+    /// The pictures shown while seeking, when the server made them.
+    pub trick: Option<extras::Trick>,
     pub id: String,
     /// The series an episode belongs to, to find the next one.
     pub series: Option<String>,

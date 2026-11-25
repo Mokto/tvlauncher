@@ -2,13 +2,19 @@
 //! subtitles (text, and the bitmaps of PGS and DVD tracks).
 use super::super::*;
 use crate::ff::demux::{Bitmap, SubEv, SubWhat};
+use crate::film::extras::{chapter_at, Chapter, SegKind};
 use crate::film::{self, Item, TICKS};
 use crate::subs::Cue;
 use std::ffi::c_int;
 
 pub enum Fk {
     Back,
+    /// OK: pauses, or skips what the button on screen offers.
     Toggle,
+    /// The remote's Play and Pause keys: always pause.
+    Pause,
+    /// The next (1) or the previous (-1) chapter.
+    Chapter(i32),
     Seek(i64),
     Up,
     Down,
@@ -36,7 +42,11 @@ pub fn fkey() -> Option<Fk> {
         }
         match (sym, wcode) {
             // 415 and 19 are the remote's Play and Pause
-            (K_RETURN | K_KP_ENTER, _) | (_, 415 | 19) => return Some(Fk::Toggle),
+            (K_RETURN | K_KP_ENTER, _) => return Some(Fk::Toggle),
+            (_, 415 | 19) => return Some(Fk::Pause),
+            // 427 and 428 are the remote's channel up and down
+            (K_PAGEDOWN, _) | (_, 427) => return Some(Fk::Chapter(1)),
+            (K_PAGEUP, _) | (_, 428) => return Some(Fk::Chapter(-1)),
             (K_LEFT, _) => return Some(Fk::Seek(-10)),
             (K_RIGHT, _) => return Some(Fk::Seek(10)),
             (_, 412) => return Some(Fk::Seek(-30)),
@@ -51,6 +61,14 @@ pub fn fkey() -> Option<Fk> {
 
 // ---- the bar ------------------------------------------------------------------------------------------------------
 
+/// Where the bar is on screen: its left edge, width and the top of its panel, and how far along it is (0 to 1).
+pub struct Bar {
+    x: f32,
+    w: f32,
+    top: f32,
+    frac: f32,
+}
+
 /// The title, the bar and the times, at the bottom of the picture for a few seconds, and while paused.
 pub struct Osd {
     name: Option<Tex>,
@@ -60,6 +78,10 @@ pub struct Osd {
     total_s: i64,
     at: (String, Option<Tex>),
     status: Option<Tex>,
+    chapters: Vec<Chapter>,
+    /// The chapter whose name is drawn, and the name.
+    chapter: (Option<usize>, Option<Tex>),
+    skip: Option<(SegKind, Tex)>,
     /// A status that goes by itself (a failed subtitle download), unlike an error that stays until Back.
     status_until: Option<Instant>,
     until: Instant,
@@ -76,6 +98,9 @@ impl Osd {
             total_s,
             at: (String::new(), None),
             status: None,
+            chapters: it.chapters.clone(),
+            chapter: (None, None),
+            skip: None,
             status_until: None,
             until: Instant::now() + Duration::from_secs(6),
         }
@@ -96,13 +121,13 @@ impl Osd {
         self.status_until = Some(Instant::now() + Duration::from_secs(3));
     }
 
-    /// Whether anything was drawn.
-    fn draw(&mut self, g: &Gfx, pos_s: i64, paused: bool, seeking: Option<i64>) -> bool {
+    /// Where the bar is, when it was drawn.
+    fn draw(&mut self, g: &Gfx, pos_s: i64, paused: bool, seeking: Option<i64>) -> Option<Bar> {
         if self.status_until.is_some_and(|t| Instant::now() > t) {
             (self.status, self.status_until) = (None, None);
         }
         if !(paused || seeking.is_some() || self.status.is_some() || Instant::now() < self.until) {
-            return false;
+            return None;
         }
         let shown = seeking.unwrap_or(pos_s);
         let label = film::clock(shown);
@@ -114,28 +139,69 @@ impl Osd {
         g.rounded(x, y, w, h, 28.0, PANEL, 0.94);
         g.put(self.name.as_ref(), x + 48.0, y + 28.0, TEXT, 1.0);
         g.put(self.sub.as_ref(), x + 48.0, y + 82.0, DIM, 1.0);
-        if let Some(s) = &self.status {
-            g.put(Some(s), x + 48.0, y + 132.0, DIM, 1.0);
-            return true;
-        }
-        if let Some(p) = self.paused.as_ref().filter(|_| paused) {
-            g.put(Some(p), x + w - 48.0 - p.w as f32, y + 34.0, TEXT, 1.0);
-        }
         let (bx, bw, by) = (x + 48.0, w - 96.0, y + h - 72.0);
-        g.rounded(bx, by, bw, 8.0, 4.0, BLACK, 0.5);
-        let f = if self.total_s > 0 {
+        let frac = if self.total_s > 0 {
             (shown as f32 / self.total_s as f32).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        if bw * f >= 8.0 {
-            g.rounded(bx, by, bw * f, 8.0, 4.0, TEXT, 1.0);
+        let bar = Some(Bar {
+            x: bx,
+            w: bw,
+            top: y,
+            frac,
+        });
+        if let Some(s) = &self.status {
+            g.put(Some(s), x + 48.0, y + 132.0, DIM, 1.0);
+            return bar;
+        }
+        if let Some(p) = self.paused.as_ref().filter(|_| paused) {
+            g.put(Some(p), x + w - 48.0 - p.w as f32, y + 34.0, TEXT, 1.0);
+        }
+        g.rounded(bx, by, bw, 8.0, 4.0, BLACK, 0.5);
+        if bw * frac >= 8.0 {
+            g.rounded(bx, by, bw * frac, 8.0, 4.0, TEXT, 1.0);
+        }
+        if self.total_s > 0 {
+            for c in self.chapters.iter().filter(|c| c.start > 0) {
+                let f = (c.start / TICKS) as f32 / self.total_s as f32;
+                g.rounded(bx + bw * f - 2.0, by - 6.0, 4.0, 20.0, 2.0, DIM, 1.0);
+            }
         }
         g.put(self.at.1.as_ref(), bx, by + 22.0, TEXT, 1.0);
+        let now = chapter_at(&self.chapters, shown * TICKS);
+        if self.chapter.0 != now {
+            let name = now.map(|i| crate::jellyfin::clip(&self.chapters[i].name, 60));
+            self.chapter = (now, name.and_then(|n| g.text(g.f_sub, &n, 0)));
+        }
+        if let Some(n) = &self.chapter.1 {
+            let at_w = self.at.1.as_ref().map_or(0, |t| t.w) as f32;
+            g.put(Some(n), bx + at_w + 40.0, by + 22.0, DIM, 1.0);
+        }
         if let Some(t) = &self.total {
             g.put(Some(t), bx + bw - t.w as f32, by + 22.0, DIM, 1.0);
         }
-        true
+        bar
+    }
+
+    /// The button that offers to skip what is on screen, above the bar when it is up.
+    fn draw_skip(&mut self, g: &Gfx, kind: SegKind, bar: Option<&Bar>) {
+        if self.skip.as_ref().is_none_or(|s| s.0 != kind) {
+            self.skip = g
+                .text(g.f_label, &format!("{}   OK", kind.label()), 0)
+                .map(|t| (kind, t));
+        }
+        let Some((_, t)) = &self.skip else { return };
+        let (w, h) = (t.w as f32 + 72.0, 84.0);
+        let y = bar.map_or(H - 64.0 - h - 24.0, |b| b.top - h - 24.0);
+        g.rounded(W - MARGIN - w, y, w, h, 22.0, TEXT, 1.0);
+        g.put(
+            Some(t),
+            W - MARGIN - w + 36.0,
+            y + (h - t.h as f32) / 2.0,
+            rgb(20, 22, 25),
+            1.0,
+        );
     }
 }
 
@@ -427,6 +493,8 @@ pub enum Pick {
     Head,
     Sub(Option<SubSel>),
     Audio(i64),
+    /// A chapter's start, in ticks.
+    Chapter(i64),
 }
 
 /// Subtitles and audio tracks to choose from, with Down.
@@ -437,7 +505,7 @@ pub struct Menu {
 
 impl Menu {
     /// None when there is nothing to choose: no subtitles and at most one audio track.
-    pub fn new(g: &Gfx, t: &Tracks, c: &Choice) -> Option<Menu> {
+    pub fn new(g: &Gfx, t: &Tracks, c: &Choice, chapters: &[Chapter], pos: i64) -> Option<Menu> {
         let mut rows = vec![];
         let mut row = |name: &str, pick, current| {
             rows.push((g.text(g.f_sub, &crate::jellyfin::clip(name, 46), 0), pick, current))
@@ -461,6 +529,14 @@ impl Menu {
                     Pick::Audio(a.index),
                     c.audio == Some(a.index) || (c.audio.is_none() && n == 0),
                 );
+            }
+        }
+        if !chapters.is_empty() {
+            row("Chapters", Pick::Head, false);
+            let now = chapter_at(chapters, pos);
+            for (n, ch) in chapters.iter().enumerate() {
+                let name = format!("{}   {}", film::clock(ch.start / TICKS), ch.name);
+                row(&name, Pick::Chapter(ch.start), now == Some(n));
             }
         }
         let sel = rows.iter().position(|r| r.2 && !matches!(r.1, Pick::Head))?;
@@ -515,6 +591,9 @@ impl Menu {
 pub struct Over<'a> {
     pub shown: Option<&'a Shown>,
     pub menu: Option<&'a Menu>,
+    /// What the skip button offers now, and the picture to show above the bar while seeking.
+    pub skip: Option<SegKind>,
+    pub thumb: Option<&'a Tex>,
 }
 
 /// A transparent frame, so the video plane shows, with the subtitle, the controls and the track menu over it.
@@ -529,8 +608,20 @@ pub fn vframe(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<
 
 fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i64>, over: Over) {
     // The subtitle stands above the controls when they are up.
-    let bar = osd.draw(g, pos_s, paused, seeking);
-    if let Some(s) = over.shown {
+    let geom = osd.draw(g, pos_s, paused, seeking);
+    let bar = geom.is_some();
+    if let (Some(t), Some(b), true) = (over.thumb, &geom, seeking.is_some()) {
+        let w = 420.0;
+        let h = w * t.h as f32 / t.w.max(1) as f32;
+        let x = (b.x + b.w * b.frac - w / 2.0).clamp(MARGIN, W - MARGIN - w);
+        let y = b.top - h - 28.0;
+        g.rounded(x - 6.0, y - 6.0, w + 12.0, h + 12.0, 14.0, TEXT, 1.0);
+        g.copy(t, None, FRect { x, y, w, h });
+    }
+    if let (Some(kind), None) = (over.skip, over.menu) {
+        osd.draw_skip(g, kind, geom.as_ref());
+    }
+    if let Some(s) = over.shown.filter(|_| seeking.is_none()) {
         for (t, dst) in &s.images {
             g.tint(t, rgb(255, 255, 255), 1.0);
             g.copy(t, None, *dst);
@@ -564,6 +655,20 @@ pub fn shot(g: &Gfx, menu: bool) {
         subs: vec![],
         default_audio: None,
         default_sub: None,
+        chapters: [
+            (0, "Opening"),
+            (610, "The harbour"),
+            (1750, "Chapter 3"),
+            (3300, "Low tide"),
+        ]
+        .iter()
+        .map(|(s, n)| Chapter {
+            start: s * TICKS,
+            name: n.to_string(),
+        })
+        .collect(),
+        segments: vec![],
+        trick: None,
         id: "m1".into(),
         series: None,
         source: "s".into(),
@@ -606,7 +711,9 @@ pub fn shot(g: &Gfx, menu: bool) {
         }),
         ..Choice::default()
     };
-    let menu = menu.then(|| Menu::new(g, &tracks, &choice)).flatten();
+    let menu = menu
+        .then(|| Menu::new(g, &tracks, &choice, &it.chapters, 1234 * TICKS))
+        .flatten();
     let mut events = Events::default();
     events.insert(SubEv {
         start_ns: 0,
@@ -628,11 +735,25 @@ pub fn shot(g: &Gfx, menu: bool) {
             h: H,
         },
     );
+    let (w, h) = (320, 180);
+    let px: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
+        .collect();
+    let thumb = Tex::rgba(g.ren, w, h, &px);
     let over = Over {
         shown: Some(&shown),
         menu: menu.as_ref(),
+        skip: menu.is_none().then_some(SegKind::Intro),
+        thumb: thumb.as_ref(),
     };
-    draw_over(g, &mut osd, 1234, true, None, over);
+    draw_over(
+        g,
+        &mut osd,
+        1234,
+        true,
+        (thumb.is_some() && menu.is_none()).then_some(2410),
+        over,
+    );
 }
 
 #[cfg(test)]

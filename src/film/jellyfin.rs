@@ -45,7 +45,15 @@ pub fn resolve(cfg: &Config, id: &str) -> Result<Item, Why> {
     } else {
         json_of(cfg, &format!("/Users/{user}/Items/{target}"))?
     };
-    item_from(cfg, &o).ok_or_else(|| Why::Failed("The server sent no video for this title.".into()))
+    let mut it = item_from(cfg, &o).ok_or_else(|| Why::Failed("The server sent no video for this title.".into()))?;
+    // Jellyfin 10.10 and later; an older server answers 404 and the film has nothing to skip.
+    it.segments = cfg
+        .get_within(&format!("/MediaSegments/{}", it.id), 4)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .map(|v| extras::jellyfin_segments(&v))
+        .unwrap_or_default();
+    Ok(it)
 }
 
 pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
@@ -88,6 +96,9 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
         subs: tracks("Subtitle", true),
         default_audio: default("DefaultAudioStreamIndex"),
         default_sub: default("DefaultSubtitleStreamIndex"),
+        chapters: extras::jellyfin_chapters(o),
+        segments: vec![],
+        trick: extras::jellyfin_trick(cfg, o, &id, &source),
         direct: format!(
             "{}/Videos/{id}/stream?static=true&MediaSourceId={source}&DeviceId={DEVICE}&api_key={}",
             cfg.server, cfg.token

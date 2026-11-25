@@ -16,6 +16,7 @@ mkdir -p "$D/root" build/fake-sf
     -f lavfi -i sine=frequency=880:sample_rate=48000 -i "$D/s.srt" -t 30 -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 48 \
     -c:a:0 ac3 -c:a:1 flac -ac:a:1 2 -map 0:v -map 1:a -map 2:a -map 3 -c:s srt -metadata:s:a:0 language=eng -metadata:s:a:1 language=fre -metadata:s:s:0 language=fre "$D/film.mkv"
 }
+[ -f "$D/tile.jpg" ] || ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=320x180:rate=1 -t 30 -vf tile=10x3 -frames:v 1 "$D/tile.jpg"
 clang -dynamiclib -o build/fake-sf/libplayerAPIs.so.1 tools/fake-starfish.c
 cargo build --release
 R=$D/root
@@ -31,4 +32,4 @@ sleep 1
 FILM_KEYS="${1:-6:esc}" DYLD_INSERT_LIBRARIES=build/fake-sf/libplayerAPIs.so.1 DYLD_LIBRARY_PATH=build/fake-sf \
   LAUNCHER_ROOT="$R" target/release/tvlauncher --film-sim m1
 echo "--- what the server heard:"
-grep -E "REPORT|RANGE" "$D/server.log" | cut -c1-160
+grep -E "REPORT|RANGE|TILE" "$D/server.log" | cut -c1-160

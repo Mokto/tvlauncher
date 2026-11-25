@@ -128,6 +128,8 @@ pub const K_KP_ENTER: i32 = 0x4000_0058;
 pub const K_RIGHT: i32 = 0x4000_004f;
 pub const K_LEFT: i32 = 0x4000_0050;
 pub const K_DOWN: i32 = 0x4000_0051;
+pub const K_PAGEUP: i32 = 0x4000_004B;
+pub const K_PAGEDOWN: i32 = 0x4000_004E;
 pub const K_UP: i32 = 0x4000_0052;
 
 pub type LogFn = extern "C" fn(*mut c_void, c_int, c_int, *const c_char);

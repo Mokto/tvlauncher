@@ -6,7 +6,10 @@ use serde_json::Value;
 
 fn meta(conn: &Conn, key: &str) -> Result<Value, Why> {
     let v = conn
-        .get_json(&format!("/library/metadata/{key}"), 15)
+        .get_json(
+            &format!("/library/metadata/{key}?includeChapters=1&includeMarkers=1"),
+            15,
+        )
         .map_err(Why::Failed)?;
     Ok(v["MediaContainer"]["Metadata"][0].clone())
 }
@@ -113,6 +116,9 @@ pub fn item_from(conn: &Conn, o: &Value) -> Option<Item> {
         subs,
         default_audio,
         default_sub,
+        chapters: extras::plex_chapters(o),
+        segments: extras::plex_segments(o),
+        trick: extras::plex_trick(conn, o, part),
         direct: conn.url(part["key"].as_str()?),
         source: part["id"].as_i64().map(|i| i.to_string()).unwrap_or_default(),
         name: o["title"].as_str().unwrap_or("Video").to_string(),
