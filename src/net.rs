@@ -157,6 +157,63 @@ pub fn curl_stream(url: &str) -> std::io::Result<std::process::Child> {
     Ok(child)
 }
 
+/// A `curl` writing the bytes of `url` from `from` on to its stdout (a ranged GET, for a film file that is read
+/// at the place the player asks for).
+pub fn curl_from(url: &str, from: i64) -> std::io::Result<std::process::Child> {
+    let mut child = Command::new(curl_bin())
+        .args(["-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let c = format!(
+            "url = {}\nsilent\nfail\nlocation\nconnect-timeout = 10\nuser-agent = {}\nrange = \"{from}-\"\n",
+            quote(url),
+            quote(BROWSER_UA)
+        );
+        stdin.write_all(c.as_bytes())?;
+    }
+    Ok(child)
+}
+
+/// The size of the file at `url` in bytes, from the `Content-Range` of a one-byte ranged GET. Err when the server
+/// does not do ranges: such a file cannot be played from the middle.
+pub fn file_size(url: &str) -> Result<i64, String> {
+    let mut child = Command::new(curl_bin())
+        .args(["-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("curl: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let c = format!(
+            "url = {}\nsilent\nlocation\nconnect-timeout = 10\nmax-time = 20\nuser-agent = {}\nrange = \"0-0\"\noutput = \"/dev/null\"\ndump-header = \"-\"\n",
+            quote(url),
+            quote(BROWSER_UA)
+        );
+        let _ = stdin.write_all(c.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    parse_size(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The total after the slash of the last `Content-Range: bytes 0-0/<total>` header.
+fn parse_size(headers: &str) -> Result<i64, String> {
+    headers
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-range").then_some(v)
+        })
+        .next_back()
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|n| n.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| "the server does not serve byte ranges".to_string())
+}
+
 /// A GET, or a POST of a JSON body, with `headers`, that gives up after `timeout` seconds.
 pub fn send(url: &str, post: Option<&str>, headers: &[(&str, String)], timeout: u64) -> Result<Reply, String> {
     if url.starts_with("https://") {
@@ -187,6 +244,13 @@ pub fn send(url: &str, post: Option<&str>, headers: &[(&str, String)], timeout: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn size_comes_from_the_last_content_range() {
+        let h = "HTTP/1.1 302 Found\r\nLocation: /x\r\n\r\nHTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/9876543210\r\n\r\n";
+        assert_eq!(super::parse_size(h), Ok(9_876_543_210));
+        assert!(super::parse_size("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").is_err());
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

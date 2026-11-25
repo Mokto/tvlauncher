@@ -7,6 +7,7 @@ mod app;
 #[cfg(target_arch = "arm")]
 mod compat;
 mod data;
+mod ff;
 mod film;
 mod gfx;
 mod hls;
@@ -62,6 +63,11 @@ fn main() -> ExitCode {
     let on_tv = root.is_empty();
     if !on_tv && args.len() > 2 && args[1] == "--play" {
         return player::probe(&args[2]);
+    }
+    if args.get(1).is_some_and(|a| a == "--direct") && args.len() > 2 {
+        let n = |i: usize| args.get(i).and_then(|s| s.parse::<i64>().ok());
+        ff::demux::probe_cli(&args[2], n(3).unwrap_or(0), n(4), n(5));
+        return ExitCode::SUCCESS;
     }
     let child = on_tv && args.len() > 2 && matches!(args[1].as_str(), "--player" | "--film");
     if child {

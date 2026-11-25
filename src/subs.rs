@@ -54,11 +54,40 @@ pub fn parse_srt(text: &str) -> Vec<Cue> {
     cues
 }
 
-/// The index of the cue to show at `ms`.
-pub fn at(cues: &[Cue], ms: i64) -> Option<usize> {
-    let after = cues.partition_point(|c| c.start_ms <= ms);
-    // A long cue can still run while a later one has started: look back a few.
-    (after.saturating_sub(4)..after).rev().find(|&i| cues[i].end_ms > ms)
+/// `0:01:02.50` in milliseconds.
+fn ass_stamp(s: &str) -> Option<i64> {
+    let mut p = s.trim().split([':', '.']);
+    let mut n = || p.next()?.trim().parse::<i64>().ok();
+    let (h, m, sec, cs) = (n()?, n()?, n()?, n()?);
+    Some(((h * 60 + m) * 60 + sec) * 1000 + cs * 10)
+}
+
+/// The dialogue of an ASS or SSA file as plain cues: the `Format:` line of `[Events]` says where start, end and text
+/// are; override blocks and line breaks are cleaned as in `ff::demux::plain_text`.
+pub fn parse_ass(text: &str) -> Vec<Cue> {
+    let mut cols: Vec<String> = vec![];
+    let mut cues: Vec<Cue> = vec![];
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(f) = line.strip_prefix("Format:") {
+            cols = f.split(',').map(|c| c.trim().to_ascii_lowercase()).collect();
+        } else if let Some(d) = line.strip_prefix("Dialogue:") {
+            let pos = |n: &str| cols.iter().position(|c| c == n);
+            let (Some(s), Some(e), Some(t)) = (pos("start"), pos("end"), pos("text")) else {
+                continue;
+            };
+            let f: Vec<&str> = d.trim_start().splitn(cols.len(), ',').collect();
+            let (Some(a), Some(b), Some(body)) = (f.get(s), f.get(e), f.get(t)) else {
+                continue;
+            };
+            let (text, _) = crate::ff::demux::plain_text(body, false);
+            if let (Some(start_ms), Some(end_ms), false) = (ass_stamp(a), ass_stamp(b), text.is_empty()) {
+                cues.push(Cue { start_ms, end_ms, text });
+            }
+        }
+    }
+    cues.sort_by_key(|c| c.start_ms);
+    cues
 }
 
 #[cfg(test)]
@@ -88,19 +117,18 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_cue_for_a_time() {
-        let cues = parse_srt(SRT);
-        assert_eq!(at(&cues, 500), None);
-        assert_eq!(at(&cues, 1000), Some(0));
-        assert_eq!(at(&cues, 3499), Some(0));
-        assert_eq!(at(&cues, 3500), None, "a cue ends at its end time");
-        assert_eq!(at(&cues, 63_000), Some(1));
-        assert_eq!(at(&cues, 999_000), None);
-    }
-
-    #[test]
-    fn a_long_cue_survives_a_short_one_inside_it() {
-        let cues = parse_srt("1\n00:00:01,000 --> 00:00:20,000\nlong\n\n2\n00:00:02,000 --> 00:00:03,000\nshort\n");
-        assert_eq!(at(&cues, 10_000), Some(0));
+    fn ass_dialogue_becomes_cues() {
+        let ass = "[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                   Dialogue: 0,0:00:03.00,0:00:06.50,Default,,0,0,0,,{\\b1}Styled{\\b0}, text\\Nsecond\n\
+                   Comment: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,ignored\n";
+        let cues = parse_ass(ass);
+        assert_eq!(
+            cues,
+            [Cue {
+                start_ms: 3000,
+                end_ms: 6500,
+                text: "Styled, text\nsecond".into()
+            }]
+        );
     }
 }

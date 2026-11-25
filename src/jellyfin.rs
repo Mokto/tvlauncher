@@ -23,7 +23,7 @@ const MAX_ITEMS: usize = 15;
 const FIELDS: &str = "Overview,ParentBackdropItemId,ParentBackdropImageTags,ParentThumbItemId,ParentThumbImageTag";
 
 /// `<DIR>/jellyfin.json`, written when the user signs in (see `quick_connect`).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Config {
     pub server: String,
     pub(crate) token: String,

@@ -514,12 +514,6 @@ impl App {
                 text(&app),
             ),
             entry(
-                Act::JfPlayer,
-                "Play in the launcher",
-                "Plays films and episodes with the launcher's own player instead of opening the Jellyfin app. Experimental: collections still open in the app.",
-                Value::Switch(self.prefs.jf_player),
-            ),
-            entry(
                 Act::Watching(WATCH),
                 "Continue watching",
                 "A row on Home with the films and episodes you are in the middle of.",
@@ -560,6 +554,12 @@ impl App {
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
+        let player = vec![entry(
+            Act::JfPlayer,
+            "Play in the launcher",
+            "Plays films and episodes from Jellyfin and Plex with the launcher's own player instead of opening their apps. Collections and what the player cannot start still open in the app.",
+            Value::Switch(self.prefs.jf_player),
+        )];
         let host = |url: &str| {
             let rest = url.split_once("://").map_or(url, |(_, r)| r);
             rest.split(['/', '?']).next().unwrap_or(rest).to_string()
@@ -621,10 +621,11 @@ impl App {
             })
             .collect::<Vec<_>>();
         let tabs = (!tabs.is_empty()).then_some(("Tabs", tabs));
+        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", player));
         tabs.into_iter()
+            .chain([("Jellyfin", jellyfin), ("Plex", plex)])
+            .chain(player)
             .chain([
-                ("Jellyfin", jellyfin),
-                ("Plex", plex),
                 ("YouTube", youtube),
                 ("Live TV", tv),
                 ("Ads and privacy", privacy),
@@ -827,40 +828,42 @@ impl App {
                 card: None,
                 bg: None,
             };
-            self.luna.launch(&tile.item(&self.plex_app()));
-        } else {
-            let (id, name) = (t.id.clone(), t.name.clone());
-            if self.prefs.jf_player {
-                self.film(&id, &name);
-            } else {
-                self.open_in_jellyfin(&id, &name);
+            let item = tile.item(&self.plex_app());
+            if !(self.prefs.jf_player && !self.film(&item.key)) {
+                self.luna.launch(&item);
+            }
+        } else if let Some(item) = self.jf_item(&t.id, &t.name) {
+            if !(self.prefs.jf_player && !self.film(&t.id.clone())) {
+                self.luna.launch(&item);
             }
         }
     }
 
     /// The title's page in the Jellyfin app.
-    fn open_in_jellyfin(&mut self, id: &str, name: &str) {
-        let Some(jf) = &self.jf else { return };
+    fn jf_item(&self, id: &str, name: &str) -> Option<Item> {
+        let jf = self.jf.as_ref()?;
         let mut it = Item::new(format!("jf:{id}"), self.jf_app(), Kind::Watch, Some(name.to_string()));
         it.params = Some(serde_json::json!({ "itemId": id, "userId": jf.cfg.user_id, "serverId": jf.cfg.server_id }));
-        self.luna.launch(&it);
+        Some(it)
     }
 
-    /// Plays a Jellyfin title in the launcher's own player (a process of its own, see `player::run_child`). What it
-    /// cannot play (a collection) or cannot start opens in the Jellyfin app instead.
-    fn film(&mut self, id: &str, name: &str) {
+    /// Plays a Jellyfin or Plex title in the launcher's own player (a process of its own, see `player::run_child`).
+    /// `spec` is a Jellyfin item id or `plex:<server>:<rating key>`. What it cannot play (a collection) or cannot
+    /// start is left to the caller: this gives true then, and the caller opens the title in the media app.
+    fn film(&mut self, spec: &str) -> bool {
         if !self.luna.root.is_empty() {
-            return log("play: the simulator has no player");
+            log("play: the simulator has no player");
+            return true;
         }
-        let code = crate::player::run_child(self.win, self.wake, &["--film", id]);
-        if code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE)) {
-            self.open_in_jellyfin(id, name);
-        }
+        let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
+        let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
         // What was watched moves up in Continue watching and in the libraries.
         self.refresh_jellyfin();
+        self.refresh_plex();
         for lib in self.libs.iter().filter(|l| !l.plex) {
             let _ = lib.refresh.send(true);
         }
+        not_played
     }
 
     /// For testing without the remote: what `player::SPAWN` holds, `film:<item id>` or a stream address.
@@ -870,7 +873,7 @@ impl App {
         };
         let _ = std::fs::remove_file(crate::player::SPAWN);
         match what.trim().strip_prefix("film:") {
-            Some(id) => self.film(id, ""),
+            Some(id) => drop(self.film(id)),
             None => drop(crate::player::run_child(
                 self.win,
                 self.wake,
@@ -1707,10 +1710,16 @@ impl App {
                 self.rebuild_apps();
                 self.refocus(key, col);
             }
-            Kind::Watch if self.prefs.jf_player && self.rows[r].items[c].key.starts_with("jf:") => {
-                let it = &self.rows[r].items[c];
-                let (id, name) = (it.key[3..].to_string(), it.title.clone());
-                self.film(&id, &name);
+            Kind::Watch
+                if self.prefs.jf_player
+                    && (self.rows[r].items[c].key.starts_with("jf:")
+                        || self.rows[r].items[c].key.starts_with("plex:")) =>
+            {
+                let key = &self.rows[r].items[c].key;
+                let spec = key.strip_prefix("jf:").unwrap_or(key).to_string();
+                if self.film(&spec) {
+                    self.luna.launch(&self.rows[r].items[c]);
+                }
             }
             _ => self.luna.launch(&self.rows[r].items[c]),
         }

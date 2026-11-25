@@ -1,43 +1,10 @@
-//! Jellyfin films and episodes for the launcher's own player (`player::film`): what to play, the address of the
-//! server's remuxed HLS stream (the server only re-packs H.264/H.265 into MPEG-TS segments, which the player
-//! already reads), the progress reports, and the playhead clock.
+//! Jellyfin: what to play, the address of the file and of the server's remuxed HLS stream (the fallback, where the
+//! server re-packs H.264/H.265 into MPEG-TS segments), the subtitles and the progress reports.
+use super::*;
 use crate::jellyfin::Config;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
 
-pub const TICKS: i64 = 10_000_000;
-/// The exit status of the player process that tells Home to open the title in the Jellyfin app instead.
-pub const ELSEWHERE: u8 = 3;
 const DEVICE: &str = "tvlauncher-c1";
-
-/// An audio or a subtitle track, as the server names it (for example "French - AC3 5.1 - Default").
-#[derive(Clone)]
-pub struct Track {
-    pub index: i64,
-    pub name: String,
-}
-
-/// What is played: a film or one episode.
-pub struct Item {
-    pub audio: Vec<Track>,
-    /// Text subtitles only: the server can hand those over as SRT; picture subtitles (PGS, VobSub) it would have
-    /// to burn into the video.
-    pub subs: Vec<Track>,
-    pub id: String,
-    pub source: String,
-    pub name: String,
-    pub sub: String,
-    /// Length and the place to resume from, in 100 ns ticks.
-    pub total: i64,
-    pub resume: i64,
-    pub session: String,
-}
-
-pub enum Why {
-    /// A collection, a library: only the Jellyfin app shows those.
-    Elsewhere,
-    Failed(String),
-}
 
 fn json_of(cfg: &Config, path: &str) -> Result<Value, Why> {
     let body = cfg.get_within(path, 15).map_err(Why::Failed)?;
@@ -78,10 +45,10 @@ pub fn resolve(cfg: &Config, id: &str) -> Result<Item, Why> {
     } else {
         json_of(cfg, &format!("/Users/{user}/Items/{target}"))?
     };
-    item_from(&o).ok_or_else(|| Why::Failed("The server sent no video for this title.".into()))
+    item_from(cfg, &o).ok_or_else(|| Why::Failed("The server sent no video for this title.".into()))
 }
 
-pub fn item_from(o: &Value) -> Option<Item> {
+pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
     let id = o["Id"].as_str()?.to_string();
     let total = o["RunTimeTicks"].as_i64().unwrap_or(0);
     let at = o["UserData"]["PlaybackPositionTicks"].as_i64().unwrap_or(0);
@@ -94,37 +61,41 @@ pub fn item_from(o: &Value) -> Option<Item> {
     } else {
         o["ProductionYear"].as_i64().map(|y| y.to_string()).unwrap_or_default()
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+    let streams = &o["MediaSources"][0]["MediaStreams"];
     let tracks = |kind: &str, text_only: bool| -> Vec<Track> {
-        o["MediaSources"][0]["MediaStreams"]
+        streams
             .as_array()
             .into_iter()
             .flatten()
             .filter(|s| s["Type"] == kind && (!text_only || s["IsTextSubtitleStream"] == true))
             .filter_map(|s| {
-                Some(Track {
-                    index: s["Index"].as_i64()?,
-                    name: s["DisplayTitle"].as_str().or(s["Language"].as_str())?.to_string(),
-                })
+                let mut t = Track::new(
+                    s["Index"].as_i64()?,
+                    s["DisplayTitle"].as_str().or(s["Language"].as_str())?,
+                );
+                t.external = s["IsExternal"] == true;
+                Some(t)
             })
             .collect()
     };
+    let source = o["MediaSources"][0]["Id"].as_str().unwrap_or(&id).to_string();
+    let default = |k: &str| o["MediaSources"][0][k].as_i64().filter(|i| *i >= 0);
     Some(Item {
+        backend: Backend::Jellyfin(cfg.clone()),
         audio: tracks("Audio", false),
         subs: tracks("Subtitle", true),
-        source: o["MediaSources"][0]["Id"].as_str().unwrap_or(&id).to_string(),
+        default_audio: default("DefaultAudioStreamIndex"),
+        default_sub: default("DefaultSubtitleStreamIndex"),
+        direct: format!(
+            "{}/Videos/{id}/stream?static=true&MediaSourceId={source}&DeviceId={DEVICE}&api_key={}",
+            cfg.server, cfg.token
+        ),
+        source,
         name: o["Name"].as_str().unwrap_or("Video").to_string(),
         sub,
-        // Resume only between 30 s in and 95 %: what is nearly finished starts again.
-        resume: if at > 30 * TICKS && (total == 0 || at < total / 100 * 95) {
-            at
-        } else {
-            0
-        },
+        resume: resume_point(at, total),
         total,
-        session: format!("{nanos:x}"),
+        session: session_id(),
         id,
     })
 }
@@ -145,48 +116,37 @@ pub fn master_url(cfg: &Config, it: &Item, start: i64, audio: Option<i64>) -> St
 /// A subtitle track as SRT, from the server.
 pub fn subtitles(cfg: &Config, id: &str, source: &str, index: i64) -> Result<Vec<crate::subs::Cue>, String> {
     let url = format!("{}/Videos/{id}/{source}/Subtitles/{index}/0/Stream.srt", cfg.server);
-    let auth = format!(
-        "MediaBrowser Token=\"{}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"",
-        cfg.token
-    );
-    let r = crate::net::send(&url, None, &[("Authorization", auth)], 20)?;
+    let r = crate::net::send(&url, None, &[("Authorization", auth(cfg))], 20)?;
     if r.status != 200 {
         return Err(format!("HTTP {}", r.status));
     }
     Ok(crate::subs::parse_srt(&String::from_utf8_lossy(&r.body)))
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Event {
-    Start,
-    Progress,
-    Stop,
+fn auth(cfg: &Config) -> String {
+    format!(
+        "MediaBrowser Token=\"{}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"",
+        cfg.token
+    )
 }
 
-/// Tells the server where the viewer is (the resume point, the watched mark and the dashboard's "now playing").
-/// The last one is waited for so the process does not exit first; the others go out on a thread.
-pub fn report(cfg: &Config, it: &Item, event: Event, ticks: i64, paused: bool) {
-    let (path, wait) = match event {
-        Event::Start => ("/Sessions/Playing", false),
-        Event::Progress => ("/Sessions/Playing/Progress", false),
-        Event::Stop => ("/Sessions/Playing/Stopped", true),
+pub fn report(cfg: &Config, it: &Summary, event: Event, ticks: i64, paused: bool, direct: bool) -> Result<(), String> {
+    let (path, secs) = match event {
+        Event::Start => ("/Sessions/Playing", 6),
+        Event::Progress => ("/Sessions/Playing/Progress", 6),
+        Event::Stop => ("/Sessions/Playing/Stopped", 3),
     };
-    let body = body(it, ticks, paused).to_string();
-    let (url, token) = (format!("{}{path}", cfg.server), cfg.token.clone());
-    let send = move || {
-        let auth = format!("MediaBrowser Token=\"{token}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"");
-        if let Err(e) = crate::net::send(&url, Some(&body), &[("Authorization", auth)], if wait { 3 } else { 6 }) {
-            crate::sdl::log(&format!("film: report: {e}"));
-        }
-    };
-    if wait {
-        send();
-    } else {
-        std::thread::spawn(send);
-    }
+    let body = body(it, ticks, paused, direct).to_string();
+    crate::net::send(
+        &format!("{}{path}", cfg.server),
+        Some(&body),
+        &[("Authorization", auth(cfg))],
+        secs,
+    )
+    .map(drop)
 }
 
-fn body(it: &Item, ticks: i64, paused: bool) -> Value {
+fn body(it: &Summary, ticks: i64, paused: bool, direct: bool) -> Value {
     json!({
         "ItemId": it.id,
         "MediaSourceId": it.source,
@@ -194,45 +154,8 @@ fn body(it: &Item, ticks: i64, paused: bool) -> Value {
         "PositionTicks": ticks.max(0),
         "IsPaused": paused,
         "CanSeek": true,
-        "PlayMethod": "Transcode",
+        "PlayMethod": if direct { "DirectPlay" } else { "Transcode" },
     })
-}
-
-/// The playhead: how far the pipeline has been let run, which stops while paused.
-#[derive(Default)]
-pub struct Clock {
-    before: Duration,
-    since: Option<Instant>,
-}
-
-impl Clock {
-    pub fn run(&mut self) {
-        self.since.get_or_insert_with(Instant::now);
-    }
-
-    pub fn hold(&mut self) {
-        if let Some(t) = self.since.take() {
-            self.before += t.elapsed();
-        }
-    }
-
-    pub fn running(&self) -> bool {
-        self.since.is_some()
-    }
-
-    pub fn now(&self) -> Duration {
-        self.before + self.since.map_or(Duration::ZERO, |t| t.elapsed())
-    }
-}
-
-/// `1:05:09` or `5:09`.
-pub fn clock(secs: i64) -> String {
-    let s = secs.max(0);
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
 }
 
 #[cfg(test)]
@@ -255,14 +178,18 @@ mod tests {
             json!({ "Id": "m1", "Name": "Film", "Type": "Movie", "ProductionYear": 1999, "RunTimeTicks": 6000 * TICKS,
                     "UserData": { "PlaybackPositionTicks": at }, "MediaSources": [{ "Id": "src9" }] })
         };
-        let it = item_from(&o(1200 * TICKS)).unwrap();
+        let it = item_from(&cfg(), &o(1200 * TICKS)).unwrap();
         assert_eq!(
             (it.resume, it.source.as_str(), it.sub.as_str()),
             (1200 * TICKS, "src9", "1999")
         );
-        assert_eq!(item_from(&o(10 * TICKS)).unwrap().resume, 0, "too early to resume");
         assert_eq!(
-            item_from(&o(5900 * TICKS)).unwrap().resume,
+            item_from(&cfg(), &o(10 * TICKS)).unwrap().resume,
+            0,
+            "too early to resume"
+        );
+        assert_eq!(
+            item_from(&cfg(), &o(5900 * TICKS)).unwrap().resume,
             0,
             "nearly finished starts again"
         );
@@ -270,13 +197,16 @@ mod tests {
 
     #[test]
     fn tracks_keep_text_subtitles_only() {
-        let it = item_from(&json!({ "Id": "m1", "MediaSources": [{ "Id": "s", "MediaStreams": [
+        let it = item_from(
+            &cfg(),
+            &json!({ "Id": "m1", "MediaSources": [{ "Id": "s", "MediaStreams": [
             { "Type": "Video", "Index": 0 },
             { "Type": "Audio", "Index": 1, "DisplayTitle": "French - AC3 5.1" },
             { "Type": "Audio", "Index": 2, "Language": "eng" },
             { "Type": "Subtitle", "Index": 3, "DisplayTitle": "French - SRT", "IsTextSubtitleStream": true },
             { "Type": "Subtitle", "Index": 4, "DisplayTitle": "English - PGS", "IsTextSubtitleStream": false },
-        ] }] }))
+        ] }] }),
+        )
         .unwrap();
         let names = |t: &[Track]| t.iter().map(|t| (t.index, t.name.clone())).collect::<Vec<_>>();
         assert_eq!(names(&it.audio), [(1, "French - AC3 5.1".into()), (2, "eng".into())]);
@@ -286,6 +216,7 @@ mod tests {
     #[test]
     fn episodes_say_season_and_number() {
         let it = item_from(
+            &cfg(),
             &json!({ "Id": "e1", "Name": "Pilot", "Type": "Episode", "SeriesName": "The Show",
                                     "ParentIndexNumber": 2, "IndexNumber": 5 }),
         )
@@ -296,7 +227,7 @@ mod tests {
 
     #[test]
     fn master_url_asks_for_a_remux_from_the_start_point() {
-        let it = item_from(&json!({ "Id": "m1", "MediaSources": [{ "Id": "src9" }] })).unwrap();
+        let it = item_from(&cfg(), &json!({ "Id": "m1", "MediaSources": [{ "Id": "src9" }] })).unwrap();
         let u = master_url(&cfg(), &it, 42 * TICKS, Some(3));
         assert!(u.starts_with("https://jf.example/Videos/m1/master.m3u8?MediaSourceId=src9&PlaySessionId="));
         for part in [
@@ -317,8 +248,8 @@ mod tests {
 
     #[test]
     fn reports_carry_the_position_and_never_a_negative_one() {
-        let it = item_from(&json!({ "Id": "m1" })).unwrap();
-        let b = body(&it, -5, true);
+        let it = item_from(&cfg(), &json!({ "Id": "m1" })).unwrap();
+        let b = body(&it.summary(), -5, true, false);
         assert_eq!(
             (
                 b["PositionTicks"].as_i64(),
@@ -327,21 +258,6 @@ mod tests {
             ),
             (Some(0), Some(true), Some("m1"))
         );
-    }
-
-    #[test]
-    fn the_clock_stops_while_held() {
-        let mut c = Clock::default();
-        assert_eq!(c.now(), Duration::ZERO);
-        c.run();
-        std::thread::sleep(Duration::from_millis(30));
-        c.hold();
-        let held = c.now();
-        assert!(held >= Duration::from_millis(30) && !c.running());
-        std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(c.now(), held);
-        c.run();
-        assert!(c.running());
     }
 
     /// A server that answers each request with the body of the first route its path contains, and 404 otherwise.
@@ -403,13 +319,5 @@ mod tests {
         assert_eq!(resolve(&cfg, "m1").ok().unwrap().total, 60 * TICKS);
         assert!(matches!(resolve(&cfg, "c1"), Err(Why::Elsewhere)));
         assert!(matches!(resolve(&cfg, "gone"), Err(Why::Failed(_))));
-    }
-
-    #[test]
-    fn times_read_as_clocks() {
-        assert_eq!(
-            (clock(309).as_str(), clock(3909).as_str(), clock(-4).as_str()),
-            ("5:09", "1:05:09", "0:00")
-        );
     }
 }

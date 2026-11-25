@@ -385,6 +385,24 @@ impl Smp {
 
 /// The Load payload (the shape of ss4s and Native Jelly). `windowId` binds the picture to our exported window.
 fn payload(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> String {
+    payload_dv(app, window, video, audio, None)
+}
+
+/// The same with Dolby Vision declared: `profile` is the stream's profile (5 or 8), which the pipeline then shows in
+/// Dolby Vision. The node sits in `contents`, as Native Jelly sends it (`with_dolby_hdr_info`).
+fn payload_dv(app: &str, window: &str, video: Codec, audio: Option<Codec>, profile: Option<u8>) -> String {
+    let p = payload_base(app, window, video, audio);
+    match profile.filter(|_| video == Codec::H265 || video == Codec::H264) {
+        Some(n) => p.replacen(
+            r#""provider":"tvlauncher""#,
+            &format!(r#""provider":"tvlauncher","DolbyHdrInfo":{{"trackType":"single","encryptionType":"clear","profileId":{n}}}"#),
+            1,
+        ),
+        None => p,
+    }
+}
+
+fn payload_base(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> String {
     let (w, h) = if video == Codec::H265 {
         (3840, 2160)
     } else {
