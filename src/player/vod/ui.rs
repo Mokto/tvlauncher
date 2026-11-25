@@ -346,6 +346,55 @@ impl Shown {
     }
 }
 
+/// A styled (ASS) subtitle on screen: libass's pictures as textures, where they go on the frame.
+#[derive(Default)]
+pub struct AssLayer {
+    pics: Vec<(Tex, FRect)>,
+}
+
+impl AssLayer {
+    /// Makes the pictures libass gave at `(ox, oy)` on the frame.
+    pub fn set(&mut self, g: &Gfx, pics: &[crate::ff::ass::Picture], ox: i32, oy: i32) {
+        self.pics = pics
+            .iter()
+            .filter_map(|p| {
+                let t = Tex::rgba(g.ren, p.w, p.h, &p.rgba)?;
+                let dst = FRect {
+                    x: (p.x + ox) as f32,
+                    y: (p.y + oy) as f32,
+                    w: p.w as f32,
+                    h: p.h as f32,
+                };
+                Some((t, dst))
+            })
+            .collect();
+    }
+
+    pub fn clear(&mut self) {
+        self.pics.clear();
+    }
+}
+
+/// Where the subtitles go for a picture of `video` pixels shown at the largest size that fits the 1920 x 1080 screen:
+/// the frame libass works on, and its offset on the screen.
+pub fn ass_frame(video: (i32, i32)) -> ((i32, i32), (i32, i32)) {
+    let (vw, vh) = (video.0.max(1) as i64, video.1.max(1) as i64);
+    if vw * 1080 > vh * 1920 {
+        let h = (1920 * vh / vw) as i32;
+        ((1920, h), (0, (1080 - h) / 2))
+    } else {
+        let w = (1080 * vw / vh) as i32;
+        ((w, 1080), ((1920 - w) / 2, 0))
+    }
+}
+
+/// The font libass falls back to for a name that no attachment gives: the UI's own.
+pub fn ass_default_font() -> Option<String> {
+    let root = FONT_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let p = format!("{root}/usr/share/fonts/LG_Smart_UI-SemiBold.ttf");
+    std::path::Path::new(&p).exists().then_some(p)
+}
+
 /// A subtitle as one picture per line, so each can be centred. A line the UI font has no glyphs for (Chinese,
 /// Arabic, ...) is drawn with another font of the TV that has them.
 pub fn lines(g: &Gfx, text: &str) -> Vec<Tex> {
@@ -594,6 +643,7 @@ pub struct Over<'a> {
     /// What the skip button offers now, and the picture to show above the bar while seeking.
     pub skip: Option<SegKind>,
     pub thumb: Option<&'a Tex>,
+    pub ass: Option<&'a AssLayer>,
 }
 
 /// A transparent frame, so the video plane shows, with the subtitle, the controls and the track menu over it.
@@ -620,6 +670,11 @@ fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<i
     }
     if let (Some(kind), None) = (over.skip, over.menu) {
         osd.draw_skip(g, kind, geom.as_ref());
+    }
+    if let Some(a) = over.ass.filter(|_| seeking.is_none()) {
+        for (t, dst) in &a.pics {
+            g.copy(t, None, *dst);
+        }
     }
     if let Some(s) = over.shown.filter(|_| seeking.is_none()) {
         for (t, dst) in &s.images {
@@ -745,6 +800,7 @@ pub fn shot(g: &Gfx, menu: bool) {
         menu: menu.as_ref(),
         skip: menu.is_none().then_some(SegKind::Intro),
         thumb: thumb.as_ref(),
+        ass: None,
     };
     draw_over(
         g,

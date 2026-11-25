@@ -15,6 +15,23 @@ They are licensed under the GNU Lesser General Public License, version 2.1 or la
   (`/media/developer/tvlauncher/lib`).
 - The `-plx` suffix in the file names keeps them apart from any FFmpeg the TV has.
 
+## libass, FreeType, HarfBuzz and FriBidi (styled subtitles)
+
+The package carries `lib/libass-plx.so.0`, one shared library that exports only `ass_*` and has these four libraries
+linked in statically:
+
+- libass 0.17.5, ISC licence (<https://github.com/libass/libass>);
+- FreeType 2.15.0, the FreeType Licence (FTL) or GPL-2.0, as the user chooses; "Portions of this software are copyright
+  The FreeType Project (<https://freetype.org>). All rights reserved.";
+- HarfBuzz 15.0.0, the MIT licence;
+- FriBidi 1.0.18, LGPL-2.1-or-later.
+
+They are built from the **unmodified** release archives, pinned by SHA-256 in [`tools/build-libass.sh`](tools/build-libass.sh),
+which is the exact recipe and which every release attaches next to the package as `libass-sources.tar.xz`. FriBidi is
+under the LGPL, so the library can be replaced: build your own with the script (`sh tools/build-libass.sh arm`, or
+`host` for the simulator) and copy it over `lib/libass-plx.so.0` on the TV (`/media/developer/tvlauncher/lib`). The
+recipe and the pins are those of Native Jelly's `ci/build-libass.py` (below).
+
 ## Native Jelly and PLX Native
 
 Parts of the film player follow, and some code is adapted from, [Native Jelly](https://github.com/sostk/native-jelly)

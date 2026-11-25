@@ -9,6 +9,7 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub mod ass;
 pub mod convert;
 pub mod demux;
 pub mod lossless;
@@ -176,6 +177,7 @@ pub(crate) use off::*;
 pub const AVMEDIA_TYPE_VIDEO: c_int = 0;
 pub const AVMEDIA_TYPE_AUDIO: c_int = 1;
 pub const AVMEDIA_TYPE_SUBTITLE: c_int = 3;
+pub const AVMEDIA_TYPE_ATTACHMENT: c_int = 4;
 pub const AV_PKT_FLAG_KEY: c_int = 1;
 pub const AVSEEK_FLAG_BACKWARD: c_int = 1;
 pub const AVSEEK_SIZE: c_int = 0x10000;
@@ -260,7 +262,7 @@ table! {
 }
 
 /// Where the libraries are looked for: `FFMPEG_DIR`, then `lib/` beside the program and in the install folder (the
-/// package), then the desktop build `build/ffmpeg-host` (`tools/build-ffmpeg.sh host`).
+/// package), then the desktop build `build/ffmpeg-host` (`tools/build-ffmpeg.sh host`, and `build/libass-host` for libass).
 fn dirs() -> Vec<PathBuf> {
     let mut v = vec![];
     if let Some(d) = std::env::var_os("FFMPEG_DIR") {
@@ -275,6 +277,7 @@ fn dirs() -> Vec<PathBuf> {
     // The program runs as a bind mount over LG's Home program, so its own path says nothing of where it came from.
     v.push(PathBuf::from(format!("{}/lib", crate::data::DIR)));
     v.push(PathBuf::from("build/ffmpeg-host"));
+    v.push(PathBuf::from("build/libass-host"));
     v
 }
 

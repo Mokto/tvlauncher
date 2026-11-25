@@ -6,6 +6,7 @@ mod thumbs;
 mod ui;
 
 use super::*;
+use crate::ff::ass::Ass;
 use crate::ff::demux::{Demux, Feed, Queue, Run, ENDED};
 use crate::ff::lossless;
 use crate::film::{self, extras, Backend, Clock, Event as Note, Item, Track, Why, TICKS};
@@ -457,6 +458,9 @@ impl Player {
         let mut menu: Option<Menu> = None;
         // The time in the file of the run's time 0: what was asked for, then the keyframe it began on.
         let mut origin = start;
+        let mut ass: Option<Ass> = None;
+        let mut ass_layer = AssLayer::default();
+        let (mut ass_off, mut last_ass) = ((0, 0), Instant::now());
         let end = loop {
             let pos = origin + (clock.now().as_nanos() / 100) as i64;
             if tick.elapsed() > Duration::from_secs(10) {
@@ -608,6 +612,22 @@ impl Player {
                             origin = b / 100;
                             continue;
                         }
+                        Some(Feed::AssTrack { header, fonts, video }) => {
+                            let (frame, off) = ass_frame(video);
+                            ass_off = off;
+                            ass = choice
+                                .sub
+                                .filter(|s| !s.server)
+                                .and_then(|_| Ass::new(&header, &fonts.0, ass_default_font().as_deref(), frame, video));
+                            ass_layer.clear();
+                            continue;
+                        }
+                        Some(Feed::AssChunk { data, start_ms, dur_ms }) => {
+                            if let Some(a) = ass.as_mut() {
+                                a.chunk(&data, start_ms, dur_ms);
+                            }
+                            continue;
+                        }
                         Some(Feed::Sub(ev)) => {
                             if choice.sub.is_some_and(|s| !s.server) {
                                 events.insert(ev);
@@ -680,12 +700,25 @@ impl Player {
             if choice.sub.is_some() {
                 shown.update(g, events, ms);
             }
+            if let Some(a) = ass.as_mut() {
+                // A script's own timing: look at most every 33 ms.
+                if last_ass.elapsed() >= Duration::from_millis(33) {
+                    last_ass = Instant::now();
+                    if let Some(pics) = a.render(pos / 10_000) {
+                        if !pics.is_empty() {
+                            log(&format!("film: ass {} pictures at {} ms", pics.len(), pos / 10_000));
+                        }
+                        ass_layer.set(g, &pics, ass_off.0, ass_off.1);
+                    }
+                }
+            }
             let thumb = seek.and_then(|s| thumbs.at(g, s.0 * 1000));
             let over = Over {
                 shown: choice.sub.map(|_| &shown),
                 menu: menu.as_ref(),
                 skip: skip.map(|s| s.kind).filter(|_| seek.is_none()),
                 thumb,
+                ass: ass.as_ref().map(|_| &ass_layer),
             };
             vframe(g, osd, pos / TICKS, paused, seek.map(|s| s.0), over);
             if !clock.running() && !paused && t.elapsed() > Duration::from_secs(40) {

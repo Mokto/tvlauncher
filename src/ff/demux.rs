@@ -69,6 +69,8 @@ pub struct STrack {
     pub stream: i32,
     pub name: String,
     pub image: bool,
+    /// A script libass draws with its styling (when libass is installed), rather than text.
+    pub ass: bool,
     pub lang: String,
     pub forced: bool,
 }
@@ -79,6 +81,18 @@ pub struct Info {
     pub video: Option<Video>,
     pub audio: Vec<ATrack>,
     pub subs: Vec<STrack>,
+    /// The fonts attached to the file, for ASS.
+    pub fonts: Fonts,
+}
+
+/// Font files attached to a film: name and data. Shared, since a run's header carries them to the player.
+#[derive(Clone, Default)]
+pub struct Fonts(pub Arc<Vec<(String, Vec<u8>)>>);
+
+impl std::fmt::Debug for Fonts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} fonts", self.0.len())
+    }
 }
 
 impl Info {
@@ -140,6 +154,18 @@ pub enum Feed {
     },
     Au(Au),
     Sub(SubEv),
+    /// An ASS track starts: its header, the file's fonts and the picture's size. Then `AssChunk`s follow.
+    AssTrack {
+        header: Vec<u8>,
+        fonts: Fonts,
+        video: (i32, i32),
+    },
+    /// One packet of the ASS track, times in the file.
+    AssChunk {
+        data: Vec<u8>,
+        start_ms: i64,
+        dur_ms: i64,
+    },
     /// The time in the file, in ns, that this run's time 0 is: the keyframe the picture starts on.
     Base(i64),
     End(String),
@@ -162,6 +188,7 @@ fn weight(f: &Feed) -> usize {
     match f {
         Feed::Au(a) => a.data.len() + 64,
         Feed::Sub(_) => 4096,
+        Feed::AssChunk { data, .. } => data.len() + 256,
         _ => 0,
     }
 }
@@ -428,6 +455,7 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
         ..Info::default()
     };
     let (mut n_a, mut n_s) = (0, 0);
+    let (mut fonts, mut fonts_bytes) = (vec![], 0usize);
     for i in 0..(*fmt).nb_streams as usize {
         let s = *(*fmt).streams.add(i);
         let cp = stream_codecpar(s);
@@ -488,16 +516,32 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                         stream: i as i32,
                         name: track_name(f, s, &name, None, n_s),
                         image,
+                        ass: matches!(name.as_str(), "ass" | "ssa") && ass::available(),
                         lang: stream_tag(f, s, c"language").unwrap_or_default(),
                         forced: stream_forced(s),
                     });
                 }
             }
+            AVMEDIA_TYPE_ATTACHMENT if ass::available() => {
+                let cp = stream_codecpar(s);
+                let (d, n) = ((*cp).extradata, (*cp).extradata_size);
+                let name = stream_tag(f, s, c"filename").unwrap_or_default();
+                let lower = name.to_lowercase();
+                let font = [".ttf", ".otf", ".ttc"].iter().any(|e| lower.ends_with(e));
+                if font && !d.is_null() && n > 0 && fonts_bytes + n as usize <= MAX_FONT_BYTES {
+                    fonts_bytes += n as usize;
+                    fonts.push((name, std::slice::from_raw_parts(d, n as usize).to_vec()));
+                }
+            }
             _ => {}
         }
     }
+    info.fonts = Fonts(Arc::new(fonts));
     info
 }
+
+/// The most attached font data kept: a pack of fonts for a long series can run to tens of megabytes.
+const MAX_FONT_BYTES: usize = 24 << 20;
 
 struct Open {
     fmt: *mut AVFormatContext,
@@ -1079,7 +1123,16 @@ unsafe fn run(
         log(&format!("ff: audio {}", c.desc));
     }
     let sub_info = sub.and_then(|s| info.subs.iter().find(|t| t.stream == s));
-    let (sub_dec, sub_name) = match sub_info {
+    let ass_header = sub_info.filter(|t| t.ass).map(|t| {
+        let cp = stream_codecpar(streams[t.stream as usize]);
+        let (d, n) = ((*cp).extradata, (*cp).extradata_size);
+        if d.is_null() || n <= 0 {
+            vec![]
+        } else {
+            std::slice::from_raw_parts(d, n as usize).to_vec()
+        }
+    });
+    let (sub_dec, sub_name) = match sub_info.filter(|t| !t.ass) {
         Some(t) => {
             let cp = stream_codecpar(streams[t.stream as usize]);
             (open_sub_decoder(f, cp), codec_name(f, (*cp).codec_id))
@@ -1113,6 +1166,17 @@ unsafe fn run(
         (f.av_packet_free)(&mut { pkt });
         return Ok(());
     }
+    if let Some(header) = ass_header {
+        if !q.push(Feed::AssTrack {
+            header,
+            fonts: info.fonts.clone(),
+            video: (video.w, video.h),
+        }) {
+            (f.av_packet_free)(&mut { pkt });
+            return Ok(());
+        }
+    }
+    let ass_stream = sub_info.filter(|t| t.ass).map(|t| t.stream);
     let mut base: Option<i64> = None;
     let mut au_buf: Vec<u8> = Vec::new();
     let mut converted: Vec<(i64, Vec<u8>)> = vec![];
@@ -1248,6 +1312,20 @@ unsafe fn run(
                         }
                     }
                 }
+            } else if Some(si as i32) == ass_stream {
+                if let Some(pts) = pts {
+                    let dur = if (*pkt).duration > 0 {
+                        (f.av_rescale_q)((*pkt).duration, stream_time_base(st), NS_TB)
+                    } else {
+                        0
+                    };
+                    subs_n += 1;
+                    alive = q.push(Feed::AssChunk {
+                        data: data.to_vec(),
+                        start_ms: pts / 1_000_000,
+                        dur_ms: dur / 1_000_000,
+                    });
+                }
             } else if Some(si as i32) == sub && !sub_dec.is_null() {
                 if let Some(pts) = pts {
                     let dur = if (*pkt).duration > 0 {
@@ -1325,6 +1403,10 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
                 au += 1;
                 last_a = x.pts_ns;
             }
+            Some(Feed::AssTrack { header, fonts, .. }) => {
+                println!("ass track: {} header bytes, {:?}", header.len(), fonts)
+            }
+            Some(Feed::AssChunk { .. }) => subs += 1,
             Some(Feed::Sub(e)) => {
                 subs += 1;
                 if subs <= 3 {

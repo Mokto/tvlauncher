@@ -20,11 +20,7 @@ const SHELF: f32 = 0.84;
 const HOLD_MS: u32 = 700;
 
 /// How films are delivered (`film::DIRECT`), as Settings words it.
-const DIRECT_MODES: [(&str, &str); 3] = [
-    ("auto", "Automatic"),
-    ("off", "Off"),
-    ("force", "Forced"),
-];
+const DIRECT_MODES: [(&str, &str); 3] = [("auto", "Automatic"), ("off", "Off"), ("force", "Forced")];
 
 /// The choices of the server's streaming quality, in Mbps; 0 is no limit.
 const QUALITIES: [u32; 7] = [0, 40, 20, 12, 8, 4, 2];
@@ -1936,7 +1932,12 @@ impl App {
             let list = DIRECT_MODES
                 .iter()
                 .enumerate()
-                .map(|(i, m)| (Opt::DirectMode(m.0), format!("{}{}", m.1, if i == sel { "   (current)" } else { "" })))
+                .map(|(i, m)| {
+                    (
+                        Opt::DirectMode(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
                 .collect();
             return self.show_menu("Direct Play", list, sel);
         }
@@ -1946,8 +1947,15 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, m)| {
-                    let name = if *m == 0 { "Maximum".to_string() } else { format!("{m} Mbps") };
-                    (Opt::Quality(*m), format!("{name}{}", if i == sel { "   (current)" } else { "" }))
+                    let name = if *m == 0 {
+                        "Maximum".to_string()
+                    } else {
+                        format!("{m} Mbps")
+                    };
+                    (
+                        Opt::Quality(*m),
+                        format!("{name}{}", if i == sel { "   (current)" } else { "" }),
+                    )
                 })
                 .collect();
             return self.show_menu("Streaming quality", list, sel);
