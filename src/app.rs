@@ -105,8 +105,7 @@ enum Opt {
     /// Sort the library tabs by "name" or by date "added".
     LibSort(&'static str),
     RefreshLib,
-    /// Show or hide a tab (its key), or move it left (-1) or right (1).
-    TabShow(String),
+    /// Move a tab by its key: left (-1) or right (1).
     TabMove(String, i32),
     TabRename(String),
     NewProfile(Role),
@@ -115,9 +114,6 @@ enum Opt {
     ProfilePin(usize),
     RemovePin(usize),
     ClearPin(usize),
-    ProfileApps(usize),
-    ToggleApp(usize, String),
-    ProfileMedia(usize),
     Close,
 }
 
@@ -313,6 +309,8 @@ pub struct App {
     cog: bool,
     /// Where the focus was on the settings page, so it is still there after a dialog or a change.
     last_settings: (usize, usize, bool),
+    device_settings: Option<usize>,
+    settings_context: Option<Tex>,
     /// The settings page is open, or a dialog that was opened from it: closing the dialog returns to it.
     in_settings: bool,
     /// OK is held on an app: since when. A tap launches it when OK is released, a hold opens its options.
@@ -421,6 +419,8 @@ impl App {
             just_signed_in: false,
             cog: false,
             last_settings: (0, 0, false),
+            device_settings: None,
+            settings_context: None,
             in_settings: false,
             ok_down: None,
             detail: None,
@@ -677,6 +677,44 @@ impl App {
             desc: desc.into(),
             value,
         };
+        use crate::icons::Icon;
+        let category = |name: &str, icon, entries| Category {
+            name: name.into(),
+            icon,
+            entries,
+        };
+        let device_sections = [
+            (
+                "Shared media",
+                Icon::Server,
+                "YouTube account, live TV channels and guide.",
+            ),
+            (
+                "Startup",
+                Icon::Power,
+                "Decide whether the launcher starts with the TV.",
+            ),
+            ("Ads and privacy", Icon::Lock, "Manage LG ads, tracking and telemetry."),
+            (
+                "Receiver setup",
+                Icon::Audio,
+                "Configure the TV’s eARC support for lossless audio.",
+            ),
+        ];
+        if self.editing.is_none() && self.device_settings.is_none() {
+            return vec![
+                category("Profiles", Icon::Person, self.profile_entries()),
+                category(
+                    "This TV",
+                    Icon::Tv,
+                    device_sections
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, _, desc))| entry(Act::ThisTv(i), name, desc, text("Open")))
+                        .collect(),
+                ),
+            ];
+        }
         let id = self.jf_app();
         let app = self
             .all_apps()
@@ -685,8 +723,12 @@ impl App {
         let jellyfin = vec![
             entry(
                 Act::Jellyfin,
-                "Account",
-                "Where Continue watching, the library tabs and the background pictures come from.",
+                "Jellyfin account",
+                if self.kid() {
+                    "Use a restricted Jellyfin account. Hiding tabs is not a content restriction."
+                } else {
+                    "Connect Jellyfin libraries and Continue watching."
+                },
                 match &self.jf {
                     Some(jf) => text(&jf.cfg.user),
                     None => text("Sign in"),
@@ -694,21 +736,21 @@ impl App {
             ),
             entry(
                 Act::JfApp,
-                "Open videos in",
-                "The app that opens what you pick in Continue watching.",
+                "Jellyfin external app",
+                "Open Jellyfin titles in this app when not using the built-in player.",
                 text(&app),
             ),
             entry(
                 Act::Watching(WATCH),
-                "Continue watching",
-                "A row on Home with the films and episodes you are in the middle of.",
+                "Jellyfin Continue watching",
+                "Show unfinished Jellyfin films and episodes on Home.",
                 Value::Switch(!self.row_off(WATCH)),
             ),
         ];
         let youtube = vec![entry(
             Act::Youtube,
-            "Account",
-            "Recommended videos from your YouTube account. Unofficial: it uses the sign-in of YouTube's TV app.",
+            "YouTube account",
+            "Shared recommendations. Uses the sign-in of YouTube’s TV app.",
             text(if self.yt.is_some() { "Signed in" } else { "Sign in" }),
         )];
         let plex_app = self.plex_app();
@@ -719,8 +761,12 @@ impl App {
         let plex = vec![
             entry(
                 Act::Plex,
-                "Account",
-                "Where Continue watching on Plex and its library tabs come from. Sign in with a code you enter at plex.tv/link.",
+                "Plex account",
+                if self.kid() {
+                    "Use a restricted Plex account. Hiding tabs is not a content restriction."
+                } else {
+                    "Connect Plex libraries and Continue watching."
+                },
                 match &self.px {
                     Some(px) => text(&px.cfg.user),
                     None => text("Sign in"),
@@ -728,14 +774,14 @@ impl App {
             ),
             entry(
                 Act::PlexApp,
-                "Open videos in",
-                "The app that opens what you pick. PlxNative opens the title itself; other apps only start.",
+                "Plex external app",
+                "PlxNative opens the title directly; other apps only start.",
                 text(&plex_title),
             ),
             entry(
                 Act::Watching(PLEX),
-                "Continue watching",
-                "A row on Home with the films and episodes you are in the middle of.",
+                "Plex Continue watching",
+                "Show unfinished Plex films and episodes on Home.",
                 Value::Switch(!self.row_off(PLEX)),
             ),
         ];
@@ -781,7 +827,7 @@ impl App {
             .iter()
             .find(|m| m.0 == self.prefs.sub_mode)
             .map_or(SUB_MODES[0].1, |m| m.1);
-        let mut audio = vec![
+        let audio = vec![
             entry(
                 Act::AudioLang,
                 "Audio language",
@@ -803,11 +849,11 @@ impl App {
             entry(
                 Act::Lossless,
                 "Lossless audio to a receiver",
-                "DTS and DTS-HD MA go unchanged to an AV receiver (Digital Sound Output: Pass Through). TrueHD, Atmos and DTS:X need the row below.",
+                "Send DTS and DTS-HD MA unchanged. For TrueHD, Atmos and DTS:X, see This TV → Receiver setup.",
                 Value::Switch(self.prefs.lossless),
             ),
         ];
-        if self.prefs.lossless {
+        let receiver = {
             let state = match self.hbr.as_deref() {
                 _ if self.hbr_rx.is_some() => "Working...",
                 Some(s) if s.contains("not installed") => "Not installed",
@@ -816,13 +862,13 @@ impl App {
                 Some(s) if s.contains("REFUSED") => "Refused",
                 _ => "Unknown",
             };
-            audio.push(entry(
+            vec![entry(
                 Act::Hbr,
                 "Atmos, TrueHD and DTS:X (root)",
                 "Installs a kernel module that opens the 8-channel eARC link TrueHD, Atmos and DTS:X need. Tested on an LG C1 (03.53.45) only.",
                 text(state),
-            ));
-        }
+            )]
+        };
         let host = |url: &str| {
             let rest = url.split_once("://").map_or(url, |(_, r)| r);
             rest.split(['/', '?']).next().unwrap_or(rest).to_string()
@@ -875,68 +921,83 @@ impl App {
             .map(|(i, (key, name, on))| {
                 let plex = self.libs.iter().any(|l| l.plex && l.views.iter().any(|v| v.id == key));
                 let what = match (key.as_str(), plex) {
-                    ("", _) => "Apps and Continue watching. Home is used if no other tabs are available.",
+                    ("", _) => "Apps and Continue watching. Falls back to Home if no tabs are visible.",
                     ("tv", _) => "The live TV guide.",
                     (_, true) => "A library on your Plex server.",
                     _ => "A library on your Jellyfin server.",
                 };
-                let desc = format!("{what} OK to show, hide, move or rename it.");
+                let desc = format!("{what} OK to toggle · Right for options.");
                 entry(Act::Tab(i), &name, &desc, Value::Switch(on))
             })
             .collect::<Vec<_>>();
-        use crate::icons::Icon;
-        let tabs = ("Tabs", Icon::Tabs, tabs);
-        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", Icon::Play, player));
-        let accounts = self
-            .editing
-            .is_none()
-            .then(|| ("Profiles", Icon::Person, self.profile_entries()));
-        std::iter::once(tabs)
-            .chain(accounts)
-            .chain([("Jellyfin", Icon::Server, jellyfin), ("Plex", Icon::Server, plex)])
-            .chain(player.filter(|_| !self.kid()))
-            .chain([
-                ("Audio", Icon::Audio, audio),
-                ("YouTube", Icon::Video, youtube),
-                ("Live TV", Icon::Tv, tv),
-                ("Ads and privacy", Icon::Lock, privacy),
-                ("Startup", Icon::Power, startup),
-            ])
-            .filter(|(name, _, _)| self.editing.is_none() || matches!(*name, "Tabs" | "Jellyfin" | "Plex" | "Player"))
-            .map(|(name, icon, entries)| Category {
-                name: name.into(),
-                icon,
-                entries,
-            })
-            .collect()
+        let Some(i) = self.editing else {
+            return device_sections
+                .into_iter()
+                .zip([youtube.into_iter().chain(tv).collect(), startup, privacy, receiver])
+                .map(|((name, icon, _), rows)| category(name, icon, rows))
+                .collect();
+        };
+        let kid = self.kid();
+        let (accounts, rows): (Vec<_>, Vec<_>) = jellyfin
+            .into_iter()
+            .chain(plex)
+            .filter(|e| !kid || !matches!(e.act, Act::JfApp | Act::PlexApp))
+            .partition(|e| !matches!(e.act, Act::Watching(_)));
+        let playback = player
+            .into_iter()
+            .filter(|e| !kid || e.act != Act::JfPlayer)
+            .chain(audio)
+            .collect();
+        let mut cats = vec![
+            category("Profile", Icon::Person, self.identity_entries(i)),
+            category("Media accounts", Icon::Server, accounts),
+            category("Home & tabs", Icon::Tabs, tabs.into_iter().chain(rows).collect()),
+            category("Playback", Icon::Play, playback),
+        ];
+        if kid {
+            cats.push(category("Allowed apps", Icon::Lock, self.allowed_app_entries(i)));
+        }
+        cats
     }
 
-    /// Opens the settings page, or builds it again after a change, with the focus where it was.
     fn show_settings(&mut self) {
-        let cats = self.settings_cats();
-        let (cat, row, pane) = match &self.mode {
-            // The Tabs category comes and goes at the top with the first and the last library.
-            Mode::Settings(p) => ((p.cat + cats.len()).saturating_sub(p.cat_count()), p.row, p.pane),
+        let (title, scope, avatar) = if let Some(i) = self.editing {
+            let profile = &self.profiles[i];
+            (
+                profile.name.as_str(),
+                format!("Settings  /  Profiles  /  Editing · {}", profile.role.label()),
+                Some(profile.avatar),
+            )
+        } else if self.device_settings.is_some() {
+            ("This TV", "Settings  /  Applies to this TV".into(), None)
+        } else {
+            ("Settings", "Choose what to manage".into(), None)
+        };
+        let focus = match &self.mode {
+            Mode::Settings(p) => (p.cat, p.row, p.pane),
             _ => self.last_settings,
         };
-        let title = self.editing.map_or_else(
-            || "Settings".into(),
-            |i| format!("Settings for {}", self.profiles[i].name),
-        );
-        let page = Page::new(&self.g, &title, cats, cat, row, pane);
+        let page = Page::new(&self.g, (title, &scope, avatar), self.settings_cats(), focus);
+        self.settings_context = if self.editing.is_some() {
+            self.g.text(self.g.f_label, &format!("Editing: {title}"), 0)
+        } else if self.device_settings.is_some() {
+            self.g.text(self.g.f_label, "This TV", 0)
+        } else {
+            None
+        };
         self.in_settings = true;
         self.mode = Mode::Settings(Box::new(page));
     }
 
     fn load_hbr(&mut self) {
-        self.hbr = (self.prefs.lossless && self.luna.root.is_empty()).then(data::hbr_status);
+        self.hbr = self.luna.root.is_empty().then(data::hbr_status);
     }
 
     fn open_settings(&mut self) {
         if !self.manager() {
             return;
         }
-        self.load_hbr();
+        self.device_settings = None;
         self.last_settings = (0, 0, false);
         self.show_settings();
     }
@@ -1612,6 +1673,9 @@ impl App {
             if let Ok(bytes) = rx.try_recv() {
                 self.luna_rx = None;
                 self.apply_launch_lists(data::lists_from_bytes(&bytes.0, &bytes.1));
+                if self.editing.is_some() && matches!(self.mode, Mode::Settings(_)) {
+                    self.show_settings();
+                }
             }
         }
         while let Some(list) = self.px.as_ref().and_then(|p| p.res.try_recv().ok()) {
@@ -1832,6 +1896,28 @@ impl App {
 
     fn draw(&mut self, focus: Option<(usize, usize)>) {
         let g = &self.g;
+        if self.in_settings {
+            if let Mode::Settings(page) = &self.mode {
+                return page.draw(g);
+            }
+            g.fill(
+                BG,
+                1.0,
+                FRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: W,
+                    h: H,
+                },
+            );
+            self.draw_dialog();
+            if let Some(t) = &self.settings_context {
+                let w = t.w as f32 + 48.0;
+                g.rounded(W - MARGIN - w, 50.0, w, 62.0, 31.0, PANEL, 1.0);
+                g.put(Some(t), W - MARGIN - w + 24.0, 81.0 - t.h as f32 / 2.0, TEXT, 1.0);
+            }
+            return;
+        }
         if let Mode::Picker(p) = &self.mode {
             return p.draw(g);
         }
@@ -2385,16 +2471,33 @@ impl App {
         if !self.manager() {
             return;
         }
-        if let Act::Profile(i) = act {
-            return self.manage_profile(i);
+        self.remember_settings_focus();
+        match act {
+            Act::Profile(i) => return self.manage_profile(i),
+            Act::AddProfile => return self.add_profile(),
+            Act::ThisTv(section) => {
+                self.device_settings = Some(section);
+                self.load_hbr();
+                self.last_settings = (section, 0, false);
+                self.mode = Mode::Browse;
+                return self.show_settings();
+            }
+            Act::None => return,
+            _ => {}
         }
-        if act == Act::AddProfile {
-            return self.add_profile();
+        if let Some(i) = self.editing {
+            let option = match act {
+                Act::ProfileName => Some(Opt::RenameProfile(i)),
+                Act::ProfilePicture => Some(Opt::ProfilePicture(i)),
+                Act::ProfilePin => Some(Opt::ProfilePin(i)),
+                Act::RemovePin => Some(Opt::RemovePin(i)),
+                Act::AllowedApp(n) => return self.toggle_allowed_app(i, n),
+                _ => None,
+            };
+            if let Some(option) = option {
+                return self.account_option(&option);
+            }
         }
-        self.last_settings = match &self.mode {
-            Mode::Settings(p) => (p.cat, p.row, p.pane),
-            _ => self.last_settings,
-        };
         if act == Act::Boot {
             set_boot(&self.luna.root, !boot_on(&self.luna.root));
             return self.show_settings();
@@ -2487,8 +2590,6 @@ impl App {
         if act == Act::Lossless {
             self.prefs.lossless = !self.prefs.lossless;
             self.prefs.save();
-            self.hbr = None;
-            self.load_hbr();
             return self.show_settings();
         }
         if act == Act::Hbr {
@@ -2535,21 +2636,15 @@ impl App {
             return self.show_settings();
         }
         if let Act::Tab(i) = act {
-            let tabs = self.all_tabs();
-            let Some((key, name, on)) = tabs.get(i).cloned() else {
-                return;
-            };
-            let mut list = vec![
-                (Opt::TabShow(key.clone()), if on { "Hide" } else { "Show" }.to_string()),
-                (Opt::TabRename(key.clone()), "Rename".into()),
-            ];
-            if i > 0 {
-                list.push((Opt::TabMove(key.clone(), -1), "Move left".into()));
+            if let Some((key, _, on)) = self.all_tabs().into_iter().nth(i) {
+                if on {
+                    self.prefs.tabs_off.push(key);
+                } else {
+                    self.prefs.tabs_off.retain(|k| *k != key);
+                }
+                self.prefs.save();
             }
-            if i + 1 < tabs.len() {
-                list.push((Opt::TabMove(key, 1), "Move right".into()));
-            }
-            return self.show_menu(&name, list, 0);
+            return self.show_settings();
         }
         if act == Act::TvSource {
             let mut list = vec![
@@ -2787,15 +2882,6 @@ impl App {
             }
             Opt::SubMode(m) => {
                 self.prefs.sub_mode = m.to_string();
-                self.prefs.save();
-                return;
-            }
-            Opt::TabShow(k) => {
-                let off = &mut self.prefs.tabs_off;
-                match off.iter().position(|t| t == k) {
-                    Some(i) => drop(off.remove(i)),
-                    None => off.push(k.clone()),
-                }
                 self.prefs.save();
                 return;
             }
@@ -3245,15 +3331,46 @@ impl App {
         match out {
             Out::Stay => {}
             Out::Back if self.editing.is_some() => {
+                let i = self.editing.unwrap();
                 self.reload_profile(self.active, None);
-                self.open_settings();
+                self.last_settings = (0, i, true);
+                self.show_settings();
+            }
+            Out::Back if self.device_settings.is_some() => {
+                self.last_settings = (1, self.device_settings.take().unwrap(), true);
+                self.mode = Mode::Browse;
+                self.show_settings();
             }
             Out::Back => {
                 self.in_settings = false;
                 self.mode = Mode::Browse;
             }
             Out::Do(act) => self.do_setting(act),
+            Out::TabOptions(i) => self.tab_options(i),
         }
+    }
+
+    fn remember_settings_focus(&mut self) {
+        if let Mode::Settings(page) = &self.mode {
+            self.last_settings = (page.cat, page.row, page.pane);
+        }
+    }
+
+    fn tab_options(&mut self, i: usize) {
+        if !self.manager() || self.editing.is_none() {
+            return;
+        }
+        self.remember_settings_focus();
+        let tabs = self.all_tabs();
+        let Some((key, name, _)) = tabs.get(i) else { return };
+        let mut options = vec![(Opt::TabRename(key.clone()), "Rename".into())];
+        if i > 0 {
+            options.push((Opt::TabMove(key.clone(), -1), "Move left".into()));
+        }
+        if i + 1 < tabs.len() {
+            options.push((Opt::TabMove(key.clone(), 1), "Move right".into()));
+        }
+        self.show_menu(name, options, 0);
     }
 
     /// OK was released: a tap on an app launches it (a hold already opened its options).

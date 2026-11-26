@@ -8,6 +8,13 @@ use crate::sdl::*;
 pub enum Act {
     AddProfile,
     Profile(usize),
+    ThisTv(usize),
+    ProfileName,
+    ProfilePicture,
+    ProfilePin,
+    RemovePin,
+    AllowedApp(usize),
+    None,
     Jellyfin,
     JfApp,
     Youtube,
@@ -36,13 +43,14 @@ pub enum Act {
     /// One group of `debloat.sh`.
     Debloat(&'static str),
     Boot,
-    /// A tab after Home, by its place in the order.
+    /// A tab, by its place in the order.
     Tab(usize),
 }
 
 pub enum Value {
     Text(String),
     Switch(bool),
+    Profile { avatar: usize, role: String },
 }
 
 pub struct Entry {
@@ -62,6 +70,7 @@ pub enum Out {
     Stay,
     Back,
     Do(Act),
+    TabOptions(usize),
 }
 
 struct EntryTex {
@@ -70,6 +79,7 @@ struct EntryTex {
     desc: Option<Tex>,
     value: Option<Tex>,
     switch: Option<bool>,
+    avatar: Option<usize>,
 }
 
 struct CatTex {
@@ -80,6 +90,8 @@ struct CatTex {
 
 pub struct Page {
     title: Option<Tex>,
+    scope: Option<Tex>,
+    avatar: Option<usize>,
     help: Option<Tex>,
     cats: Vec<CatTex>,
     pub cat: usize,
@@ -125,12 +137,12 @@ fn entry_rect(i: usize) -> FRect {
 }
 
 impl Page {
-    /// `cat`, `row` and `pane` say where the focus was, when the page is built again after a change.
-    pub fn cat_count(&self) -> usize {
-        self.cats.len()
-    }
-
-    pub fn new(g: &Gfx, title: &str, cats: Vec<Category>, cat: usize, row: usize, pane: bool) -> Page {
+    pub fn new(
+        g: &Gfx,
+        (title, scope, avatar): (&str, &str, Option<usize>),
+        cats: Vec<Category>,
+        (cat, row, pane): (usize, usize, bool),
+    ) -> Page {
         let cats: Vec<CatTex> = cats
             .into_iter()
             .map(|c| CatTex {
@@ -142,14 +154,22 @@ impl Page {
                     .map(|e| EntryTex {
                         act: e.act,
                         title: g.text(g.f_menu, &e.title, 0),
-                        desc: g.text(g.f_label, &e.desc, (PANE_W - 72.0 - 280.0) as u32),
+                        desc: (!e.desc.is_empty())
+                            .then(|| g.text(g.f_label, &e.desc, (PANE_W - 72.0 - 340.0) as u32))
+                            .flatten(),
                         switch: match &e.value {
                             Value::Switch(on) => Some(*on),
-                            Value::Text(_) => None,
+                            _ => None,
                         },
                         value: match &e.value {
-                            Value::Text(t) => g.text(g.f_menu, t, 0),
+                            Value::Text(t) | Value::Profile { role: t, .. } => {
+                                g.text(g.f_row, &crate::jellyfin::clip(t, 25), 0)
+                            }
                             Value::Switch(_) => None,
+                        },
+                        avatar: match e.value {
+                            Value::Profile { avatar, .. } => Some(avatar),
+                            _ => None,
                         },
                     })
                     .collect(),
@@ -157,9 +177,16 @@ impl Page {
             .collect();
         let cat = cat.min(cats.len().saturating_sub(1));
         let row = row.min(cats.get(cat).map_or(0, |c| c.entries.len().saturating_sub(1)));
+        let pane = pane && cats.get(cat).is_some_and(|c| !c.entries.is_empty());
         Page {
             title: g.text(g.f_hero, title, 0),
-            help: g.text(g.f_label, "Up / Down to browse   OK to change   Back to close", 0),
+            scope: g.text(g.f_sub, scope, 0),
+            avatar,
+            help: g.text(
+                g.f_label,
+                "Up / Down to browse   •   OK to select   •   Left to change section   •   Back to return",
+                0,
+            ),
             cats,
             cat,
             row,
@@ -180,8 +207,13 @@ impl Page {
                 self.pane = false;
             } else if dy != 0 {
                 self.row = (self.row as i32 + dy).clamp(0, self.entries() as i32 - 1) as usize;
-            } else if ok {
-                return Out::Do(self.cats[self.cat].entries[self.row].act);
+            } else if let Some(entry) = self.cats[self.cat].entries.get(self.row) {
+                if ok {
+                    return Out::Do(entry.act);
+                }
+                if let (true, Act::Tab(i)) = (dx > 0, entry.act) {
+                    return Out::TabOptions(i);
+                }
             }
         } else if dy != 0 {
             self.cat = (self.cat as i32 + dy).clamp(0, self.cats.len() as i32 - 1) as usize;
@@ -199,8 +231,26 @@ impl Page {
             w: W,
             h: H,
         };
-        g.fill(BG, 1.0, full);
-        g.put(self.title.as_ref(), MARGIN, 76.0, TEXT, 1.0);
+        crate::avatars::backdrop(g);
+        g.fill(BLACK, 0.52, full);
+        let x = if let Some(avatar) = self.avatar {
+            crate::avatars::draw(g, avatar, MARGIN, 68.0, 124.0);
+            MARGIN + 152.0
+        } else {
+            MARGIN
+        };
+        g.put(self.scope.as_ref(), x, 64.0, DIM, 1.0);
+        g.put(self.title.as_ref(), x, 105.0, TEXT, 1.0);
+        g.fill(
+            rgb(69, 68, 72),
+            1.0,
+            FRect {
+                x: SIDE_X + SIDE_W + 40.0,
+                y: SIDE_Y,
+                w: 2.0,
+                h: 700.0,
+            },
+        );
         let c0 = first(self.cat, CATS_SHOWN);
         for (i, c) in self.cats.iter().enumerate().skip(c0).take(CATS_SHOWN) {
             let r = cat_rect(i - c0);
@@ -225,21 +275,33 @@ impl Page {
         for (i, e) in cat.entries.iter().enumerate().skip(e0).take(ENTRIES_SHOWN) {
             let r = entry_rect(i - e0);
             let on = self.pane && i == self.row;
-            g.rounded(
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                20.0,
-                if on { WHITE } else { PANEL },
-                if on { 1.0 } else { 0.92 },
-            );
+            if on {
+                g.rounded(r.x, r.y, r.w, r.h, 20.0, WHITE, 1.0);
+            } else {
+                g.fill(
+                    rgb(62, 61, 66),
+                    1.0,
+                    FRect {
+                        x: r.x + 36.0,
+                        y: r.y + r.h + 6.0,
+                        w: r.w - 72.0,
+                        h: 2.0,
+                    },
+                );
+            }
             let (head, sub) = if on { (BLACK, rgb(84, 88, 95)) } else { (TEXT, DIM) };
             let th = e.title.as_ref().map_or(0.0, |t| t.h as f32);
             let dh = e.desc.as_ref().map_or(0.0, |t| t.h as f32);
-            let top = r.y + (r.h - th - dh - 8.0) / 2.0;
-            g.put(e.title.as_ref(), r.x + 36.0, top, head, 1.0);
-            g.put(e.desc.as_ref(), r.x + 36.0, top + th + 8.0, sub, 1.0);
+            let gap = if dh > 0.0 { 8.0 } else { 0.0 };
+            let top = r.y + (r.h - th - dh - gap) / 2.0;
+            let x = if let Some(avatar) = e.avatar {
+                crate::avatars::draw(g, avatar, r.x + 32.0, r.y + (r.h - 80.0) / 2.0, 80.0);
+                r.x + 142.0
+            } else {
+                r.x + 36.0
+            };
+            g.put(e.title.as_ref(), x, top, head, 1.0);
+            g.put(e.desc.as_ref(), x, top + th + gap, sub, 1.0);
             if let Some(t) = &e.value {
                 g.put(
                     Some(t),
@@ -268,6 +330,37 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_toggle_and_tab_options_are_distinct_actions() {
+        let mut page = Page {
+            title: None,
+            scope: None,
+            avatar: None,
+            help: None,
+            cats: vec![CatTex {
+                name: None,
+                icon: crate::icons::Icon::Tabs,
+                entries: vec![EntryTex {
+                    act: Act::Tab(0),
+                    title: None,
+                    desc: None,
+                    value: None,
+                    switch: Some(true),
+                    avatar: None,
+                }],
+            }],
+            cat: 0,
+            row: 0,
+            pane: false,
+        };
+        assert!(matches!(page.key(1, 0, false, false), Out::Stay));
+        assert!(matches!(page.key(0, 0, true, false), Out::Do(Act::Tab(0))));
+        assert!(matches!(page.key(1, 0, false, false), Out::TabOptions(0)));
+        assert!(matches!(page.key(-1, 0, false, false), Out::Stay));
+        assert!(!page.pane);
+        assert!(matches!(page.key(0, 0, false, true), Out::Back));
+    }
 
     #[test]
     fn long_lists_scroll_and_stay_above_the_help_line() {
