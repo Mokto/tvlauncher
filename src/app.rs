@@ -236,6 +236,7 @@ pub struct App {
     detail: Option<Box<detail::Page>>,
     /// The title pages a related title was opened from, for Back.
     detail_back: Vec<String>,
+    prefetch: Sender<(detail::Backend, &'static str, library::Source, Vec<String>)>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -265,6 +266,7 @@ pub struct App {
 impl App {
     pub fn new(g: Gfx, luna: Luna, win: *mut Opaque, bgl: Background, jf: Option<Jelly>, wake: u32) -> App {
         let prefs = Prefs::load(&luna.root);
+        let prefs_root = luna.root.clone();
         let rows = vec![
             Row::new("Pinned apps"),
             Row::new("Continue watching"),
@@ -329,6 +331,7 @@ impl App {
             ok_down: None,
             detail: None,
             detail_back: vec![],
+            prefetch: detail::prefetch(prefs_root),
             cog_f: 0.0,
         };
         if let Some(jf) = &app.jf {
@@ -931,27 +934,41 @@ impl App {
         lib.asked.clear();
     }
 
+    /// How a title page of library `view` reaches its server.
+    fn backend(&self, lib: &Lib, view: &str, src: &library::Source) -> Option<detail::Backend> {
+        match (src, &self.px, &self.jf) {
+            (library::Source::Plex { base, token }, Some(px), _) => {
+                let server = lib.views.iter().find(|v| v.id == view).map(|v| v.server.clone());
+                Some(detail::Backend::Plex(
+                    px.cfg.conn(base, token),
+                    server.unwrap_or_default(),
+                ))
+            }
+            (library::Source::Jellyfin(_), _, Some(jf)) => Some(detail::Backend::Jellyfin(jf.cfg.clone())),
+            _ => None,
+        }
+    }
+
     /// Opens the focused title's page, or its page in the media app when films do not play in the launcher.
     fn open_title(&mut self) {
         if !self.prefs.jf_player {
             return self.open_in_app();
         }
-        let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) else {
+        let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
             return;
         };
         let page = &lib.pages[&self.tab];
         let Some(t) = page.title().cloned() else { return };
-        let backend = match (page.source(), &self.px, &self.jf) {
-            (library::Source::Plex { base, token }, Some(px), _) => {
-                let server = lib.views.iter().find(|v| v.id == self.tab).map(|v| v.server.clone());
-                detail::Backend::Plex(px.cfg.conn(&base, &token), server.unwrap_or_default())
-            }
-            (library::Source::Jellyfin(_), _, Some(jf)) => detail::Backend::Jellyfin(jf.cfg.clone()),
-            _ => return self.open_in_app(),
+        let src = page.source();
+        let Some(backend) = self.backend(lib, &self.tab, &src) else {
+            return self.open_in_app();
         };
         let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
-        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, page.source(), self.wake)));
-        lib.asked.clear();
+        let root = self.luna.root.clone();
+        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, src, self.wake, root)));
+        if let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) {
+            lib.asked.clear();
+        }
         self.animating = true;
     }
 
@@ -1436,7 +1453,21 @@ impl App {
                         lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
                         lib.views = views;
                     }
-                    library::Got::Titles(view, titles, src) => self.set_titles(i, &view, titles, Some(src)),
+                    library::Got::Titles(view, titles, src) => {
+                        // The server has just answered: a good time to save its title pages ahead of time.
+                        if self.prefs.jf_player {
+                            if let Some(b) = self.backend(&self.libs[i], &view, &src) {
+                                let pre = if self.libs[i].plex {
+                                    library::PLEX
+                                } else {
+                                    library::JELLYFIN
+                                };
+                                let ids = titles.iter().map(|t| t.id.clone()).collect();
+                                let _ = self.prefetch.send((b, pre, src.clone(), ids));
+                            }
+                        }
+                        self.set_titles(i, &view, titles, Some(src))
+                    }
                 }
             }
         }

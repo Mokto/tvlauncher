@@ -2,8 +2,10 @@
 //! Resume, From the start and Mark as watched; for a series its seasons and episodes; then the cast and crew, related
 //! titles, and About with Information, Languages and Accessibility.
 //!
-//! The page is made from the library's own title at once, and filled in when the server answers (a thread, see
-//! [`load`]). It never wakes a media server by itself: it asks only when the viewer opened it.
+//! The page is made from the library's own title at once, then from the server's answers saved the last time
+//! (`cache/<lib|plib>-d-<id>-page`), and drawn again only when the server's answer now differs (a thread, see
+//! [`load`]). [`prefetch`] saves the pages and their pictures of a whole library ahead of time, right after the server
+//! answered for its list, so it never wakes a media server either.
 use crate::data::DIR;
 use crate::gfx::*;
 use crate::jellyfin::clip;
@@ -11,7 +13,8 @@ use crate::library::{Source, Title};
 use crate::sdl::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 /// Where the title lives, and how to reach it.
 #[derive(Clone)]
@@ -112,11 +115,13 @@ pub struct Ep {
     pub still: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Season {
     pub name: String,
     pub eps: Vec<Ep>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Got {
     /// The title, its seasons (none for a film) and the episode to watch next (season, episode).
     Loaded(Box<Info>, Vec<Season>, (usize, usize)),
@@ -140,20 +145,160 @@ fn json(b: Vec<u8>) -> Result<Value, String> {
     serde_json::from_slice(&b).map_err(|e| e.to_string())
 }
 
-/// Fetches the title and, for a series, all its episodes, on a thread; wakes the main loop when done.
-pub fn load(b: Backend, id: String, wake: u32) -> Receiver<Got> {
+/// Where the server's answers for the page of `id` are saved. The id comes right after `d`, as
+/// `library::prune` reads it, so the file goes when the title leaves the library.
+fn page_file(root: &str, pre: &str, id: &str) -> String {
+    format!("{root}{DIR}/cache/{pre}-d-{id}-page")
+}
+
+/// The page of `id`, on a thread: first the saved copy (when `saved`), then the server's answer when it differs.
+/// Each wakes the main loop; the channel closes when the server has answered or failed.
+pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, saved: bool) -> Receiver<Got> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let t = std::time::Instant::now();
-        let got = match &b {
-            Backend::Jellyfin(c) => jf_load(c, &id),
-            Backend::Plex(c, _) => plex_load(c, &id),
+        let send = |g: Got| {
+            let _ = tx.send(g);
+            unsafe { SDL_PushEvent(&mut Event::new(wake)) };
         };
-        log(&format!("detail: {id} in {} ms", t.elapsed().as_millis()));
-        let _ = tx.send(got.unwrap_or_else(Got::Failed));
-        unsafe { SDL_PushEvent(&mut Event::new(wake)) };
+        let file = page_file(&root, pre, &id);
+        let old = saved
+            .then(|| std::fs::read(&file).ok())
+            .flatten()
+            .and_then(|d| serde_json::from_slice::<Value>(&d).ok())
+            .map(|v| parse(&b, &v));
+        if let Some(g) = &old {
+            send(g.clone());
+        }
+        let t = std::time::Instant::now();
+        let new = fetch(&b, &id);
+        let ms = t.elapsed().as_millis();
+        match new {
+            Ok(v) => {
+                let got = parse(&b, &v);
+                if old.as_ref() == Some(&got) {
+                    log(&format!("detail: {id} in {ms} ms, unchanged"));
+                } else {
+                    log(&format!("detail: {id} in {ms} ms"));
+                    let _ = std::fs::write(&file, v.to_string());
+                    send(got);
+                }
+            }
+            Err(e) if old.is_some() => log(&format!("detail: {id}: {e}, showing the saved copy")),
+            Err(e) => send(Got::Failed(e)),
+        }
     });
     rx
+}
+
+/// Saves the pages of `ids` and all their pictures, on a thread: send it a library right after its server
+/// answered. A page saved less than a day ago is left (opening it asks again anyway); the first request that fails
+/// ends the library, as the server has gone to sleep.
+pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<String>)> {
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+    let (tx, rx) = channel::<(Backend, &'static str, Source, Vec<String>)>();
+    std::thread::spawn(move || {
+        while let Ok((b, pre, src, ids)) = rx.recv() {
+            let (t, mut pages, mut pics) = (std::time::Instant::now(), 0, 0);
+            'library: for id in ids {
+                let file = page_file(&root, pre, &id);
+                let age = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+                let fresh = age.and_then(|t| t.elapsed().ok()).is_some_and(|a| a < DAY);
+                // A fresh page still gets the pictures it misses (a run cut short by a reboot leaves some).
+                let saved = fresh
+                    .then(|| std::fs::read(&file).ok())
+                    .flatten()
+                    .and_then(|d| serde_json::from_slice::<Value>(&d).ok());
+                let v = match saved {
+                    Some(v) => v,
+                    None => match fetch(&b, &id) {
+                        Ok(v) => {
+                            let _ = std::fs::write(&file, v.to_string());
+                            pages += 1;
+                            v
+                        }
+                        Err(e) => {
+                            log(&format!("prefetch: {id}: {e}"));
+                            break;
+                        }
+                    },
+                };
+                let Got::Loaded(info, seasons, _) = parse(&b, &v) else {
+                    continue;
+                };
+                for (url, path) in all_pictures(pre, &id, &src, &info, &seasons) {
+                    let full = format!("{root}{path}");
+                    if std::path::Path::new(&full).exists() {
+                        continue;
+                    }
+                    match crate::net::send(&url, None, &[], 10) {
+                        // A picture the server refuses is saved empty, so it is not asked for again.
+                        Ok(r) => {
+                            let ok = r.status < 400;
+                            let _ = std::fs::write(&full, if ok { &r.body[..] } else { b"" });
+                            pics += usize::from(ok);
+                        }
+                        Err(e) => {
+                            log(&format!("prefetch: {url}: {e}"));
+                            break 'library;
+                        }
+                    }
+                }
+            }
+            if pages + pics > 0 {
+                log(&format!(
+                    "prefetch: {pages} pages, {pics} pictures in {} s",
+                    t.elapsed().as_secs()
+                ));
+            }
+        }
+    });
+    tx
+}
+
+/// Every picture a page can show: (address, path under the root).
+fn all_pictures(pre: &str, id: &str, src: &Source, info: &Info, seasons: &[Season]) -> Vec<(String, String)> {
+    let mut out = vec![];
+    if let Some(tag) = &info.logo {
+        out.extend(src.logo(id, tag).zip(cache_path(pre, id, "logo", tag)));
+    }
+    for p in &info.cast {
+        if let Some(tag) = &p.photo {
+            out.extend(
+                src.picture(&p.id, tag, FACE_PX)
+                    .zip(cache_path(pre, id, &format!("c{}", p.id), tag)),
+            );
+        }
+    }
+    for r in &info.related {
+        if let Some(tag) = &r.poster {
+            out.extend(
+                src.picture(&r.id, tag, POSTER_PX)
+                    .zip(crate::library::pic_path(pre, 'p', &r.id, tag)),
+            );
+        }
+    }
+    for e in seasons.iter().flat_map(|s| &s.eps) {
+        if let Some(tag) = &e.still {
+            out.extend(src.still(&e.id, tag, STILL_W).zip(cache_path(pre, id, &e.id, tag)));
+        }
+    }
+    out
+}
+
+/// Where a picture of the page of `id` is cached. Named after the title, so the library's clean-up keeps it while
+/// the title is in the library.
+fn cache_path(pre: &str, id: &str, key: &str, tag: &str) -> Option<String> {
+    let end: String = tag
+        .rsplit('/')
+        .next()?
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let key: String = key.chars().filter(char::is_ascii_alphanumeric).collect();
+    Some(format!(
+        "{DIR}/cache/{pre}-e-{id}-{key}{}.img",
+        &end[end.len().saturating_sub(8)..]
+    ))
 }
 
 /// Marks `id` watched or not on the server, on a thread. The page shows the change at once.
@@ -183,86 +328,96 @@ pub fn mark(b: Backend, id: String, played: bool) {
     });
 }
 
-fn jf_load(c: &crate::jellyfin::Config, id: &str) -> Result<Got, String> {
-    let user = &c.user_id;
-    let o = json(c.get_within(&format!("/Users/{user}/Items/{id}"), 15)?)?;
-    let series = match o["Type"].as_str().unwrap_or_default() {
-        "Series" => true,
-        "Movie" | "Episode" | "Video" | "MusicVideo" => false,
-        _ => return Ok(Got::Elsewhere),
-    };
-    let mut info = jf_info(&o);
-    // The extras of the page: a server that does not have them leaves the rows out.
-    if let Ok(v) = c
-        .get_within(&format!("/Items/{id}/Similar?userId={user}&limit=16"), 10)
-        .and_then(json)
-    {
-        info.related = v["Items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(jf_related)
-            .collect();
-    }
-    if !series {
-        return Ok(Got::Loaded(Box::new(info), vec![], (0, 0)));
-    }
-    let v = json(c.get_within(
-        &format!("/Shows/{id}/Episodes?userId={user}&Fields=Overview&EnableImageTypes=Primary&ImageTypeLimit=1"),
-        20,
-    )?)?;
-    let eps: Vec<Ep> = v["Items"].as_array().into_iter().flatten().filter_map(jf_ep).collect();
-    let (seasons, next) = group(eps);
-    info.length = series_length(&seasons);
-    if let Some(e) = seasons.get(next.0).and_then(|s| s.eps.get(next.1)) {
-        if let Ok(v) = c
-            .get_within(&format!("/Users/{user}/Items/{}", e.id), 10)
-            .and_then(json)
-        {
-            info.streams = jf_streams(&v);
+/// The server's answers for a page, as sent: `item`, `similar`, and for a series `episodes` and `next` (its next
+/// episode, for the languages). The extras are left null when the server does not have them.
+fn fetch(b: &Backend, id: &str) -> Result<Value, String> {
+    let mut v = serde_json::json!({});
+    match b {
+        Backend::Jellyfin(c) => {
+            let user = &c.user_id;
+            v["item"] = json(c.get_within(&format!("/Users/{user}/Items/{id}"), 15)?)?;
+            v["similar"] = c
+                .get_within(&format!("/Items/{id}/Similar?userId={user}&limit=16"), 10)
+                .and_then(json)
+                .unwrap_or_default();
+            if v["item"]["Type"] == "Series" {
+                v["episodes"] = json(c.get_within(
+                    &format!(
+                        "/Shows/{id}/Episodes?userId={user}&Fields=Overview&EnableImageTypes=Primary&ImageTypeLimit=1"
+                    ),
+                    20,
+                )?)?;
+                if let Some(next) = next_id(b, &v) {
+                    v["next"] = c
+                        .get_within(&format!("/Users/{user}/Items/{next}"), 10)
+                        .and_then(json)
+                        .unwrap_or_default();
+                }
+            }
+        }
+        Backend::Plex(conn, _) => {
+            v["item"] = conn.get_json(&format!("/library/metadata/{id}"), 15)?;
+            v["similar"] = conn
+                .get_json(&format!("/library/metadata/{id}/similar?count=16"), 10)
+                .unwrap_or_default();
+            if v["item"]["MediaContainer"]["Metadata"][0]["type"] == "show" {
+                v["episodes"] = conn.get_json(
+                    &format!("/library/metadata/{id}/allLeaves?X-Plex-Container-Start=0&X-Plex-Container-Size=2000"),
+                    20,
+                )?;
+                if let Some(next) = next_id(b, &v) {
+                    v["next"] = conn
+                        .get_json(&format!("/library/metadata/{next}"), 10)
+                        .unwrap_or_default();
+                }
+            }
         }
     }
-    Ok(Got::Loaded(Box::new(info), seasons, next))
+    Ok(v)
 }
 
-fn plex_load(conn: &crate::plex::Conn, id: &str) -> Result<Got, String> {
-    let v = conn.get_json(&format!("/library/metadata/{id}"), 15)?;
-    let o = &v["MediaContainer"]["Metadata"][0];
-    let series = match o["type"].as_str().unwrap_or_default() {
-        "show" => true,
-        "movie" | "episode" | "clip" => false,
-        _ => return Ok(Got::Elsewhere),
+fn episodes(b: &Backend, v: &Value) -> Vec<Ep> {
+    let (list, ep): (&Value, fn(&Value) -> Option<Ep>) = match b {
+        Backend::Jellyfin(_) => (&v["episodes"]["Items"], jf_ep),
+        Backend::Plex(..) => (&v["episodes"]["MediaContainer"]["Metadata"], plex_ep),
     };
-    let mut info = plex_info(o);
-    if let Ok(v) = conn.get_json(&format!("/library/metadata/{id}/similar?count=16"), 10) {
-        info.related = v["MediaContainer"]["Metadata"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(plex_related)
-            .collect();
-    }
+    list.as_array().into_iter().flatten().filter_map(ep).collect()
+}
+
+fn next_id(b: &Backend, v: &Value) -> Option<String> {
+    let (seasons, (s, e)) = group(episodes(b, v));
+    Some(seasons.get(s)?.eps.get(e)?.id.clone())
+}
+
+/// The page, from the server's answers (see [`fetch`]).
+fn parse(b: &Backend, v: &Value) -> Got {
+    let (o, similar, next) = match b {
+        Backend::Jellyfin(_) => (&v["item"], &v["similar"]["Items"], &v["next"]),
+        Backend::Plex(..) => (
+            &v["item"]["MediaContainer"]["Metadata"][0],
+            &v["similar"]["MediaContainer"]["Metadata"],
+            &v["next"]["MediaContainer"]["Metadata"][0],
+        ),
+    };
+    let jf = matches!(b, Backend::Jellyfin(_));
+    let kind = if jf { &o["Type"] } else { &o["type"] };
+    let series = match kind.as_str().unwrap_or_default() {
+        "Series" | "show" => true,
+        "Movie" | "Episode" | "Video" | "MusicVideo" | "movie" | "episode" | "clip" => false,
+        _ => return Got::Elsewhere,
+    };
+    let mut info = if jf { jf_info(o) } else { plex_info(o) };
+    let related = if jf { jf_related } else { plex_related };
+    info.related = similar.as_array().into_iter().flatten().filter_map(related).collect();
     if !series {
-        return Ok(Got::Loaded(Box::new(info), vec![], (0, 0)));
+        return Got::Loaded(Box::new(info), vec![], (0, 0));
     }
-    let v = conn.get_json(
-        &format!("/library/metadata/{id}/allLeaves?X-Plex-Container-Start=0&X-Plex-Container-Size=2000"),
-        20,
-    )?;
-    let eps: Vec<Ep> = v["MediaContainer"]["Metadata"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(plex_ep)
-        .collect();
-    let (seasons, next) = group(eps);
+    let (seasons, next_ep) = group(episodes(b, v));
     info.length = series_length(&seasons);
-    if let Some(e) = seasons.get(next.0).and_then(|s| s.eps.get(next.1)) {
-        if let Ok(v) = conn.get_json(&format!("/library/metadata/{}", e.id), 10) {
-            info.streams = plex_streams(&v["MediaContainer"]["Metadata"][0]);
-        }
+    if next.is_object() {
+        info.streams = if jf { jf_streams(next) } else { plex_streams(next) };
     }
-    Ok(Got::Loaded(Box::new(info), seasons, next))
+    Got::Loaded(Box::new(info), seasons, next_ep)
 }
 
 fn res_name(width: i64) -> &'static str {
@@ -842,6 +997,7 @@ struct Lay {
 
 pub struct Page {
     pub backend: Backend,
+    root: String,
     id: String,
     pre: &'static str,
     src: Source,
@@ -897,10 +1053,11 @@ fn texw(t: &Option<Tex>) -> f32 {
 }
 
 impl Page {
-    pub fn new(backend: Backend, title: Title, pre: &'static str, src: Source, wake: u32) -> Page {
+    pub fn new(backend: Backend, title: Title, pre: &'static str, src: Source, wake: u32, root: String) -> Page {
         let id = title.id.clone();
         Page {
-            rx: Some(load(backend.clone(), id.clone(), wake)),
+            rx: Some(load(backend.clone(), root.clone(), pre, id.clone(), wake, true)),
+            root,
             backend,
             id,
             pre,
@@ -935,14 +1092,21 @@ impl Page {
 
     /// Asks the server again (after a film was played, its resume point moved).
     pub fn reload(&mut self) {
-        self.rx = Some(load(self.backend.clone(), self.id.clone(), self.wake));
+        let b = self.backend.clone();
+        self.rx = Some(load(b, self.root.clone(), self.pre, self.id.clone(), self.wake, false));
     }
 
     /// What the server sent: `Some(true)` when the title is not one this page shows (the media app should),
     /// `Some(false)` when the page has new details.
     pub fn poll(&mut self, g: &Gfx) -> Option<bool> {
-        let got = self.rx.as_ref()?.try_recv().ok()?;
-        self.rx = None;
+        let got = match self.rx.as_ref()?.try_recv() {
+            Ok(g) => g,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.rx = None;
+                return None;
+            }
+        };
         match got {
             Got::Elsewhere => return Some(true),
             Got::Failed(e) => {
@@ -1369,6 +1533,8 @@ impl Page {
 
     /// Shows a change of watched state at once; the server is told by [`mark`].
     pub fn marked(&mut self, id: &str, played: bool) {
+        // The saved copy is out of date now: the next visit waits for the server rather than show it.
+        let _ = std::fs::remove_file(page_file(&self.root, self.pre, &self.id));
         let whole = id == self.id;
         if whole {
             if let Some(i) = &mut self.info {
@@ -1386,22 +1552,8 @@ impl Page {
         self.stale = true;
     }
 
-    /// Where a picture of this page is cached. Named after the title, so the library's clean-up keeps it while the
-    /// title is in the library.
     fn cache(&self, key: &str, tag: &str) -> Option<String> {
-        let end: String = tag
-            .rsplit('/')
-            .next()?
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
-        let key: String = key.chars().filter(char::is_ascii_alphanumeric).collect();
-        Some(format!(
-            "{DIR}/cache/{}-e-{}-{key}{}.img",
-            self.pre,
-            self.id,
-            &end[end.len().saturating_sub(8)..]
-        ))
+        cache_path(self.pre, &self.id, key, tag)
     }
 
     fn still_path(&self, e: &Ep) -> Option<String> {
@@ -2127,6 +2279,46 @@ mod tests {
         .unwrap();
         assert_eq!((e.id.as_str(), e.resume_s, e.progress), ("28", 1421, 0.5));
         assert_eq!(sound_name("dca", "ma", 8, false), "DTS-HD MA 7.1");
+    }
+
+    #[test]
+    fn a_saved_page_is_read_back_and_kept_while_its_title_is_in_the_library() {
+        let b = Backend::Jellyfin(crate::jellyfin::Config {
+            server: String::new(),
+            token: String::new(),
+            server_id: String::new(),
+            user_id: String::new(),
+            user: String::new(),
+        });
+        let ep = |n: i64, played: bool| json!({ "Id": format!("e{n}"), "IndexNumber": n, "ParentIndexNumber": 1, "UserData": { "Played": played } });
+        let v = json!({
+            "item": { "Type": "Series", "Name": "Show" },
+            "similar": { "Items": [{ "Id": "r1", "Name": "Other", "ImageTags": { "Primary": "t" } }] },
+            "episodes": { "Items": [ep(1, true), ep(2, false)] },
+            "next": { "MediaStreams": [{ "Type": "Audio", "Language": "fre", "Codec": "aac", "Channels": 2 }] }
+        });
+        assert_eq!(next_id(&b, &v).as_deref(), Some("e2"));
+        let saved: Value = serde_json::from_str(&v.to_string()).unwrap();
+        let got = parse(&b, &saved);
+        assert_eq!(got, parse(&b, &v), "the saved copy draws the same page");
+        let Got::Loaded(info, seasons, next) = got else {
+            panic!()
+        };
+        assert_eq!((seasons[0].eps.len(), next), (2, (0, 1)));
+        assert_eq!(info.related[0].id, "r1");
+        assert_eq!(info.streams.audio, ["French (AAC Stereo)"]);
+        assert_eq!(parse(&b, &json!({ "item": { "Type": "BoxSet" } })), Got::Elsewhere);
+
+        let root = std::env::temp_dir().join(format!("tvl-page-{}", std::process::id()));
+        let root = root.to_str().unwrap();
+        std::fs::create_dir_all(format!("{root}{DIR}/cache")).unwrap();
+        for id in ["keep", "gone"] {
+            std::fs::write(page_file(root, "lib", id), "{}").unwrap();
+        }
+        crate::library::prune(root, "lib", &["keep".to_string()].into_iter().collect());
+        assert!(std::path::Path::new(&page_file(root, "lib", "keep")).exists());
+        assert!(!std::path::Path::new(&page_file(root, "lib", "gone")).exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
