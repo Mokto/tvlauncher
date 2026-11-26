@@ -301,7 +301,16 @@ impl Gfx {
             self.rounded(bx, by, (bw * it.progress).max(6.0), 6.0, 3.0, WHITE, a);
         }
         if it.label.is_none() {
-            it.label = self.text(self.f_label, &it.title, 0);
+            let ep = it
+                .sub
+                .as_deref()
+                .and_then(episode_tag)
+                .filter(|_| it.kind == Kind::Watch);
+            let label = match ep {
+                Some(ep) => format!("{} · {ep}", crate::jellyfin::clip(&it.title, 26)),
+                None => it.title.clone(),
+            };
+            it.label = self.text(self.f_label, &label, 0);
         }
         let (lw, lh) = it.label.as_ref().map_or((0.0, 0.0), |t| (t.w as f32, t.h as f32));
         let label = it.label.as_ref();
@@ -322,6 +331,12 @@ impl Gfx {
             self.put(label, x0, y0 + h + 16.0, TEXT, f);
         }
     }
+}
+
+/// "S1 · E4" from an episode's sub line ("S1 · E4 — Name").
+fn episode_tag(sub: &str) -> Option<&str> {
+    let tag = sub.lines().next()?.split_once(" — ")?.0;
+    (tag.starts_with('S') && tag.contains(" · E")).then_some(tag)
 }
 
 /// A white texture whose alpha is `f(x, y, w, h)`.
@@ -500,4 +515,16 @@ fn f_hgrad(x: f32, _: f32, w: f32, _: f32) -> f32 {
 }
 fn f_vgrad(_: f32, y: f32, _: f32, h: f32) -> f32 {
     y / h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::episode_tag;
+
+    #[test]
+    fn episode_tag_only_for_episodes() {
+        assert_eq!(episode_tag("S1 · E4 — The Long Night\nA story — told"), Some("S1 · E4"));
+        assert_eq!(episode_tag("2023\nTwo strangers"), None);
+        assert_eq!(episode_tag("Some channel — live\n1M views"), None);
+    }
 }
