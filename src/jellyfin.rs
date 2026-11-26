@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// The app that opens an item until the user picks another one in Settings.
 pub const DEFAULT_APP: &str = "com.sostk.nativejelly.nightly";
-const CLIENT: &str = "Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"tvlauncher-c1\", Version=\"0.1\"";
+const LEGACY_DEVICE: &str = "tvlauncher-c1";
 
 const CARD_WIDTH: u32 = 640;
 const BG_WIDTH: u32 = 1920;
@@ -30,31 +30,28 @@ pub struct Config {
     pub server_id: String,
     pub user_id: String,
     pub user: String,
+    pub(crate) device: String,
 }
 
-fn auth(token: Option<&str>) -> String {
+fn auth(device: &str, token: Option<&str>) -> String {
+    let client = format!("Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{device}\", Version=\"0.1\"");
     match token {
-        Some(t) => format!("MediaBrowser Token=\"{t}\", {CLIENT}"),
-        None => format!("MediaBrowser {CLIENT}"),
+        Some(t) => format!("MediaBrowser Token=\"{t}\", {client}"),
+        None => format!("MediaBrowser {client}"),
     }
-}
-
-/// A request with a 6 s timeout: the server may be asleep, and the launcher never waits long for it.
-fn request(server: &str, post: Option<&str>, path: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    request_within(server, post, path, token, 6)
 }
 
 fn request_within(
     server: &str,
     post: Option<&str>,
     path: &str,
-    token: Option<&str>,
+    authorization: &str,
     secs: u64,
 ) -> Result<Vec<u8>, String> {
     let r = net::send(
         &format!("{server}{path}"),
         post,
-        &[("Authorization", auth(token))],
+        &[("Authorization", authorization.to_string())],
         secs,
     )?;
     if (200..300).contains(&r.status) {
@@ -65,6 +62,18 @@ fn request_within(
 }
 
 impl Config {
+    pub(crate) fn device(&self) -> &str {
+        if self.device.is_empty() {
+            LEGACY_DEVICE
+        } else {
+            &self.device
+        }
+    }
+
+    pub(crate) fn auth(&self) -> String {
+        auth(self.device(), Some(&self.token))
+    }
+
     pub fn load(root: &str) -> Option<Config> {
         let v: Value = serde_json::from_slice(&std::fs::read(format!("{root}{DIR}/jellyfin.json")).ok()?).ok()?;
         let f = |k: &str| v[k].as_str().map(String::from);
@@ -74,31 +83,30 @@ impl Config {
             server_id: f("serverId")?,
             user_id: f("userId")?,
             user: f("user").unwrap_or_default(),
+            device: f("deviceId")
+                .filter(|s| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+                .unwrap_or_default(),
         })
     }
 
     /// Owner-only: the file holds the device token.
     fn save(&self, root: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(format!("{root}{DIR}"))?;
-        let body = json!({ "server": self.server, "serverId": self.server_id, "userId": self.user_id, "user": self.user, "token": self.token });
+        let body = json!({ "server": self.server, "serverId": self.server_id, "userId": self.user_id, "user": self.user, "token": self.token, "deviceId": self.device() });
         write_private(&format!("{root}{DIR}/jellyfin.json"), body.to_string().as_bytes())
     }
 
     pub(crate) fn get(&self, path: &str) -> Result<Vec<u8>, String> {
-        request(&self.server, None, path, Some(&self.token))
+        self.get_within(path, 6)
     }
 
     /// For a long answer (a whole library), once `get` has shown that the server is awake.
     pub(crate) fn post(&self, path: &str) -> Result<(), String> {
-        request(&self.server, Some(""), path, Some(&self.token)).map(drop)
+        request_within(&self.server, Some(""), path, &self.auth(), 6).map(drop)
     }
 
     pub(crate) fn delete(&self, path: &str) -> Result<(), String> {
-        let r = net::delete(
-            &format!("{}{path}", self.server),
-            &[("Authorization", auth(Some(&self.token)))],
-            10,
-        )?;
+        let r = net::delete(&format!("{}{path}", self.server), &[("Authorization", self.auth())], 10)?;
         (200..300)
             .contains(&r.status)
             .then_some(())
@@ -106,7 +114,7 @@ impl Config {
     }
 
     pub(crate) fn get_within(&self, path: &str, secs: u64) -> Result<Vec<u8>, String> {
-        request_within(&self.server, None, path, Some(&self.token), secs)
+        request_within(&self.server, None, path, &self.auth(), secs)
     }
 
     /// `app` is the app that opens the item.
@@ -137,7 +145,15 @@ impl Config {
 /// login and cached list are deleted here.
 pub fn sign_out(root: &str, cfg: &Config) {
     let cfg = cfg.clone();
-    std::thread::spawn(move || drop(request(&cfg.server, Some("{}"), "/Sessions/Logout", Some(&cfg.token))));
+    std::thread::spawn(move || {
+        drop(request_within(
+            &cfg.server,
+            Some("{}"),
+            "/Sessions/Logout",
+            &cfg.auth(),
+            6,
+        ))
+    });
     let _ = std::fs::remove_file(format!("{root}{DIR}/jellyfin.json"));
     for e in std::fs::read_dir(format!("{root}{DIR}/cache"))
         .into_iter()
@@ -168,7 +184,7 @@ pub enum Qc {
     /// No server was found or the address given does not answer.
     NeedAddress(String),
     Failed(String),
-    Done(Config),
+    Done(Box<Config>),
     /// YouTube's sign-in finished (see `youtube::device_flow`).
     Linked,
 }
@@ -258,7 +274,7 @@ pub fn quick_connect(
             unsafe { crate::sdl::SDL_PushEvent(&mut Event::new(wake)) };
         };
         match connect(&root, server, discover_too, &cancel, &send) {
-            Ok(Some(cfg)) => send(Qc::Done(cfg)),
+            Ok(Some(cfg)) => send(Qc::Done(Box::new(cfg))),
             Ok(None) => {}
             Err(q) => send(q),
         }
@@ -285,7 +301,10 @@ fn connect(
         }));
     };
     let parse = |b: Vec<u8>| serde_json::from_slice::<Value>(&b).map_err(|e| failed(e.to_string()));
-    let init = request(&url, Some("{}"), "/QuickConnect/Initiate", None).map_err(|e| {
+    let device = format!("tvlauncher-{}", crate::youtube::device_id());
+    let authorization = auth(&device, None);
+    let request = |post, path: &str| request_within(&url, post, path, &authorization, 6);
+    let init = request(Some("{}"), "/QuickConnect/Initiate").map_err(|e| {
         failed(if e == "HTTP 401" {
             "Quick Connect is switched off on the server (Dashboard, General).".into()
         } else {
@@ -312,7 +331,7 @@ fn connect(
         if Instant::now() > deadline {
             return Err(failed("The code expired.".into()));
         }
-        match request(&url, None, &format!("/QuickConnect/Connect?secret={secret}"), None) {
+        match request(None, &format!("/QuickConnect/Connect?secret={secret}")) {
             Ok(b) => {
                 errors = 0;
                 if parse(b)?["Authenticated"] == true {
@@ -329,7 +348,19 @@ fn connect(
         }
     }
     let body = json!({ "Secret": secret }).to_string();
-    let r = parse(request(&url, Some(&body), "/Users/AuthenticateWithQuickConnect", None).map_err(failed)?)?;
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let r = parse(
+        request_within(
+            &url,
+            Some(&body),
+            "/Users/AuthenticateWithQuickConnect",
+            &authorization,
+            6,
+        )
+        .map_err(failed)?,
+    )?;
     let f = |v: &Value| v.as_str().map(String::from);
     let (Some(token), Some(user_id), Some(server_id)) = (f(&r["AccessToken"]), f(&r["User"]["Id"]), f(&r["ServerId"]))
     else {
@@ -341,7 +372,12 @@ fn connect(
         server_id,
         user_id,
         user: f(&r["User"]["Name"]).unwrap_or_default(),
+        device,
     };
+    if cancel.load(Ordering::SeqCst) {
+        let _ = cfg.post("/Sessions/Logout");
+        return Ok(None);
+    }
     cfg.save(root)
         .map_err(|e| failed(format!("Could not save the login: {e}")))?;
     Ok(Some(cfg))
@@ -729,6 +765,7 @@ mod tests {
             server_id: "s".into(),
             user_id: "u".into(),
             user: "n".into(),
+            device: String::new(),
         }
     }
 
@@ -824,8 +861,7 @@ mod tests {
     }
 
     /// Needs the real server and a login to authorize with: `JF_FIXTURES=<dir with media/developer/tvlauncher/jellyfin.json>
-    /// cargo test --release -- --ignored quick_connect`. The device id is fixed, so signing in again replaces that
-    /// login on the server and signing out revokes the new one: sign in again afterwards.
+    /// cargo test --release -- --ignored quick_connect`.
     #[test]
     #[ignore]
     fn quick_connect_end_to_end() {
@@ -837,17 +873,12 @@ mod tests {
         let Ok(Qc::Code { code, .. }) = rx.recv_timeout(Duration::from_secs(10)) else {
             panic!("no code")
         };
-        request(
-            &me.server,
-            Some("{}"),
-            &format!("/QuickConnect/Authorize?code={code}"),
-            Some(&me.token),
-        )
-        .unwrap();
+        me.post(&format!("/QuickConnect/Authorize?code={code}")).unwrap();
         let Ok(Qc::Done(cfg)) = rx.recv_timeout(Duration::from_secs(20)) else {
             panic!("not signed in")
         };
         assert_eq!(cfg.user_id, me.user_id);
+        assert_ne!(cfg.device(), me.device());
         assert_eq!(Config::load(&root).unwrap().token, cfg.token);
         let mode = std::fs::metadata(format!("{root}{DIR}/jellyfin.json")).unwrap();
         assert_eq!(

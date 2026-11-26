@@ -41,6 +41,7 @@ pub fn ease(v: &mut f32, target: f32, dt: f32, k: f32) -> bool {
 /// Everything that draws: the renderer, the fonts and the generated shape textures.
 pub struct Gfx {
     pub root: String,
+    pub media_root: std::cell::RefCell<String>,
     pub ren: *mut Opaque,
     pub f_label: *mut Opaque,
     pub f_row: *mut Opaque,
@@ -73,6 +74,7 @@ impl Gfx {
             f_menu: font(semibold, 34),
             f_small: font(regular, 26),
             root: root.to_string(),
+            media_root: std::cell::RefCell::new(root.to_string()),
             ren,
             circle: gen(ren, 2 * RAD, 2 * RAD, f_circle),
             soft: gen(ren, 2 * RAD, 2 * RAD, f_soft),
@@ -104,6 +106,11 @@ impl Gfx {
     }
 
     pub fn rp(&self, p: &str) -> String {
+        if let Some(file) = p.strip_prefix(crate::data::DIR).and_then(|p| p.strip_prefix("/cache/")) {
+            if !file.starts_with("yt-") && !file.starts_with("iptv-") {
+                return format!("{}{p}", self.media_root.borrow());
+            }
+        }
         format!("{}{p}", self.root)
     }
 

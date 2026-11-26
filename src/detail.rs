@@ -206,7 +206,7 @@ pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, 
 /// Saves the pages of `ids` and all their pictures, on a thread: send it a library right after its server
 /// answered. A page saved less than a day ago is left (opening it asks again anyway); the first request that fails
 /// ends the library, as the server has gone to sleep.
-pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<String>)> {
+pub fn prefetch(root: String, live: std::sync::Weak<()>) -> Sender<(Backend, &'static str, Source, Vec<String>)> {
     const DAY: Duration = Duration::from_secs(24 * 3600);
     let (tx, rx) = channel::<(Backend, &'static str, Source, Vec<String>)>();
     std::thread::spawn(move || {
@@ -214,6 +214,9 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
             let ids: HashSet<String> = ids.into_iter().collect();
             let (t, mut pages, mut pics) = (std::time::Instant::now(), 0, 0);
             'library: for id in &ids {
+                if live.strong_count() == 0 {
+                    return;
+                }
                 let free = free_mb(&root);
                 if free.is_some_and(|f| f < STOP_MB) && !make_room(&root) {
                     log(&format!("prefetch: stopped, {} MB free", free.unwrap_or(0)));
@@ -231,6 +234,9 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
                     Some(v) => v,
                     None => match fetch(&b, id).map(|v| trim(&v)) {
                         Ok(v) => {
+                            if live.strong_count() == 0 {
+                                return;
+                            }
                             if let Some(old) = &saved {
                                 drop_changed(&root, pre, id, &parse(b.jf(), old), &parse(b.jf(), &v));
                             }
@@ -248,6 +254,9 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
                     continue;
                 };
                 for (url, path) in ahead(pre, id, &src, &info, seasons.get(next.0), &ids, cast) {
+                    if live.strong_count() == 0 {
+                        return;
+                    }
                     let full = format!("{root}{path}");
                     if std::path::Path::new(&full).exists() {
                         continue;

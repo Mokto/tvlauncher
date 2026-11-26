@@ -6,6 +6,8 @@ use crate::sdl::*;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Act {
+    AddProfile,
+    Profile(usize),
     Jellyfin,
     JfApp,
     Youtube,
@@ -128,7 +130,7 @@ impl Page {
         self.cats.len()
     }
 
-    pub fn new(g: &Gfx, cats: Vec<Category>, cat: usize, row: usize, pane: bool) -> Page {
+    pub fn new(g: &Gfx, title: &str, cats: Vec<Category>, cat: usize, row: usize, pane: bool) -> Page {
         let cats: Vec<CatTex> = cats
             .into_iter()
             .map(|c| CatTex {
@@ -156,7 +158,7 @@ impl Page {
         let cat = cat.min(cats.len().saturating_sub(1));
         let row = row.min(cats.get(cat).map_or(0, |c| c.entries.len().saturating_sub(1)));
         Page {
-            title: g.text(g.f_hero, "Settings", 0),
+            title: g.text(g.f_hero, title, 0),
             help: g.text(g.f_label, "Up / Down to browse   OK to change   Back to close", 0),
             cats,
             cat,

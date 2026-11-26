@@ -4,8 +4,6 @@ use super::*;
 use crate::jellyfin::Config;
 use serde_json::{json, Value};
 
-const DEVICE: &str = "tvlauncher-c1";
-
 fn json_of(cfg: &Config, path: &str) -> Result<Value, Why> {
     let body = cfg.get_within(path, 15).map_err(Why::Failed)?;
     serde_json::from_slice(&body).map_err(|e| Why::Failed(e.to_string()))
@@ -103,8 +101,10 @@ pub fn item_from(cfg: &Config, o: &Value) -> Option<Item> {
         segments: vec![],
         trick: extras::jellyfin_trick(cfg, o, &id, &source),
         direct: format!(
-            "{}/Videos/{id}/stream?static=true&MediaSourceId={source}&DeviceId={DEVICE}&api_key={}",
-            cfg.server, cfg.token
+            "{}/Videos/{id}/stream?static=true&MediaSourceId={source}&DeviceId={}&api_key={}",
+            cfg.server,
+            cfg.device(),
+            cfg.token
         ),
         source,
         name: o["Name"].as_str().unwrap_or("Video").to_string(),
@@ -147,30 +147,28 @@ pub fn master_url(cfg: &Config, it: &Item, audio: Option<i64>) -> String {
     // `ApiKey`, not `api_key`: Jellyfin 12 answers 401 to the latter on the playlists (the file stream still takes it),
     // and passes the former on to the segment addresses in them.
     format!(
-        "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={DEVICE}&VideoCodec=h264,hevc\
+        "{}/Videos/{}/master.m3u8?MediaSourceId={}&PlaySessionId={}&DeviceId={}&VideoCodec=h264,hevc\
          &AudioCodec=aac,ac3,eac3&TranscodingMaxAudioChannels=6&SegmentContainer=ts&MinSegments=1\
          &BreakOnNonKeyFrames=true&AllowVideoStreamCopy=true&AllowAudioStreamCopy=true\
          &h264-profile=high,main,baseline,constrainedbaseline&h264-videobitdepth=8\
          &ApiKey={}{audio}{max}",
-        cfg.server, it.id, it.source, it.session, cfg.token
+        cfg.server,
+        it.id,
+        it.source,
+        it.session,
+        cfg.device(),
+        cfg.token
     )
 }
 
 /// A subtitle track as SRT, from the server.
 pub fn subtitles(cfg: &Config, id: &str, source: &str, index: i64) -> Result<Vec<crate::subs::Cue>, String> {
     let url = format!("{}/Videos/{id}/{source}/Subtitles/{index}/0/Stream.srt", cfg.server);
-    let r = crate::net::send(&url, None, &[("Authorization", auth(cfg))], 20)?;
+    let r = crate::net::send(&url, None, &[("Authorization", cfg.auth())], 20)?;
     if r.status != 200 {
         return Err(format!("HTTP {}", r.status));
     }
     Ok(crate::subs::parse_srt(&String::from_utf8_lossy(&r.body)))
-}
-
-fn auth(cfg: &Config) -> String {
-    format!(
-        "MediaBrowser Token=\"{}\", Client=\"tvlauncher\", Device=\"LG C1\", DeviceId=\"{DEVICE}\", Version=\"0.1\"",
-        cfg.token
-    )
 }
 
 pub fn report(cfg: &Config, it: &Summary, event: Event, ticks: i64, paused: bool, direct: bool) -> Result<(), String> {
@@ -183,7 +181,7 @@ pub fn report(cfg: &Config, it: &Summary, event: Event, ticks: i64, paused: bool
     crate::net::send(
         &format!("{}{path}", cfg.server),
         Some(&body),
-        &[("Authorization", auth(cfg))],
+        &[("Authorization", cfg.auth())],
         secs,
     )
     .map(drop)
@@ -212,6 +210,7 @@ mod tests {
             server_id: "s".into(),
             user_id: "u".into(),
             user: "me".into(),
+            device: String::new(),
         }
     }
 

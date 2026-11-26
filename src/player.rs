@@ -832,13 +832,17 @@ pub fn child(url: &str) -> ExitCode {
 /// meanwhile. The Home key (a relaunch, once registered) stops it: SIGTERM first, so LG's pipeline is released and the
 /// server hears where it stopped, and a kill after eight seconds. Gives its exit status, None when a signal ended it. The launcher's window is raised again
 /// afterwards: the TV leaves it hidden.
-pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
+pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str], profile_root: &str, save_options: bool) -> Option<i32> {
     let exe = std::env::current_exe().unwrap_or_default();
     let t = Instant::now();
     // Its own app id: while the player's window carries Home's id the app manager takes Home to be in front already and
     // the Home key does nothing (checked on the TV); with another id the key launches Home, which arrives as a relaunch.
     let mut cmd = std::process::Command::new(&exe);
-    cmd.env("APPID", "tvlauncher.player");
+    cmd.env("APPID", "tvlauncher.player")
+        .env("TVLAUNCHER_PROFILE_ROOT", profile_root);
+    if !save_options {
+        cmd.env("TVLAUNCHER_READ_ONLY", "1");
+    }
     let mut child = match cmd.args(args).spawn() {
         Ok(c) => c,
         Err(e) => {

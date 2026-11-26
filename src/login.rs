@@ -243,7 +243,7 @@ impl Login {
                     self.step = Step::Failed;
                     self.say(g, &e, None, Some("OK to try again   Back to close"));
                 }
-                Qc::Done(cfg) => return Some(Signed::Jellyfin(cfg)),
+                Qc::Done(cfg) => return Some(Signed::Jellyfin(*cfg)),
                 Qc::Linked if self.provider == Provider::Plex => return Some(Signed::Plex),
                 Qc::Linked => return Some(Signed::Youtube),
             }

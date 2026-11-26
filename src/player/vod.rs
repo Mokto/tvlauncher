@@ -16,6 +16,10 @@ use std::sync::mpsc::{channel, Receiver};
 use thumbs::Thumbs;
 use ui::*;
 
+fn media_root() -> String {
+    std::env::var("TVLAUNCHER_PROFILE_ROOT").unwrap_or_else(|_| root())
+}
+
 pub use ui::shot;
 
 /// A subtitle track's number and its cues, or why the download failed.
@@ -144,7 +148,7 @@ impl Player {
             }
         };
         let mut choice = Choice {
-            look: clamp_look(crate::data::Prefs::load(&root()).look),
+            look: clamp_look(crate::data::Prefs::load(&media_root()).look),
             ..Choice::default()
         };
         set_sub_size(SIZES[choice.look.sub_size].1);
@@ -683,8 +687,8 @@ impl Player {
                             set_sub_size(SIZES[choice.look.sub_size].1);
                             shown.reset();
                         }
-                        if o != Opt::Delay {
-                            crate::data::Prefs::save_look(&root(), choice.look);
+                        if o != Opt::Delay && std::env::var_os("TVLAUNCHER_READ_ONLY").is_none() {
+                            crate::data::Prefs::save_look(&media_root(), choice.look);
                         }
                         *m = Menu::options(g, &choice.look, choice.delay_ms, m.sel);
                     }
@@ -1070,7 +1074,8 @@ pub fn child(spec: &str) -> ExitCode {
 /// The same under `root`: a desktop run (`--film-sim`) with the fake player library of `tools/fake-starfish.c`.
 pub fn child_in(root: &str, spec: &str) -> ExitCode {
     unsafe { libc::signal(libc::SIGTERM, on_term as *const () as usize) };
-    let it = match film::resolve(root, spec) {
+    let profile_root = std::env::var("TVLAUNCHER_PROFILE_ROOT").unwrap_or_else(|_| root.to_string());
+    let it = match film::resolve(&profile_root, spec) {
         Ok(it) => it,
         Err(Why::Elsewhere) => return ExitCode::from(film::ELSEWHERE),
         Err(Why::Failed(e)) => {
@@ -1093,7 +1098,7 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
     };
     let g = Gfx::new(root, ren, |name, size| crate::font(root, name, size));
     set_font_root(root);
-    let prefs = crate::data::Prefs::load(root);
+    let prefs = crate::data::Prefs::load(&profile_root);
     lossless::configure(prefs.lossless);
     film::DIRECT.store(
         match prefs.direct.as_str() {

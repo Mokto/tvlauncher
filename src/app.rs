@@ -1,4 +1,6 @@
 //! The launcher's state: rows of cards, focus, the options menu, and one frame of drawing.
+mod accounts;
+use crate::avatars;
 use crate::data::{self, apply_debloat, boot_on, set_boot, Item, Kind, Luna, Prefs, Row, DEBLOAT};
 use crate::gfx::*;
 use crate::iptv::{self, Channel, Got, Guide};
@@ -6,13 +8,17 @@ use crate::jellyfin::{self, Watch, DEFAULT_APP};
 use crate::keyboard::{Prompt, Typed};
 use crate::login::{Login, Signed};
 use crate::plex::{self, Tile as PlexTile};
+use crate::profiles::{self, Profile, Role};
 use crate::sdl::*;
 use crate::settings::{Act, Category, Entry, Out, Page, Value};
 use crate::tv;
 use crate::youtube::{self, Tile};
 use crate::{detail, library};
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::rc::Rc;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// How much of the background picture the rows cover: the rest shows through, as on Android TV.
 const SHELF: f32 = 0.84;
@@ -103,6 +109,15 @@ enum Opt {
     TabShow(String),
     TabMove(String, i32),
     TabRename(String),
+    NewProfile(Role),
+    RenameProfile(usize),
+    ProfilePicture(usize),
+    ProfilePin(usize),
+    RemovePin(usize),
+    ClearPin(usize),
+    ProfileApps(usize),
+    ToggleApp(usize, String),
+    ProfileMedia(usize),
     Close,
 }
 
@@ -114,6 +129,11 @@ enum Ask {
     XtPass(String, String),
     Guide,
     TabName(String),
+    NewProfile(Role),
+    ProfileName(usize),
+    ProfilePin(usize),
+    ConfirmPin(usize, String),
+    Unlock(usize),
 }
 
 struct Menu {
@@ -125,6 +145,7 @@ struct Menu {
 enum Mode {
     Browse,
     Menu(Menu),
+    Picker(Box<accounts::Picker>),
     /// Moving an app within its row; holds the order from before, for Back.
     Moving(Vec<String>),
     Login(Box<Login>),
@@ -132,12 +153,38 @@ enum Mode {
     Prompt(Box<Prompt>, Ask),
 }
 
-pub struct Background {
-    pub req: Sender<(u64, Option<String>)>,
-    pub res: Receiver<(u64, Option<Surf>)>,
+struct Background {
+    req: Sender<(u64, Option<String>)>,
+    res: Receiver<(u64, Option<Surf>)>,
 }
 
-pub struct Jelly {
+impl Background {
+    fn new(wake: u32) -> Self {
+        let (req, rx) = channel::<(u64, Option<String>)>();
+        let (tx, res) = channel();
+        std::thread::spawn(move || {
+            while let Ok(mut job) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    job = newer;
+                }
+                let surf = job.1.and_then(|p| {
+                    let s = Surf::load(&p)?;
+                    if p.contains("/cache/yt-") {
+                        return Some(blur(&s).unwrap_or(s));
+                    }
+                    Some(s)
+                });
+                if tx.send((job.0, surf)).is_err() {
+                    break;
+                }
+                unsafe { SDL_PushEvent(&mut Event::new(wake)) };
+            }
+        });
+        Self { req, res }
+    }
+}
+
+struct Jelly {
     pub cfg: jellyfin::Config,
     pub refresh: Sender<()>,
     pub res: Receiver<Option<Vec<Watch>>>,
@@ -184,9 +231,17 @@ struct Yt {
 }
 
 pub struct App {
-    g: Gfx,
+    g: Rc<Gfx>,
     luna: Luna,
     win: *mut Opaque,
+    profiles: Vec<Profile>,
+    active: Option<usize>,
+    editing: Option<usize>,
+    profile_root: String,
+    profile_f: bool,
+    profile_label: Option<Tex>,
+    empty_profile: Option<Tex>,
+    pin_retry: Option<Instant>,
     prefs: Prefs,
     rows: Vec<Row>,
     /// Hidden apps while they are not shown.
@@ -237,6 +292,7 @@ pub struct App {
     /// The title pages a related title was opened from, for Back.
     detail_back: Vec<String>,
     prefetch: Sender<(detail::Backend, &'static str, library::Source, Vec<String>)>,
+    _prefetch_live: Arc<()>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -264,9 +320,36 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(g: Gfx, luna: Luna, win: *mut Opaque, bgl: Background, jf: Option<Jelly>, wake: u32) -> App {
-        let prefs = Prefs::load(&luna.root);
-        let prefs_root = luna.root.clone();
+    pub fn new(g: Rc<Gfx>, luna: Luna, win: *mut Opaque, wake: u32, profiles: Vec<Profile>) -> App {
+        let active = (profiles.len() == 1 && profiles[0].pin.is_empty()).then_some(0);
+        Self::session(g, luna, win, wake, profiles, (active, None))
+    }
+
+    fn session(
+        g: Rc<Gfx>,
+        luna: Luna,
+        win: *mut Opaque,
+        wake: u32,
+        profiles: Vec<Profile>,
+        (active, editing): (Option<usize>, Option<usize>),
+    ) -> App {
+        let profile_root = profiles::data_root(&luna.root, editing.or(active).unwrap_or(0));
+        g.media_root.replace(profile_root.clone());
+        let mut prefs = active.map_or_else(Prefs::default, |_| Prefs::load(&profile_root));
+        if editing.is_none() && active.is_some_and(|i| profiles[i].role != Role::Kid) {
+            let device = Prefs::load(&luna.root);
+            prefs.debloat = device.debloat;
+        }
+        let profile_label = active
+            .filter(|_| profiles.len() > 1)
+            .and_then(|i| g.text(g.f_label, &jellyfin::clip(&profiles[i].name, 13), 0));
+        let empty_profile = g.text(g.f_row, "No apps are allowed. Press Up to reach the top bar.", 0);
+        let jf = active.and_then(|_| jellyfin::Config::load(&profile_root)).map(|cfg| {
+            let (refresh, res) = jellyfin::spawn(profile_root.clone(), cfg.clone(), wake);
+            Jelly { cfg, refresh, res }
+        });
+        let prefetch_live = Arc::new(());
+        let prefetch = detail::prefetch(profile_root.clone(), Arc::downgrade(&prefetch_live));
         let rows = vec![
             Row::new("Pinned apps"),
             Row::new("Continue watching"),
@@ -279,6 +362,14 @@ impl App {
             g,
             luna,
             win,
+            profiles,
+            active,
+            editing,
+            profile_root,
+            profile_f: false,
+            profile_label,
+            empty_profile,
+            pin_retry: None,
             prefs,
             rows,
             pool: vec![],
@@ -306,7 +397,7 @@ impl App {
             hbr: None,
             hbr_rx: None,
             luna_rx: None,
-            bgl,
+            bgl: Background::new(wake),
             jf,
             yt: None,
             px: None,
@@ -331,12 +422,17 @@ impl App {
             ok_down: None,
             detail: None,
             detail_back: vec![],
-            prefetch: detail::prefetch(prefs_root),
+            prefetch,
+            _prefetch_live: prefetch_live,
             cog_f: 0.0,
         };
+        if app.active.is_none() {
+            app.choose_profile(0, "");
+            return app;
+        }
         if let Some(jf) = &app.jf {
             let jf_app = app.jf_app();
-            let cached: Vec<Item> = jellyfin::cached(&app.luna.root)
+            let cached: Vec<Item> = jellyfin::cached(&app.profile_root)
                 .iter()
                 .map(|w| jf.cfg.item(w, &jf_app))
                 .collect();
@@ -346,19 +442,26 @@ impl App {
             app.jf_pending = jf.refresh.send(()).is_ok();
             app.start_lib(false);
         }
-        if let Some(cfg) = youtube::Config::load(&app.luna.root) {
-            app.rows[YOUTUBE].items = youtube::cached(&app.luna.root).iter().map(Tile::item).collect();
-            app.start_youtube(cfg, false);
-        }
-        if let Some(cfg) = plex::Config::load(&app.luna.root) {
+        if let Some(cfg) = plex::Config::load(&app.profile_root) {
             let plex_app = app.plex_app();
             if !app.row_off(PLEX) {
-                app.rows[PLEX].items = plex::cached(&app.luna.root).iter().map(|t| t.item(&plex_app)).collect();
+                app.rows[PLEX].items = plex::cached(&app.profile_root)
+                    .iter()
+                    .map(|t| t.item(&plex_app))
+                    .collect();
             }
             app.start_plex(cfg);
         }
-        if let Some(cfg) = iptv::Config::load(&app.luna.root) {
-            app.start_tv(cfg, false);
+        if !app.kid() {
+            if app.editing.is_none() {
+                if let Some(cfg) = youtube::Config::load(&app.luna.root) {
+                    app.rows[YOUTUBE].items = youtube::cached(&app.luna.root).iter().map(Tile::item).collect();
+                    app.start_youtube(cfg, false);
+                }
+            }
+            if let Some(cfg) = iptv::Config::load(&app.luna.root) {
+                app.start_tv(cfg, false);
+            }
         }
         if app.luna.root.is_empty() {
             app.luna_rx = Some(data::fetch_launch_lists(app.luna.clone()));
@@ -369,7 +472,40 @@ impl App {
             app.load();
         }
         app.pick_home_bg(true);
+        if app.editing.is_some() {
+            app.show_settings();
+        }
         app
+    }
+
+    fn reload_profile(&mut self, active: Option<usize>, editing: Option<usize>) {
+        let pin_retry = self.pin_retry;
+        *self = Self::session(
+            self.g.clone(),
+            self.luna.clone(),
+            self.win,
+            self.wake,
+            self.profiles.clone(),
+            (active, editing),
+        );
+        self.pin_retry = pin_retry;
+    }
+
+    fn manager(&self) -> bool {
+        self.active.is_some_and(|i| self.profiles[i].role == Role::Manager)
+    }
+
+    fn kid(&self) -> bool {
+        self.editing
+            .or(self.active)
+            .is_some_and(|i| self.profiles[i].role == Role::Kid)
+    }
+
+    fn can_launch(&self, item: &Item) -> bool {
+        self.editing.is_none()
+            && self.active.is_some_and(|i| {
+                self.profiles[i].role != Role::Kid || (item.kind == Kind::App && self.profiles[i].allows(&item.id))
+            })
     }
 
     /// Shows the cached channels and guide at once, and asks for fresh ones (`force`, or when they are old).
@@ -461,7 +597,10 @@ impl App {
     /// Chooses the picture behind the apps from the saved set: another one than now when `fresh`, else only
     /// when there is none yet or the one shown is gone.
     fn pick_home_bg(&mut self, fresh: bool) {
-        let pool = jellyfin::backdrops(&self.luna.root);
+        if self.jf.is_none() {
+            return;
+        }
+        let pool = jellyfin::backdrops(&self.profile_root);
         let current = self.home_bg.as_ref().map(|b| b.path.clone());
         let keep = current.as_ref().is_some_and(|c| pool.iter().any(|b| b.path == *c));
         if pool.is_empty() || (keep && !fresh) {
@@ -742,9 +881,14 @@ impl App {
         use crate::icons::Icon;
         let tabs = (!tabs.is_empty()).then_some(("Tabs", Icon::Tabs, tabs));
         let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", Icon::Play, player));
+        let accounts = self
+            .editing
+            .is_none()
+            .then(|| ("Profiles", Icon::Person, self.profile_entries()));
         tabs.into_iter()
+            .chain(accounts)
             .chain([("Jellyfin", Icon::Server, jellyfin), ("Plex", Icon::Server, plex)])
-            .chain(player)
+            .chain(player.filter(|_| !self.kid()))
             .chain([
                 ("Audio", Icon::Audio, audio),
                 ("YouTube", Icon::Video, youtube),
@@ -752,6 +896,7 @@ impl App {
                 ("Ads and privacy", Icon::Lock, privacy),
                 ("Startup", Icon::Power, startup),
             ])
+            .filter(|(name, _, _)| self.editing.is_none() || matches!(*name, "Tabs" | "Jellyfin" | "Plex" | "Player"))
             .map(|(name, icon, entries)| Category {
                 name: name.into(),
                 icon,
@@ -768,7 +913,11 @@ impl App {
             Mode::Settings(p) => ((p.cat + cats.len()).saturating_sub(p.cat_count()), p.row, p.pane),
             _ => self.last_settings,
         };
-        let page = Page::new(&self.g, cats, cat, row, pane);
+        let title = self.editing.map_or_else(
+            || "Settings".into(),
+            |i| format!("Settings for {}", self.profiles[i].name),
+        );
+        let page = Page::new(&self.g, &title, cats, cat, row, pane);
         self.in_settings = true;
         self.mode = Mode::Settings(Box::new(page));
     }
@@ -778,6 +927,9 @@ impl App {
     }
 
     fn open_settings(&mut self) {
+        if !self.manager() {
+            return;
+        }
         self.load_hbr();
         self.last_settings = (0, 0, false);
         self.show_settings();
@@ -785,7 +937,9 @@ impl App {
 
     /// A dialog is done: back to the settings page it was opened from, else to Home.
     fn close_dialog(&mut self) {
-        if self.in_settings {
+        if self.active.is_none() {
+            self.choose_profile(0, "");
+        } else if self.in_settings {
             self.show_settings();
         } else {
             self.mode = Mode::Browse;
@@ -798,7 +952,7 @@ impl App {
             Signed::Jellyfin(cfg) => {
                 self.prefs.jf_server = Some(cfg.server.clone());
                 self.prefs.save();
-                let (refresh, res) = jellyfin::spawn(self.luna.root.clone(), cfg.clone(), self.wake);
+                let (refresh, res) = jellyfin::spawn(self.profile_root.clone(), cfg.clone(), self.wake);
                 self.jf_pending = refresh.send(()).is_ok();
                 self.jf = Some(Jelly { cfg, refresh, res });
                 self.start_lib(false);
@@ -809,7 +963,7 @@ impl App {
                 }
             }
             Signed::Plex => {
-                if let Some(cfg) = plex::Config::load(&self.luna.root) {
+                if let Some(cfg) = plex::Config::load(&self.profile_root) {
                     self.start_plex(cfg);
                 }
             }
@@ -818,7 +972,7 @@ impl App {
     }
 
     fn start_plex(&mut self, cfg: plex::Config) {
-        let (refresh, res) = plex::spawn(self.luna.root.clone(), cfg.clone(), self.wake);
+        let (refresh, res) = plex::spawn(self.profile_root.clone(), cfg.clone(), self.wake);
         self.px_pending = refresh.send(()).is_ok();
         self.px = Some(Px { cfg, refresh, res });
         self.start_lib(true);
@@ -827,7 +981,7 @@ impl App {
     fn sign_out_plex(&mut self) {
         self.px = None;
         self.libs.retain(|l| !l.plex);
-        plex::sign_out(&self.luna.root);
+        plex::sign_out(&self.profile_root);
         self.px_pending = false;
         self.rows[PLEX].items.clear();
         self.refocus(None, self.rows[self.cur_row].col);
@@ -866,7 +1020,7 @@ impl App {
 
     /// Shows the cached libraries of Jellyfin or Plex at once and asks for new lists when they are old.
     fn start_lib(&mut self, plex: bool) {
-        let root = self.luna.root.clone();
+        let root = self.profile_root.clone();
         let (pre, src, (refresh, res)) = match (plex, &self.jf, &self.px) {
             (false, Some(jf), _) => {
                 let (r, cfg) = (root.clone(), jf.cfg.clone());
@@ -951,7 +1105,7 @@ impl App {
 
     /// Opens the focused title's page, or its page in the media app when films do not play in the launcher.
     fn open_title(&mut self) {
-        if !self.prefs.jf_player {
+        if !self.builtin_player() {
             return self.open_in_app();
         }
         let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
@@ -964,7 +1118,7 @@ impl App {
             return self.open_in_app();
         };
         let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
-        let root = self.luna.root.clone();
+        let root = self.profile_root.clone();
         self.detail = Some(Box::new(detail::Page::new(backend, t, pre, src, self.wake, root)));
         if let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) {
             lib.asked.clear();
@@ -977,15 +1131,16 @@ impl App {
         if self.detail.as_ref().is_some_and(|d| d.id() == id) {
             return;
         }
+        let tabs = self.tabs();
         let tab = self.libs.iter_mut().find_map(|l| {
             l.pages
                 .iter_mut()
-                .find_map(|(tab, p)| p.focus_id(id).then(|| tab.clone()))
+                .find_map(|(tab, p)| (tabs.iter().any(|(key, _)| key == tab) && p.focus_id(id)).then(|| tab.clone()))
         });
         let Some(tab) = tab else {
             return log(&format!("player: no library tab has {id}"));
         };
-        (self.tab, self.tabs_f, self.cog) = (tab, false, false);
+        (self.tab, self.tabs_f, self.cog, self.profile_f) = (tab, false, false, false);
         self.mode = Mode::Browse;
         self.open_title();
     }
@@ -1020,6 +1175,9 @@ impl App {
 
     /// Opens the focused title in the Jellyfin or Plex app (Native Jelly and PlxNative show its page).
     fn open_in_app(&mut self) {
+        if self.kid() || self.active.is_none() || self.editing.is_some() {
+            return;
+        }
         let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
             return;
         };
@@ -1062,13 +1220,22 @@ impl App {
     /// `spec` is a Jellyfin item id or `plex:<server>:<rating key>`. What it cannot play (a collection) or cannot
     /// start is left to the caller: this gives true then, and the caller opens the title in the media app.
     fn film(&mut self, spec: &str) -> bool {
+        if self.active.is_none() || self.editing.is_some() {
+            return false;
+        }
         if !self.luna.root.is_empty() {
             log("play: the simulator has no player");
             return true;
         }
-        let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
+        let code = crate::player::run_child(
+            self.win,
+            self.wake,
+            &["--film", spec],
+            &self.profile_root,
+            self.manager(),
+        );
         let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
-        self.prefs.look = Prefs::load(&self.luna.root).look;
+        self.prefs.look = Prefs::load(&self.profile_root).look;
         if let Ok(id) = std::fs::read_to_string(crate::player::PAGE) {
             let _ = std::fs::remove_file(crate::player::PAGE);
             self.go_to_page(id.trim());
@@ -1088,12 +1255,17 @@ impl App {
             return;
         };
         let _ = std::fs::remove_file(crate::player::SPAWN);
+        if !self.manager() || self.editing.is_some() {
+            return;
+        }
         match what.trim().strip_prefix("film:") {
             Some(id) => drop(self.film(id)),
             None => drop(crate::player::run_child(
                 self.win,
                 self.wake,
                 &["--player", what.trim()],
+                "",
+                false,
             )),
         }
         self.animating = true;
@@ -1142,9 +1314,10 @@ impl App {
     fn sign_out(&mut self) {
         self.libs.retain(|l| l.plex);
         if let Some(jf) = self.jf.take() {
-            jellyfin::sign_out(&self.luna.root, &jf.cfg);
+            jellyfin::sign_out(&self.profile_root, &jf.cfg);
         }
         self.jf_pending = false;
+        self.home_bg = None;
         self.rows[WATCH].items.clear();
         self.refocus(None, self.rows[self.cur_row].col);
     }
@@ -1207,10 +1380,17 @@ impl App {
     }
 
     fn load(&mut self) {
+        if self.active.is_none() {
+            return;
+        }
         self.apply_launch_lists(data::launch_lists(&self.luna));
     }
 
-    fn apply_launch_lists(&mut self, (apps, inputs): (Vec<Item>, Vec<Item>)) {
+    fn apply_launch_lists(&mut self, (mut apps, mut inputs): (Vec<Item>, Vec<Item>)) {
+        if self.kid() && self.editing.is_none() {
+            apps.retain(|app| self.can_launch(app));
+            inputs.clear();
+        }
         self.rows[APPS].items = apps;
         self.rows[PINNED].items.clear();
         self.pool.clear();
@@ -1374,6 +1554,21 @@ impl App {
     }
 
     pub fn frame(&mut self, dt: f32) {
+        if self.active.is_none() {
+            self.g.fill(
+                BG,
+                1.0,
+                FRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: W,
+                    h: H,
+                },
+            );
+            self.draw_dialog();
+            self.animating = false;
+            return;
+        }
         if let Mode::Login(l) = &mut self.mode {
             if let Some(signed) = l.poll(&self.g) {
                 self.signed_in(signed);
@@ -1455,7 +1650,7 @@ impl App {
                     }
                     library::Got::Titles(view, titles, src) => {
                         // The server has just answered: a good time to save its title pages ahead of time.
-                        if self.prefs.jf_player {
+                        if self.builtin_player() && self.editing.is_none() {
                             if let Some(b) = self.backend(&self.libs[i], &view, &src) {
                                 let pre = if self.libs[i].plex {
                                     library::PLEX
@@ -1486,7 +1681,13 @@ impl App {
             Some(false) => {
                 let libs = &self.libs;
                 if let Some(d) = &mut self.detail {
-                    d.keep_related(|id| libs.iter().any(|l| l.pages.values().any(|p| p.has(id))));
+                    d.keep_related(|id| {
+                        libs.iter().any(|l| {
+                            l.pages
+                                .iter()
+                                .any(|(key, p)| !self.prefs.tabs_off.contains(key) && p.has(id))
+                        })
+                    });
                 }
             }
             None => {}
@@ -1601,6 +1802,9 @@ impl App {
 
     fn draw(&mut self, focus: Option<(usize, usize)>) {
         let g = &self.g;
+        if let Mode::Picker(p) = &self.mode {
+            return p.draw(g);
+        }
         unsafe {
             SDL_SetRenderDrawColor(g.ren, BG.r, BG.g, BG.b, 255);
             SDL_RenderClear(g.ren);
@@ -1742,7 +1946,10 @@ impl App {
         let held = self
             .ok_down
             .map(|t| (unsafe { SDL_GetTicks() }.wrapping_sub(t) as f32 / HOLD_MS as f32).min(1.0));
-        let focused_app = focus.is_some_and(|(r, c)| self.rows[r].items[c].kind == Kind::App);
+        let focused_app = self.manager() && focus.is_some_and(|(r, c)| self.rows[r].items[c].kind == Kind::App);
+        if self.kid() && self.rows.iter().all(|r| r.items.is_empty()) {
+            g.put(self.empty_profile.as_ref(), MARGIN, 220.0, TEXT, 1.0);
+        }
         // Rows differ in height, so their tops add up; the scroll position is a (fractional) row number.
         let mut tops = vec![];
         let mut at = 0.0;
@@ -1829,7 +2036,8 @@ impl App {
         let tabs = self.tabs();
         for (_, name) in &tabs {
             if !self.tab_tex.contains_key(name) {
-                self.tab_tex.insert(name.clone(), self.g.text(self.g.f_row, name, 0));
+                self.tab_tex
+                    .insert(name.clone(), self.g.text(self.g.f_row, &jellyfin::clip(name, 36), 0));
             }
         }
         let g = &self.g;
@@ -1842,31 +2050,63 @@ impl App {
         g.put(self.clock.as_ref(), W - MARGIN - cw, 56.0, TEXT, 1.0);
         let ch = self.clock.as_ref().map_or(40.0, |t| t.h as f32);
         let (cx, cy) = (W - MARGIN - cw - 76.0, 56.0 + ch / 2.0);
-        g.rounded(cx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, self.cog_f);
-        let gc = rgb(
-            (f32::from(DIM.r) * (1.0 - self.cog_f)) as u8,
-            (f32::from(DIM.g) * (1.0 - self.cog_f)) as u8,
-            (f32::from(DIM.b) * (1.0 - self.cog_f)) as u8,
-        );
-        g.tint(&g.gear, gc, 1.0);
-        g.copy(
-            &g.gear,
-            None,
-            FRect {
-                x: cx - 22.0,
-                y: cy - 22.0,
-                w: 44.0,
-                h: 44.0,
-            },
-        );
+        let mut profile_width = 0.0;
+        if self.profiles.len() > 1 {
+            profile_width = self.profile_label.as_ref().map_or(0.0, |t| t.w as f32) + 92.0;
+            let color = if self.profile_f { BLACK } else { TEXT };
+            if self.profile_f {
+                g.rounded(MARGIN, cy - 32.0, profile_width, 64.0, 22.0, WHITE, 1.0);
+            }
+            if let Some(i) = self.active {
+                avatars::draw(g, self.profiles[i].avatar, MARGIN + 12.0, cy - 22.0, 44.0);
+            }
+            g.put(
+                self.profile_label.as_ref(),
+                MARGIN + 70.0,
+                cy - self.profile_label.as_ref().map_or(0.0, |t| t.h as f32 / 2.0),
+                color,
+                1.0,
+            );
+        }
 
+        if self.manager() {
+            g.rounded(cx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, self.cog_f);
+            let gc = rgb(
+                (f32::from(DIM.r) * (1.0 - self.cog_f)) as u8,
+                (f32::from(DIM.g) * (1.0 - self.cog_f)) as u8,
+                (f32::from(DIM.b) * (1.0 - self.cog_f)) as u8,
+            );
+            g.tint(&g.gear, gc, 1.0);
+            g.copy(
+                &g.gear,
+                None,
+                FRect {
+                    x: cx - 22.0,
+                    y: cy - 22.0,
+                    w: 44.0,
+                    h: 44.0,
+                },
+            );
+        }
         if tabs.len() < 2 {
             return;
         }
         let texs: Vec<Option<&Tex>> = tabs.iter().map(|(_, n)| self.tab_tex[n].as_ref()).collect();
         let widths: Vec<f32> = texs.iter().map(|t| t.map_or(0.0, |t| t.w as f32) + 64.0).collect();
-        let mut x = (W - widths.iter().sum::<f32>() - 16.0) / 2.0;
+        let left = MARGIN + profile_width + 24.0;
+        let right = cx - 56.0;
+        let total = widths.iter().sum::<f32>() + 16.0 * (widths.len() - 1) as f32;
+        let selected = tabs.iter().position(|(key, _)| *key == self.tab).unwrap_or(0);
+        let before = widths[..selected].iter().map(|w| w + 16.0).sum::<f32>();
+        let mut x = ((W - total) / 2.0)
+            .max(left)
+            .min(right - before - widths[selected])
+            .max(left - before);
         for (i, t) in texs.into_iter().enumerate() {
+            if i != selected && (x < left || x + widths[i] > right) {
+                x += widths[i] + 16.0;
+                continue;
+            }
             let current = tabs[i].0 == self.tab;
             let th = t.as_ref().map_or(0.0, |t| t.h as f32);
             let colour = if current && self.tabs_f {
@@ -1897,6 +2137,7 @@ impl App {
     fn draw_dialog(&self) {
         let g = &self.g;
         match &self.mode {
+            Mode::Picker(p) => p.draw(g),
             Mode::Menu(m) => draw_menu(g, m),
             Mode::Settings(p) => p.draw(g),
             Mode::Prompt(p, _) => p.draw(g),
@@ -1931,27 +2172,46 @@ impl App {
 
     /// The focus is on the bar at the top: the tabs or the cog.
     fn top(&self) -> bool {
-        self.cog || self.tabs_f
+        self.cog || self.tabs_f || self.profile_f
     }
 
     fn focus_top(&mut self) {
         if self.tabs().len() > 1 {
             self.tabs_f = true;
-        } else {
+        } else if self.manager() {
             self.cog = true;
+        } else {
+            self.profile_f = true;
         }
     }
 
     /// The keys while the focus is on the top bar: Left and Right go through the tabs and on to the cog.
     fn top_key(&mut self, dx: i32, dy: i32, ok: bool) {
+        if self.profile_f {
+            if ok {
+                self.switch_profiles();
+            } else if dy > 0 {
+                self.profile_f = false;
+            } else if dx > 0 {
+                self.profile_f = false;
+                self.focus_top();
+            }
+            return;
+        }
         if self.cog {
             if ok {
                 self.open_settings();
             } else if dy > 0 {
                 self.cog = false;
-            } else if dx < 0 && self.tabs().len() > 1 {
+            } else if dx < 0 {
                 self.cog = false;
-                self.tabs_f = true;
+                if self.tabs().len() > 1 {
+                    self.tabs_f = true;
+                } else if self.profiles.len() > 1 {
+                    self.profile_f = true;
+                } else {
+                    self.cog = true;
+                }
             }
             return;
         }
@@ -1962,14 +2222,25 @@ impl App {
         let tabs = self.tabs();
         let to = tabs.iter().position(|(k, _)| *k == self.tab).unwrap_or(0) as i32 + dx;
         if to >= tabs.len() as i32 {
-            self.tabs_f = false;
-            self.cog = true;
-        } else if to >= 0 {
+            if self.manager() {
+                self.tabs_f = false;
+                self.cog = true;
+            }
+        } else if to < 0 {
+            if self.profiles.len() > 1 {
+                self.tabs_f = false;
+                self.profile_f = true;
+            }
+        } else {
             self.tab = tabs[to as usize].0.clone();
             if let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) {
                 let _ = lib.refresh.send(false);
             }
         }
+    }
+
+    fn builtin_player(&self) -> bool {
+        self.kid() || self.prefs.jf_player
     }
 
     fn activate(&mut self, r: usize, c: usize) {
@@ -1981,17 +2252,18 @@ impl App {
                 self.refocus(key, col);
             }
             Kind::Watch
-                if self.prefs.jf_player
+                if self.builtin_player()
                     && (self.rows[r].items[c].key.starts_with("jf:")
                         || self.rows[r].items[c].key.starts_with("plex:")) =>
             {
                 let key = &self.rows[r].items[c].key;
                 let spec = key.strip_prefix("jf:").unwrap_or(key).to_string();
-                if self.film(&spec) {
+                if self.film(&spec) && self.can_launch(&self.rows[r].items[c]) {
                     self.luna.launch(&self.rows[r].items[c]);
                 }
             }
-            _ => self.luna.launch(&self.rows[r].items[c]),
+            _ if self.can_launch(&self.rows[r].items[c]) => self.luna.launch(&self.rows[r].items[c]),
+            _ => {}
         }
     }
 
@@ -2013,6 +2285,9 @@ impl App {
                 let list = opts.into_iter().map(|(label, a)| (Opt::Detail(a), label)).collect();
                 self.show_menu(&title, list, 0);
             }
+            return;
+        }
+        if !self.manager() {
             return;
         }
         if let Some(t) = self.lib_page().and_then(library::Page::title) {
@@ -2060,6 +2335,15 @@ impl App {
     }
 
     fn do_setting(&mut self, act: Act) {
+        if !self.manager() {
+            return;
+        }
+        if let Act::Profile(i) = act {
+            return self.manage_profile(i);
+        }
+        if act == Act::AddProfile {
+            return self.add_profile();
+        }
         self.last_settings = match &self.mode {
             Mode::Settings(p) => (p.cat, p.row, p.pane),
             _ => self.last_settings,
@@ -2180,7 +2464,7 @@ impl App {
                 None => off.push(key.into()),
             }
             self.prefs.save();
-            let root = self.luna.root.clone();
+            let root = self.profile_root.clone();
             if r == PLEX {
                 self.apply_plex(plex::cached(&root));
             } else {
@@ -2197,7 +2481,9 @@ impl App {
                 Some(i) => drop(on.remove(i)),
                 None => on.push(group.into()),
             }
-            self.prefs.save();
+            let mut device = Prefs::load(&self.luna.root);
+            device.debloat.clone_from(&self.prefs.debloat);
+            device.save();
             apply_debloat(&self.luna.root);
             return self.show_settings();
         }
@@ -2251,7 +2537,7 @@ impl App {
                 ];
                 self.show_menu(&title, list, 0);
             } else {
-                let l = Login::plex(&self.g, &self.luna.root, self.wake);
+                let l = Login::plex(&self.g, &self.profile_root, self.wake);
                 self.mode = Mode::Login(Box::new(l));
             }
         } else if act == Act::PlexApp {
@@ -2295,7 +2581,7 @@ impl App {
                 ];
                 self.show_menu(&title, list, 0);
             } else {
-                let l = Login::new(&self.g, &self.luna.root, self.wake, self.prefs.jf_server.clone());
+                let l = Login::new(&self.g, &self.profile_root, self.wake, self.prefs.jf_server.clone());
                 self.mode = Mode::Login(Box::new(l));
             }
         } else {
@@ -2408,7 +2694,7 @@ impl App {
             Opt::LibSort(by) => {
                 self.prefs.lib_sort = by.to_string();
                 self.prefs.save();
-                let root = self.luna.root.clone();
+                let root = self.profile_root.clone();
                 let views: Vec<(usize, String, &str)> = (self.libs.iter().enumerate())
                     .flat_map(|(i, l)| {
                         let pre = if l.plex { library::PLEX } else { library::JELLYFIN };
@@ -2510,6 +2796,7 @@ impl App {
                 self.pool.retain(|i| i.key != key);
             }
             Opt::Close => return,
+            _ => return self.account_option(opt),
         }
         self.prefs.save();
         self.rebuild_apps();
@@ -2517,8 +2804,16 @@ impl App {
     }
 
     fn ask(&mut self, ask: Ask, title: &str, body: &str, hint: &str, text: &str) {
-        let secret = matches!(ask, Ask::XtPass(..));
-        let p = Prompt::new(&self.g, title, body, hint, text, secret);
+        let pin = match &ask {
+            Ask::ProfilePin(i) => Some((*i, profiles::NEW_PIN_LEN)),
+            Ask::ConfirmPin(i, first) => Some((*i, first.len())),
+            Ask::Unlock(i) => Some((*i, self.profiles[*i].pin.len())),
+            _ => None,
+        };
+        let p = match pin {
+            Some((i, len)) => Prompt::pin(&self.g, title, body, hint, self.profiles[i].avatar, len),
+            None => Prompt::new(&self.g, title, body, hint, text, matches!(ask, Ask::XtPass(..))),
+        };
         self.mode = Mode::Prompt(Box::new(p), ask);
     }
 
@@ -2532,6 +2827,9 @@ impl App {
             }
         };
         match ask {
+            Ask::NewProfile(_) | Ask::ProfileName(_) | Ask::ProfilePin(_) | Ask::ConfirmPin(..) | Ask::Unlock(_) => {
+                return self.answer_account(ask, text)
+            }
             Ask::M3u if !text.is_empty() => self.set_tv(Some(iptv::Source::M3u(url(&text))), None),
             Ask::XtServer if !text.is_empty() => {
                 let user = match self.tv.as_ref().map(|t| &t.cfg.source) {
@@ -2627,7 +2925,15 @@ impl App {
             }
             KEYDOWN => {
                 let (sym, wcode) = (e.key_sym(), e.key_wcode());
-                log(&format!("key sym={sym} wcode={wcode}"));
+                if !matches!(
+                    self.mode,
+                    Mode::Prompt(
+                        _,
+                        Ask::XtPass(..) | Ask::ProfilePin(_) | Ask::ConfirmPin(..) | Ask::Unlock(_)
+                    )
+                ) {
+                    log(&format!("key sym={sym} wcode={wcode}"));
+                }
                 return self.key(sym, wcode, e.key_repeat());
             }
             // The Magic Remote's pointer is not used: moving it does nothing, and its click is OK.
@@ -2663,10 +2969,10 @@ impl App {
         }
         match &mut self.mode {
             // The tabs or the cog over a title's page: Down or Back returns to the page, another tab closes it.
-            Mode::Browse if self.detail.is_some() && (self.tabs_f || self.cog) => {
+            Mode::Browse if self.detail.is_some() && (self.tabs_f || self.cog || self.profile_f) => {
                 let tab = self.tab.clone();
                 if back {
-                    (self.tabs_f, self.cog) = (false, false);
+                    (self.tabs_f, self.cog, self.profile_f) = (false, false, false);
                 } else {
                     self.top_key(dx, dy, ok);
                 }
@@ -2718,6 +3024,10 @@ impl App {
                         }
                     }
                 }
+                if back && self.top() {
+                    (self.tabs_f, self.cog, self.profile_f) = (false, false, false);
+                    return true;
+                }
                 if back && !self.tab.is_empty() {
                     self.tab.clear();
                     self.tabs_f = false;
@@ -2748,6 +3058,7 @@ impl App {
                     self.nav(dx, dy);
                 }
             }
+            Mode::Picker(_) => self.picker_key(dx, dy, ok, back),
             Mode::Menu(m) => {
                 if back || options {
                     self.close_dialog();
@@ -2767,9 +3078,16 @@ impl App {
                 let out = p.key(dx, dy, ok, back);
                 self.settings_out(out);
             }
-            Mode::Prompt(p, _) => match p.key(&self.g, sym, ok, back, dx, dy) {
+            Mode::Prompt(p, _) if repeat && p.is_pin() && (b'0' as i32..=b'9' as i32).contains(&sym) => {}
+            Mode::Prompt(p, ask) => match p.key(&self.g, sym, ok, back, dx, dy) {
                 Typed::Stay => {}
-                Typed::Cancel => self.close_dialog(),
+                Typed::Cancel => {
+                    if let Ask::Unlock(i) = *ask {
+                        self.choose_profile(i, "");
+                    } else {
+                        self.close_dialog();
+                    }
+                }
                 Typed::Done(text) => {
                     if let Mode::Prompt(_, ask) = std::mem::replace(&mut self.mode, Mode::Browse) {
                         self.answered(ask, text);
@@ -2826,6 +3144,9 @@ impl App {
             return;
         };
         let _ = std::fs::remove_file(crate::player::TRIGGER);
+        if !self.manager() || self.editing.is_some() {
+            return;
+        }
         let what = what.trim();
         if let Ok(n) = what.parse::<usize>() {
             self.tab = "tv".into();
@@ -2871,6 +3192,10 @@ impl App {
     fn settings_out(&mut self, out: Out) {
         match out {
             Out::Stay => {}
+            Out::Back if self.editing.is_some() => {
+                self.reload_profile(self.active, None);
+                self.open_settings();
+            }
             Out::Back => {
                 self.in_settings = false;
                 self.mode = Mode::Browse;
@@ -2917,9 +3242,18 @@ impl App {
             SDL_ShowWindow(self.win);
             SDL_RaiseWindow(self.win);
         }
+        if self.active.is_none() {
+            self.close_dialog();
+            return;
+        }
+        if self.editing.is_some() {
+            self.reload_profile(self.active, None);
+            return;
+        }
         self.mode = Mode::Browse;
         self.in_settings = false;
         self.ok_down = None;
+        self.profile_f = false;
         self.detail = None;
         self.detail_back.clear();
         self.cog = false;
