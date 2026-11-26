@@ -5,8 +5,8 @@ A native Rust + SDL2 Home screen for rooted LG TVs (webOS 6). The [README](READM
 ## This repo is public
 
 - Keep personal data out of every commit: LAN IPs, hostnames, tokens, Jellyfin/Plex/YouTube content, real posters or thumbnails. `jellyfin.json`, `youtube.json`, `plex.json`, `fixtures/`, `build/`, `target/` and `dist/` must stay untracked.
-- Screenshots in the repo come from generated artwork. Re-render `docs/home.png` with `rm -rf /tmp/demo && cp -R fixtures /tmp/demo && rm -f /tmp/demo/media/developer/tvlauncher/state.json && python3 tools/demo-fixtures.py /tmp/demo && LAUNCHER_ROOT=/tmp/demo target/release/tvlauncher --shot build/demo.bmp "R"`, then `sips -s format png --resampleWidth 1600 build/demo.bmp --out docs/home.png`. Don't commit LG, Netflix or other vendors' artwork.
-- Before pushing, run `git grep -nI "192\.168\|/Users/" -- . ':!Cargo.lock'`. The README's example IP `192.168.1.10` is intended.
+- Use the [screenshot recipe](docs/guide.md#render-the-readme-screenshots) to render and review the README gallery. Don't commit LG, Netflix or other vendors' artwork.
+- Before pushing, run `git grep -nI "192\.168\|/Users/" -- . ':!Cargo.lock'`. The [guide](docs/guide.md#jellyfin)'s example IP `192.168.1.10` is intended.
 
 ## Build and check
 
