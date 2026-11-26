@@ -62,10 +62,10 @@ impl Source {
         match self {
             Source::None => None,
             Source::Jellyfin(server) => Some(format!(
-                "{server}/Items/{id}/Images/Logo?maxWidth=720&format=Png&tag={tag}"
+                "{server}/Items/{id}/Images/Logo?maxWidth=660&maxHeight=230&format=Png&tag={tag}"
             )),
             Source::Plex { base, token } => Some(format!(
-                "{base}/photo/:/transcode?width=720&height=280&minSize=0&upscale=0&format=png&url={}&X-Plex-Token={token}",
+                "{base}/photo/:/transcode?width=660&height=230&minSize=0&upscale=0&format=png&url={}&X-Plex-Token={token}",
                 encode(tag)
             )),
         }
@@ -126,6 +126,8 @@ pub struct Title {
     genres: Vec<String>,
     poster: Option<String>,
     backdrop: Option<String>,
+    /// See [`tmdb_key`]: the poster and backdrop are kept under it, once for both servers.
+    pub key: Option<String>,
 }
 
 pub enum Got {
@@ -187,6 +189,7 @@ fn title(o: &Value) -> Option<Title> {
         genres,
         poster: o["ImageTags"]["Primary"].as_str().map(String::from),
         backdrop: o["BackdropImageTags"][0].as_str().map(String::from),
+        key: tmdb_key(o),
     })
 }
 
@@ -247,6 +250,7 @@ pub(crate) fn plex_title(o: &Value) -> Option<Title> {
         genres,
         poster: s("thumb"),
         backdrop: s("art"),
+        key: tmdb_key(o),
         id,
         name,
     })
@@ -310,6 +314,7 @@ pub fn cached_titles(root: &str, pre: &str, view: &str) -> Vec<Title> {
                     .collect(),
                 poster: s("poster"),
                 backdrop: s("backdrop"),
+                key: s("key"),
             })
         })
         .collect()
@@ -332,12 +337,24 @@ pub(crate) fn save_views(root: &str, pre: &str, views: &[View]) -> Result<(), St
 
 pub(crate) fn save_titles(root: &str, pre: &str, view: &str, list: &[Title]) {
     crate::sdl::log(&format!("library {pre}-{view}: {} titles", list.len()));
+    // A shared name does not change with the picture: one the server changed is deleted, to be fetched again.
+    let old = cached_titles(root, pre, view);
+    for (t, o) in list
+        .iter()
+        .filter_map(|t| Some((t, old.iter().find(|o| o.id == t.id)?)))
+    {
+        for (kind, new, was) in [('p', &t.poster, &o.poster), ('b', &t.backdrop, &o.backdrop)] {
+            if let (Some(k), true) = (&t.key, new != was) {
+                let _ = std::fs::remove_file(format!("{root}{DIR}/cache/t-{kind}-{k}.img"));
+            }
+        }
+    }
     let v: Vec<Value> = list
         .iter()
         .map(|t| {
             json!({ "id": t.id, "name": t.name, "sort": t.sort, "added": t.added, "meta": t.meta,
                 "overview": t.overview, "progress": t.progress, "played": t.played, "rating": t.rating,
-                "genres": t.genres, "poster": t.poster, "backdrop": t.backdrop })
+                "genres": t.genres, "poster": t.poster, "backdrop": t.backdrop, "key": t.key })
         })
         .collect();
     let _ = std::fs::write(cache(root, pre, view), Value::from(v).to_string());
@@ -370,6 +387,29 @@ pub(crate) fn prune(root: &str, pre: &str, keep: &HashSet<String>) {
         if id.is_some_and(|id| id != "views" && !keep.contains(id)) {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// A film's or series' TMDB id as `tmdbm603` or `tmdbtv1668`, from a Jellyfin item (its `ProviderIds`) or Plex
+/// metadata (its `Guid`s, sent with `includeGuids=1`). Both servers name the same title the same way.
+pub(crate) fn tmdb_key(o: &Value) -> Option<String> {
+    let (series, id) = if o["Type"].is_string() {
+        (o["Type"] == "Series", o["ProviderIds"]["Tmdb"].as_str()?)
+    } else {
+        let guids = o["Guid"].as_array()?;
+        let id = guids.iter().find_map(|g| g["id"].as_str()?.strip_prefix("tmdb://"))?;
+        (o["type"] == "show", id)
+    };
+    let kind = if series { "tv" } else { "m" };
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| format!("tmdb{kind}{id}"))
+}
+
+/// Where a title's poster (`kind` `p`) or backdrop (`b`) is cached: `cache/t-<kind>-<key>.img` for a title with a
+/// TMDB key, shared by both servers; else the server's own, see [`pic_path`].
+pub(crate) fn title_pic(pre: &str, kind: char, id: &str, key: Option<&str>, tag: &str) -> Option<String> {
+    match key {
+        Some(k) => Some(format!("{DIR}/cache/t-{kind}-{k}.img")),
+        None => pic_path(pre, kind, id, tag),
     }
 }
 
@@ -419,7 +459,7 @@ pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool
     for (view, types) in &views {
         let q = format!(
             "/Users/{}/Items?ParentId={}&Recursive=true&IncludeItemTypes={types}&SortBy=SortName\
-             &Fields=Overview,Genres,DateCreated,SortName,EndDate&EnableImageTypes=Primary,Backdrop\
+             &Fields=Overview,Genres,DateCreated,SortName,EndDate,ProviderIds&EnableImageTypes=Primary,Backdrop\
              &ImageTypeLimit=1&EnableTotalRecordCount=false",
             cfg.user_id, view.id
         );
@@ -437,6 +477,7 @@ pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool
         }
     }
     prune(root, JELLYFIN, &keep);
+    crate::detail::prune_pictures(root);
     Ok(())
 }
 
@@ -660,7 +701,7 @@ impl Page {
         } else {
             t.poster.as_ref()
         }?;
-        pic_path(pre, if backdrop { 'b' } else { 'p' }, &t.id, tag)
+        title_pic(pre, if backdrop { 'b' } else { 'p' }, &t.id, t.key.as_deref(), tag)
     }
 
     /// Whether the page lists the title `id`.
@@ -888,6 +929,36 @@ mod tests {
             "UserData": { "Played": true, "PlayedPercentage": 100.0 } });
         let t = title(&show).unwrap();
         assert_eq!((t.meta.as_str(), t.progress, t.poster), ("2008–2013", 0.0, None));
+        assert_eq!(t.key, None);
+        let film = json!({ "Id": "1", "Name": "F", "Type": "Movie", "ProviderIds": { "Tmdb": "603" } });
+        assert_eq!(title(&film).unwrap().key.as_deref(), Some("tmdbm603"));
+        let show = json!({ "ratingKey": "9", "title": "S", "type": "show", "Guid": [{ "id": "tmdb://1668" }] });
+        assert_eq!(plex_title(&show).unwrap().key.as_deref(), Some("tmdbtv1668"));
+        let p = |key: Option<&str>| title_pic("plib", 'b', "9", key, "/art/123456789");
+        assert_eq!(
+            p(Some("tmdbtv1668")).unwrap(),
+            format!("{DIR}/cache/t-b-tmdbtv1668.img")
+        );
+        assert_eq!(p(None).unwrap(), format!("{DIR}/cache/plib-b-9-23456789.img"));
+
+        // A refresh that brings a new poster deletes the shared one, so it is fetched again; the backdrop stays.
+        let root = std::env::temp_dir().join(format!("tvl-lib-{}", std::process::id()));
+        let root = root.to_str().unwrap();
+        std::fs::create_dir_all(format!("{root}{DIR}/cache")).unwrap();
+        let mut f = title(
+            &json!({ "Id": "1", "Name": "F", "Type": "Movie", "ProviderIds": { "Tmdb": "603" },
+            "ImageTags": { "Primary": "old" }, "BackdropImageTags": ["bd"] }),
+        )
+        .unwrap();
+        save_titles(root, JELLYFIN, "v", std::slice::from_ref(&f));
+        for k in ['p', 'b'] {
+            std::fs::write(format!("{root}{DIR}/cache/t-{k}-tmdbm603.img"), "x").unwrap();
+        }
+        f.poster = Some("new".into());
+        save_titles(root, JELLYFIN, "v", &[f]);
+        let there = |k| std::path::Path::new(&format!("{root}{DIR}/cache/t-{k}-tmdbm603.img")).exists();
+        assert_eq!((there('p'), there('b')), (false, true));
+        let _ = std::fs::remove_dir_all(root);
         assert_eq!(types(Some("music")), None);
         assert_eq!(types(None), Some("Movie,Series"));
     }
@@ -906,6 +977,7 @@ mod tests {
             genres: genres.iter().map(|g| g.to_string()).collect(),
             poster: None,
             backdrop: None,
+            key: None,
         }
     }
 

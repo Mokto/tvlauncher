@@ -12,7 +12,7 @@ use crate::jellyfin::clip;
 use crate::library::{Source, Title};
 use crate::sdl::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -25,6 +25,10 @@ pub enum Backend {
 }
 
 impl Backend {
+    fn jf(&self) -> bool {
+        matches!(self, Backend::Jellyfin(_))
+    }
+
     /// What the film player takes (`film::resolve`): a Jellyfin item id or `plex:<server>:<rating key>`, and
     /// `@0` to start at the beginning instead of the resume point.
     fn spec(&self, id: &str, from_start: bool) -> String {
@@ -52,6 +56,8 @@ pub struct Related {
     pub id: String,
     pub name: String,
     pub poster: Option<String>,
+    /// Its TMDB key: its poster is the library's (see `library::title_pic`).
+    pub key: Option<String>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -72,6 +78,9 @@ pub struct Info {
     pub cast: Vec<Person>,
     /// The logo's Jellyfin image tag or Plex path.
     pub logo: Option<String>,
+    /// The title's TMDB id as `tmdbm603` (a film) or `tmdbtv1668`: the page's pictures are kept under it, once for
+    /// both servers.
+    pub key: Option<String>,
     pub related: Vec<Related>,
     /// Of the film, or of a series' next episode.
     pub streams: Streams,
@@ -97,7 +106,7 @@ pub struct Streams {
     pub access: Vec<&'static str>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct Ep {
     pub id: String,
     pub season: i64,
@@ -165,7 +174,7 @@ pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, 
             .then(|| std::fs::read(&file).ok())
             .flatten()
             .and_then(|d| serde_json::from_slice::<Value>(&d).ok())
-            .map(|v| parse(&b, &v));
+            .map(|v| parse(b.jf(), &v));
         if let Some(g) = &old {
             send(g.clone());
         }
@@ -174,11 +183,15 @@ pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, 
         let ms = t.elapsed().as_millis();
         match new {
             Ok(v) => {
-                let got = parse(&b, &v);
+                let v = trim(&v);
+                let got = parse(b.jf(), &v);
                 if old.as_ref() == Some(&got) {
                     log(&format!("detail: {id} in {ms} ms, unchanged"));
                 } else {
                     log(&format!("detail: {id} in {ms} ms"));
+                    if let Some(old) = &old {
+                        drop_changed(&root, pre, &id, old, &got);
+                    }
                     let _ = std::fs::write(&file, v.to_string());
                     send(got);
                 }
@@ -198,20 +211,29 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
     let (tx, rx) = channel::<(Backend, &'static str, Source, Vec<String>)>();
     std::thread::spawn(move || {
         while let Ok((b, pre, src, ids)) = rx.recv() {
+            let ids: HashSet<String> = ids.into_iter().collect();
             let (t, mut pages, mut pics) = (std::time::Instant::now(), 0, 0);
-            'library: for id in ids {
-                let file = page_file(&root, pre, &id);
+            'library: for id in &ids {
+                let free = free_mb(&root);
+                if free.is_some_and(|f| f < STOP_MB) && !make_room(&root) {
+                    log(&format!("prefetch: stopped, {} MB free", free.unwrap_or(0)));
+                    break;
+                }
+                let cast = !free_mb(&root).is_some_and(|f| f < ARTWORK_ONLY_MB);
+                let file = page_file(&root, pre, id);
                 let age = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
                 let fresh = age.and_then(|t| t.elapsed().ok()).is_some_and(|a| a < DAY);
                 // A fresh page still gets the pictures it misses (a run cut short by a reboot leaves some).
-                let saved = fresh
-                    .then(|| std::fs::read(&file).ok())
-                    .flatten()
+                let saved = std::fs::read(&file)
+                    .ok()
                     .and_then(|d| serde_json::from_slice::<Value>(&d).ok());
-                let v = match saved {
+                let v = match saved.clone().filter(|_| fresh) {
                     Some(v) => v,
-                    None => match fetch(&b, &id) {
+                    None => match fetch(&b, id).map(|v| trim(&v)) {
                         Ok(v) => {
+                            if let Some(old) = &saved {
+                                drop_changed(&root, pre, id, &parse(b.jf(), old), &parse(b.jf(), &v));
+                            }
                             let _ = std::fs::write(&file, v.to_string());
                             pages += 1;
                             v
@@ -222,10 +244,10 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
                         }
                     },
                 };
-                let Got::Loaded(info, seasons, _) = parse(&b, &v) else {
+                let Got::Loaded(info, seasons, next) = parse(b.jf(), &v) else {
                     continue;
                 };
-                for (url, path) in all_pictures(pre, &id, &src, &info, &seasons) {
+                for (url, path) in ahead(pre, id, &src, &info, seasons.get(next.0), &ids, cast) {
                     let full = format!("{root}{path}");
                     if std::path::Path::new(&full).exists() {
                         continue;
@@ -244,9 +266,10 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
                     }
                 }
             }
-            if pages + pics > 0 {
+            let gone = prune_pictures(&root);
+            if pages + pics + gone > 0 {
                 log(&format!(
-                    "prefetch: {pages} pages, {pics} pictures in {} s",
+                    "prefetch: {pages} pages, {pics} pictures in {} s, {gone} pictures removed",
                     t.elapsed().as_secs()
                 ));
             }
@@ -255,50 +278,453 @@ pub fn prefetch(root: String) -> Sender<(Backend, &'static str, Source, Vec<Stri
     tx
 }
 
-/// Every picture a page can show: (address, path under the root).
-fn all_pictures(pre: &str, id: &str, src: &Source, info: &Info, seasons: &[Season]) -> Vec<(String, String)> {
+/// Cast photos saved ahead: the ones on screen when the row comes into view. The others load when scrolled to.
+const CAST_AHEAD: usize = 8;
+
+/// Below this much free space where the launcher lives (MB), the fill saves artwork only, no cast photos. The TV's
+/// apps install and update on the same partition, so the cache leaves them room.
+const ARTWORK_ONLY_MB: u64 = 300;
+/// Below this, the fill deletes cast photos, then episode stills (see [`make_room`]), and stops if that isn't enough.
+/// Posters, backdrops and logos stay.
+const STOP_MB: u64 = 200;
+
+/// The free space of the partition the launcher lives on, in MB.
+#[allow(clippy::unnecessary_cast)] // the field types differ between the TV's libc and others
+fn free_mb(root: &str) -> Option<u64> {
+    let path = std::ffi::CString::new(format!("{root}{DIR}")).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64 / 1_000_000)
+}
+
+/// Page pictures to delete to make room, cast photos before episode stills, each oldest first: (name, modified).
+/// Logos are left, with posters and backdrops: they are the title's artwork.
+fn evict_order(mut files: Vec<(String, std::time::SystemTime)>) -> Vec<String> {
+    let tier = |name: &str| {
+        let what = name.splitn(4, '-').nth(3)?;
+        match (name.split('-').nth(1)?, what.as_bytes().first()?) {
+            ("e", b'c') => Some(0),
+            ("e", b's' | b'e') => Some(1),
+            _ => None,
+        }
+    };
+    files.retain(|(n, _)| tier(n).is_some());
+    files.sort_by_key(|(n, t)| (tier(n), *t));
+    files.into_iter().map(|(n, _)| n).collect()
+}
+
+/// Deletes page pictures (see [`evict_order`]) until [`STOP_MB`] plus 20 MB is free; false if that is not reached.
+fn make_room(root: &str) -> bool {
+    let dir = format!("{root}{DIR}/cache");
+    let files = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            Some((
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().ok()?.modified().ok()?,
+            ))
+        })
+        .collect();
+    let (mut gone, goal) = (0, STOP_MB + 20);
+    for (i, name) in evict_order(files).iter().enumerate() {
+        if i % 20 == 0 && free_mb(root).is_some_and(|f| f >= goal) {
+            break;
+        }
+        gone += usize::from(std::fs::remove_file(format!("{dir}/{name}")).is_ok());
+    }
+    log(&format!("prefetch: deleted {gone} cast photos and stills for room"));
+    free_mb(root).is_some_and(|f| f >= goal)
+}
+
+/// The pictures saved ahead for a page: (address, path under the root). Only the stills of `season`, the one the
+/// page opens on (the others load when the season is picked), and the posters of related titles in `library` (the
+/// row shows no others).
+fn ahead(
+    pre: &str,
+    id: &str,
+    src: &Source,
+    info: &Info,
+    season: Option<&Season>,
+    library: &HashSet<String>,
+    cast: bool,
+) -> Vec<(String, String)> {
+    let file = |p: Pic| pic_file(pre, id, info, p);
     let mut out = vec![];
     if let Some(tag) = &info.logo {
-        out.extend(src.logo(id, tag).zip(cache_path(pre, id, "logo", tag)));
+        out.extend(src.logo(id, tag).zip(file(Pic::Logo)));
     }
-    for p in &info.cast {
+    for p in info.cast.iter().take(if cast { CAST_AHEAD } else { 0 }) {
         if let Some(tag) = &p.photo {
-            out.extend(
-                src.picture(&p.id, tag, FACE_PX)
-                    .zip(cache_path(pre, id, &format!("c{}", p.id), tag)),
-            );
+            out.extend(src.picture(&p.id, tag, FACE_PX).zip(file(Pic::Face(p))));
         }
     }
-    for r in &info.related {
+    for r in info.related.iter().filter(|r| library.contains(&r.id)) {
         if let Some(tag) = &r.poster {
-            out.extend(
-                src.picture(&r.id, tag, POSTER_PX)
-                    .zip(crate::library::pic_path(pre, 'p', &r.id, tag)),
-            );
+            let path = crate::library::title_pic(pre, 'p', &r.id, r.key.as_deref(), tag);
+            out.extend(src.picture(&r.id, tag, POSTER_PX).zip(path));
         }
     }
-    for e in seasons.iter().flat_map(|s| &s.eps) {
+    for e in season.into_iter().flat_map(|s| &s.eps) {
         if let Some(tag) = &e.still {
-            out.extend(src.still(&e.id, tag, STILL_W).zip(cache_path(pre, id, &e.id, tag)));
+            out.extend(src.still(&e.id, tag, STILL_W).zip(file(Pic::Still(e))));
         }
     }
     out
 }
 
-/// Where a picture of the page of `id` is cached. Named after the title, so the library's clean-up keeps it while
-/// the title is in the library.
-fn cache_path(pre: &str, id: &str, key: &str, tag: &str) -> Option<String> {
-    let end: String = tag
-        .rsplit('/')
-        .next()?
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
-    let key: String = key.chars().filter(char::is_ascii_alphanumeric).collect();
+#[derive(Clone, Copy)]
+enum Pic<'a> {
+    Logo,
+    Still(&'a Ep),
+    Face(&'a Person),
+}
+
+/// Where a picture of the page of `id` is cached. With a TMDB id (`info.key`) both servers share it:
+/// `cache/t-e-<key>-<what>.img`, an episode by its numbers and a person by name. Without, it is the server's own,
+/// named after the title and the picture's tag: `cache/<pre>-e-<id>-<what><tag>.img`.
+fn pic_file(pre: &str, id: &str, info: &Info, pic: Pic) -> Option<String> {
+    let alnum = |s: &str| -> String { s.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let (tag, own, shared) = match pic {
+        Pic::Logo => (info.logo.as_deref()?, "logo".to_string(), "logo".to_string()),
+        Pic::Still(e) => {
+            let numbered = (e.no > 0).then(|| format!("s{}e{}", e.season, e.no));
+            // `e<id>`: a still's name starts with `s` or `e`, a cast photo's with `c` (see `evict_order`).
+            let own = format!("e{}", e.id);
+            (e.still.as_deref()?, own.clone(), numbered.unwrap_or(own))
+        }
+        Pic::Face(p) => (p.photo.as_deref()?, format!("c{}", p.id), format!("c{}", p.name)),
+    };
+    // Shared names leave out the servers' tags (they differ): `drop_changed` deletes a picture whose tag changed.
+    if let Some(k) = &info.key {
+        return Some(format!("{DIR}/cache/t-e-{k}-{}.img", alnum(&shared)));
+    }
+    let end = alnum(tag.rsplit('/').next()?);
     Some(format!(
-        "{DIR}/cache/{pre}-e-{id}-{key}{}.img",
+        "{DIR}/cache/{pre}-e-{id}-{}{}.img",
+        alnum(&own),
         &end[end.len().saturating_sub(8)..]
     ))
+}
+
+/// Each page picture's cache path and the server's tag for it.
+fn tags(pre: &str, id: &str, got: &Got) -> HashMap<String, String> {
+    let Got::Loaded(info, seasons, _) = got else {
+        return HashMap::new();
+    };
+    let tag = |p: &Pic| match p {
+        Pic::Logo => info.logo.clone(),
+        Pic::Still(e) => e.still.clone(),
+        Pic::Face(p) => p.photo.clone(),
+    };
+    let pics = std::iter::once(Pic::Logo)
+        .chain(info.cast.iter().map(Pic::Face))
+        .chain(seasons.iter().flat_map(|s| &s.eps).map(Pic::Still));
+    pics.filter_map(|p| Some((pic_file(pre, id, info, p)?, tag(&p)?)))
+        .collect()
+}
+
+/// Deletes the cached pictures whose tag the server changed, so they are fetched again: a shared name (see
+/// [`pic_file`]) does not change with the picture.
+fn drop_changed(root: &str, pre: &str, id: &str, old: &Got, new: &Got) {
+    let old = tags(pre, id, old);
+    for (path, tag) in tags(pre, id, new) {
+        if old.get(&path).is_some_and(|t| *t != tag) {
+            let _ = std::fs::remove_file(format!("{root}{path}"));
+        }
+    }
+}
+
+/// The TMDB key of a saved page (see [`Info::key`]).
+fn tmdb_key(v: &Value) -> Option<String> {
+    let jf = &v["item"];
+    crate::library::tmdb_key(if jf["Type"].is_string() {
+        jf
+    } else {
+        &v["item"]["MediaContainer"]["Metadata"][0]
+    })
+}
+
+/// Removes the pictures no saved page or library list uses any more (their title left both servers' libraries, or
+/// its pictures are now kept once under its TMDB id), and returns how many.
+pub fn prune_pictures(root: &str) -> usize {
+    let names: Vec<String> = std::fs::read_dir(format!("{root}{DIR}/cache"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let mut keep = std::collections::HashSet::new();
+    for name in &names {
+        let Some((pre, id)) = name.strip_suffix("-page").and_then(|n| n.split_once("-d-")) else {
+            continue;
+        };
+        let saved = std::fs::read(format!("{root}{DIR}/cache/{name}")).ok();
+        let v = saved
+            .and_then(|d| serde_json::from_slice::<Value>(&d).ok())
+            .unwrap_or_default();
+        keep.insert(match tmdb_key(&v) {
+            Some(k) => format!("t-e-{k}"),
+            None => format!("{pre}-e-{id}"),
+        });
+    }
+    // The library lists (`<lib|plib>-<view>.json`): posters and backdrops.
+    for name in &names {
+        let Some((pre, view)) = name.strip_suffix(".json").and_then(|n| n.split_once('-')) else {
+            continue;
+        };
+        if !matches!(pre, "lib" | "plib") || view == "views" {
+            continue;
+        }
+        for t in crate::library::cached_titles(root, pre, view) {
+            match &t.key {
+                Some(k) => keep.extend([format!("t-p-{k}"), format!("t-b-{k}")]),
+                None => keep.extend([format!("{pre}-p-{}", t.id), format!("{pre}-b-{}", t.id)]),
+            }
+        }
+    }
+    let mut gone = 0;
+    for name in &names {
+        let Some(base) = name.strip_suffix(".img") else {
+            continue;
+        };
+        let mut parts = base.splitn(4, '-');
+        let (Some(pre @ ("lib" | "plib" | "t")), Some(kind @ ("e" | "p" | "b")), Some(id)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if !keep.contains(&format!("{pre}-{kind}-{id}"))
+            && std::fs::remove_file(format!("{root}{DIR}/cache/{name}")).is_ok()
+        {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// Every name the title's parsers read (and a few of the values they compare with, which is harmless): all that is
+/// saved of the title and its next episode.
+const FIELDS: &[&str] = &[
+    "AAC",
+    "AD",
+    "Actor",
+    "Atmos",
+    "Audience",
+    "Audio",
+    "CC",
+    "Channels",
+    "Codec",
+    "CommunityRating",
+    "CriticRating",
+    "DOVI",
+    "DOVIPresent",
+    "DTS",
+    "Director",
+    "DisplayTitle",
+    "Episode",
+    "FLAC",
+    "Genre",
+    "Genres",
+    "GuestStar",
+    "Guid",
+    "HDR10",
+    "HDR10Plus",
+    "HLG",
+    "IMDb",
+    "Id",
+    "Image",
+    "ImageTags",
+    "IndexNumber",
+    "IsDefault",
+    "IsHearingImpaired",
+    "Items",
+    "Language",
+    "Logo",
+    "MP3",
+    "Media",
+    "MediaContainer",
+    "MediaStreams",
+    "Metadata",
+    "Movie",
+    "MusicVideo",
+    "Name",
+    "OfficialRating",
+    "Opus",
+    "OriginalLanguage",
+    "Overview",
+    "ParentIndexNumber",
+    "Part",
+    "People",
+    "PlaybackPositionTicks",
+    "Played",
+    "PlayedPercentage",
+    "PremiereDate",
+    "Primary",
+    "PrimaryImageTag",
+    "Profile",
+    "ProviderIds",
+    "Rating",
+    "Role",
+    "RunTimeTicks",
+    "SD",
+    "SDH",
+    "SeasonName",
+    "Series",
+    "Specials",
+    "Stream",
+    "Studios",
+    "Subtitle",
+    "TMDB",
+    "Title",
+    "Tmdb",
+    "Type",
+    "Unknown",
+    "UserData",
+    "Video",
+    "VideoRangeType",
+    "Width",
+    "Writer",
+    "aac",
+    "ac3",
+    "audienceRating",
+    "audienceRatingImage",
+    "channels",
+    "clearLogo",
+    "clip",
+    "codec",
+    "colorTrc",
+    "contentRating",
+    "dca",
+    "descri",
+    "displayTitle",
+    "dts",
+    "duration",
+    "eac3",
+    "episode",
+    "episodes",
+    "extendedDisplayTitle",
+    "flac",
+    "hearingImpaired",
+    "id",
+    "imdb",
+    "index",
+    "item",
+    "languageCode",
+    "ma",
+    "movie",
+    "mp3",
+    "next",
+    "opus",
+    "originallyAvailableAt",
+    "parentIndex",
+    "parentTitle",
+    "profile",
+    "rating",
+    "ratingImage",
+    "ratingKey",
+    "role",
+    "rottentomatoes",
+    "s",
+    "sdh",
+    "season",
+    "selected",
+    "show",
+    "similar",
+    "smpte2084",
+    "streamType",
+    "studio",
+    "summary",
+    "tag",
+    "themoviedb",
+    "thumb",
+    "title",
+    "truehd",
+    "type",
+    "url",
+    "viewCount",
+    "viewOffset",
+    "width",
+    "x",
+];
+
+/// What the episode rows read: Plex repeats the series' artwork, cast and crew in every episode.
+const EP_FIELDS: &[&str] = &[
+    "Id",
+    "ImageTags",
+    "IndexNumber",
+    "Items",
+    "MediaContainer",
+    "Metadata",
+    "Name",
+    "Overview",
+    "ParentIndexNumber",
+    "PlaybackPositionTicks",
+    "Played",
+    "PlayedPercentage",
+    "PremiereDate",
+    "Primary",
+    "RunTimeTicks",
+    "SeasonName",
+    "UserData",
+    "duration",
+    "index",
+    "originallyAvailableAt",
+    "parentIndex",
+    "parentTitle",
+    "ratingKey",
+    "summary",
+    "thumb",
+    "title",
+    "viewCount",
+    "viewOffset",
+];
+
+/// What the Related row reads: the servers send each similar title's whole details.
+const RELATED_FIELDS: &[&str] = &[
+    // Its TMDB key (`library::tmdb_key`).
+    "ProviderIds",
+    "Tmdb",
+    "Type",
+    "Guid",
+    "id",
+    "type",
+    "Id",
+    "ImageTags",
+    "Items",
+    "MediaContainer",
+    "Metadata",
+    "Name",
+    "Primary",
+    "ratingKey",
+    "thumb",
+    "title",
+];
+
+/// The server's answers (see [`fetch`]) with only the fields the page reads.
+fn trim(v: &Value) -> Value {
+    fn keep(v: &Value, fields: &[&str]) -> Value {
+        match v {
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .filter(|(k, _)| fields.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), keep(v, fields)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(|v| keep(v, fields)).collect()),
+            v => v.clone(),
+        }
+    }
+    let Value::Object(o) = v else { return v.clone() };
+    let part = |k: &str, v| match k {
+        "episodes" => keep(v, EP_FIELDS),
+        "similar" => keep(v, RELATED_FIELDS),
+        _ => keep(v, FIELDS),
+    };
+    Value::Object(o.iter().map(|(k, v)| (k.clone(), part(k, v))).collect())
 }
 
 /// Marks `id` watched or not on the server, on a thread. The page shows the change at once.
@@ -337,7 +763,10 @@ fn fetch(b: &Backend, id: &str) -> Result<Value, String> {
             let user = &c.user_id;
             v["item"] = json(c.get_within(&format!("/Users/{user}/Items/{id}"), 15)?)?;
             v["similar"] = c
-                .get_within(&format!("/Items/{id}/Similar?userId={user}&limit=16"), 10)
+                .get_within(
+                    &format!("/Items/{id}/Similar?userId={user}&limit=16&Fields=ProviderIds"),
+                    10,
+                )
                 .and_then(json)
                 .unwrap_or_default();
             if v["item"]["Type"] == "Series" {
@@ -347,7 +776,7 @@ fn fetch(b: &Backend, id: &str) -> Result<Value, String> {
                     ),
                     20,
                 )?)?;
-                if let Some(next) = next_id(b, &v) {
+                if let Some(next) = next_id(b.jf(), &v) {
                     v["next"] = c
                         .get_within(&format!("/Users/{user}/Items/{next}"), 10)
                         .and_then(json)
@@ -358,14 +787,14 @@ fn fetch(b: &Backend, id: &str) -> Result<Value, String> {
         Backend::Plex(conn, _) => {
             v["item"] = conn.get_json(&format!("/library/metadata/{id}"), 15)?;
             v["similar"] = conn
-                .get_json(&format!("/library/metadata/{id}/similar?count=16"), 10)
+                .get_json(&format!("/library/metadata/{id}/similar?count=16&includeGuids=1"), 10)
                 .unwrap_or_default();
             if v["item"]["MediaContainer"]["Metadata"][0]["type"] == "show" {
                 v["episodes"] = conn.get_json(
                     &format!("/library/metadata/{id}/allLeaves?X-Plex-Container-Start=0&X-Plex-Container-Size=2000"),
                     20,
                 )?;
-                if let Some(next) = next_id(b, &v) {
+                if let Some(next) = next_id(b.jf(), &v) {
                     v["next"] = conn
                         .get_json(&format!("/library/metadata/{next}"), 10)
                         .unwrap_or_default();
@@ -376,30 +805,31 @@ fn fetch(b: &Backend, id: &str) -> Result<Value, String> {
     Ok(v)
 }
 
-fn episodes(b: &Backend, v: &Value) -> Vec<Ep> {
-    let (list, ep): (&Value, fn(&Value) -> Option<Ep>) = match b {
-        Backend::Jellyfin(_) => (&v["episodes"]["Items"], jf_ep),
-        Backend::Plex(..) => (&v["episodes"]["MediaContainer"]["Metadata"], plex_ep),
+fn episodes(jf: bool, v: &Value) -> Vec<Ep> {
+    let (list, ep): (&Value, fn(&Value) -> Option<Ep>) = if jf {
+        (&v["episodes"]["Items"], jf_ep)
+    } else {
+        (&v["episodes"]["MediaContainer"]["Metadata"], plex_ep)
     };
     list.as_array().into_iter().flatten().filter_map(ep).collect()
 }
 
-fn next_id(b: &Backend, v: &Value) -> Option<String> {
-    let (seasons, (s, e)) = group(episodes(b, v));
+fn next_id(jf: bool, v: &Value) -> Option<String> {
+    let (seasons, (s, e)) = group(episodes(jf, v));
     Some(seasons.get(s)?.eps.get(e)?.id.clone())
 }
 
 /// The page, from the server's answers (see [`fetch`]).
-fn parse(b: &Backend, v: &Value) -> Got {
-    let (o, similar, next) = match b {
-        Backend::Jellyfin(_) => (&v["item"], &v["similar"]["Items"], &v["next"]),
-        Backend::Plex(..) => (
+fn parse(jf: bool, v: &Value) -> Got {
+    let (o, similar, next) = if jf {
+        (&v["item"], &v["similar"]["Items"], &v["next"])
+    } else {
+        (
             &v["item"]["MediaContainer"]["Metadata"][0],
             &v["similar"]["MediaContainer"]["Metadata"],
             &v["next"]["MediaContainer"]["Metadata"][0],
-        ),
+        )
     };
-    let jf = matches!(b, Backend::Jellyfin(_));
     let kind = if jf { &o["Type"] } else { &o["type"] };
     let series = match kind.as_str().unwrap_or_default() {
         "Series" | "show" => true,
@@ -407,12 +837,13 @@ fn parse(b: &Backend, v: &Value) -> Got {
         _ => return Got::Elsewhere,
     };
     let mut info = if jf { jf_info(o) } else { plex_info(o) };
+    info.key = tmdb_key(v);
     let related = if jf { jf_related } else { plex_related };
     info.related = similar.as_array().into_iter().flatten().filter_map(related).collect();
     if !series {
         return Got::Loaded(Box::new(info), vec![], (0, 0));
     }
-    let (seasons, next_ep) = group(episodes(b, v));
+    let (seasons, next_ep) = group(episodes(jf, v));
     info.length = series_length(&seasons);
     if next.is_object() {
         info.streams = if jf { jf_streams(next) } else { plex_streams(next) };
@@ -683,6 +1114,7 @@ fn jf_info(o: &Value) -> Info {
     let ud = &o["UserData"];
     let series = o["Type"] == "Series";
     Info {
+        key: None,
         series,
         genres: o["Genres"]
             .as_array()
@@ -765,6 +1197,7 @@ fn plex_info(o: &Value) -> Info {
         .and_then(|i| i["url"].as_str())
         .map(String::from);
     Info {
+        key: None,
         series: o["type"] == "show",
         genres: tags("Genre"),
         age: s("contentRating"),
@@ -788,6 +1221,7 @@ fn jf_related(o: &Value) -> Option<Related> {
         id: o["Id"].as_str()?.into(),
         name: o["Name"].as_str()?.into(),
         poster: o["ImageTags"]["Primary"].as_str().map(String::from),
+        key: crate::library::tmdb_key(o),
     })
 }
 
@@ -796,6 +1230,7 @@ fn plex_related(o: &Value) -> Option<Related> {
         id: o["ratingKey"].as_str()?.into(),
         name: o["title"].as_str()?.into(),
         poster: o["thumb"].as_str().map(String::from),
+        key: crate::library::tmdb_key(o),
     })
 }
 
@@ -921,7 +1356,7 @@ const REL_BLOCK: f32 = HEAD + POSTER.1 + 110.0;
 const ABOUT_W: f32 = 760.0;
 const COLS: [f32; 3] = [MARGIN, MARGIN + 640.0, MARGIN + 1200.0];
 const STILL_W: u32 = 480;
-const FACE_PX: u32 = 240;
+const FACE_PX: u32 = 176;
 const POSTER_PX: u32 = 300;
 /// Where a focused section's top sits on the screen once the page has scrolled to it.
 const SECTION_TOP: f32 = 150.0;
@@ -1552,24 +1987,24 @@ impl Page {
         self.stale = true;
     }
 
-    fn cache(&self, key: &str, tag: &str) -> Option<String> {
-        cache_path(self.pre, &self.id, key, tag)
+    fn file(&self, pic: Pic) -> Option<String> {
+        pic_file(self.pre, &self.id, self.info.as_ref()?, pic)
     }
 
     fn still_path(&self, e: &Ep) -> Option<String> {
-        self.cache(&e.id, e.still.as_ref()?)
+        self.file(Pic::Still(e))
     }
 
     fn face_path(&self, p: &Person) -> Option<String> {
-        self.cache(&format!("c{}", p.id), p.photo.as_ref()?)
+        self.file(Pic::Face(p))
     }
 
     fn poster_path(&self, r: &Related) -> Option<String> {
-        crate::library::pic_path(self.pre, 'p', &r.id, r.poster.as_ref()?)
+        crate::library::title_pic(self.pre, 'p', &r.id, r.key.as_deref(), r.poster.as_ref()?)
     }
 
     fn logo_path(&self) -> Option<String> {
-        self.cache("logo", self.info.as_ref()?.logo.as_ref()?)
+        self.file(Pic::Logo)
     }
 
     /// The pictures to fetch: the logo, then the focused row's around the focus, then the other rows' first ones.
@@ -1879,8 +2314,8 @@ impl Page {
             }
             x += w + 12.0;
         }
-        if self.focus == Focus::Eps {
-            let h = &self.tex.hint;
+        let h = &self.tex.hint;
+        if self.focus == Focus::Eps && x + 24.0 < W - MARGIN - texw(h) {
             g.put(
                 h.as_ref(),
                 W - MARGIN - texw(h),
@@ -2283,31 +2718,27 @@ mod tests {
 
     #[test]
     fn a_saved_page_is_read_back_and_kept_while_its_title_is_in_the_library() {
-        let b = Backend::Jellyfin(crate::jellyfin::Config {
-            server: String::new(),
-            token: String::new(),
-            server_id: String::new(),
-            user_id: String::new(),
-            user: String::new(),
-        });
+        let b = true;
         let ep = |n: i64, played: bool| json!({ "Id": format!("e{n}"), "IndexNumber": n, "ParentIndexNumber": 1, "UserData": { "Played": played } });
         let v = json!({
             "item": { "Type": "Series", "Name": "Show" },
-            "similar": { "Items": [{ "Id": "r1", "Name": "Other", "ImageTags": { "Primary": "t" } }] },
+            "similar": { "Items": [{ "Id": "r1", "Name": "Other", "ImageTags": { "Primary": "t" },
+                "Type": "Movie", "ProviderIds": { "Tmdb": "7" } }] },
             "episodes": { "Items": [ep(1, true), ep(2, false)] },
             "next": { "MediaStreams": [{ "Type": "Audio", "Language": "fre", "Codec": "aac", "Channels": 2 }] }
         });
-        assert_eq!(next_id(&b, &v).as_deref(), Some("e2"));
+        assert_eq!(next_id(b, &v).as_deref(), Some("e2"));
         let saved: Value = serde_json::from_str(&v.to_string()).unwrap();
-        let got = parse(&b, &saved);
-        assert_eq!(got, parse(&b, &v), "the saved copy draws the same page");
+        let got = parse(b, &trim(&saved));
+        assert_eq!(got, parse(b, &v), "the saved copy draws the same page");
         let Got::Loaded(info, seasons, next) = got else {
             panic!()
         };
         assert_eq!((seasons[0].eps.len(), next), (2, (0, 1)));
         assert_eq!(info.related[0].id, "r1");
+        assert_eq!(info.related[0].key.as_deref(), Some("tmdbm7"), "kept by the trim");
         assert_eq!(info.streams.audio, ["French (AAC Stereo)"]);
-        assert_eq!(parse(&b, &json!({ "item": { "Type": "BoxSet" } })), Got::Elsewhere);
+        assert_eq!(parse(b, &json!({ "item": { "Type": "BoxSet" } })), Got::Elsewhere);
 
         let root = std::env::temp_dir().join(format!("tvl-page-{}", std::process::id()));
         let root = root.to_str().unwrap();
@@ -2318,7 +2749,145 @@ mod tests {
         crate::library::prune(root, "lib", &["keep".to_string()].into_iter().collect());
         assert!(std::path::Path::new(&page_file(root, "lib", "keep")).exists());
         assert!(!std::path::Path::new(&page_file(root, "lib", "gone")).exists());
+
+        // Both servers' pages of one film share its pictures; the server's own names and orphans go.
+        let film = |id: &str| json!({ "item": { "Type": "Movie", "ProviderIds": { "Tmdb": id } } }).to_string();
+        let plex = json!({ "item": { "MediaContainer": { "Metadata": [
+            { "type": "movie", "Guid": [{ "id": "imdb://tt1" }, { "id": "tmdb://5" }] }] } } });
+        assert_eq!(tmdb_key(&plex).as_deref(), Some("tmdbm5"));
+        std::fs::write(page_file(root, "lib", "keep"), film("5")).unwrap();
+        std::fs::write(page_file(root, "plib", "7"), plex.to_string()).unwrap();
+        let cache = format!("{root}{DIR}/cache");
+        // A library list: a title without a TMDB id keeps its own poster; one with it shares its poster.
+        let list = json!([{ "id": "keep", "name": "K" }, { "id": "film5", "name": "F", "key": "tmdbm5" }]);
+        std::fs::write(format!("{cache}/lib-v1.json"), list.to_string()).unwrap();
+        for f in [
+            "t-e-tmdbm5-logo.img",
+            "lib-e-keep-logoabc.img",
+            "t-e-tmdbm9-logo.img",
+            "lib-p-keep-x.img",
+            "t-p-tmdbm5.img",
+            "lib-p-film5-y.img",
+            "t-b-tmdbm8.img",
+            "home-p-x.img",
+        ] {
+            std::fs::write(format!("{cache}/{f}"), "").unwrap();
+        }
+        assert_eq!(prune_pictures(root), 4);
+        let mut left: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".img"))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "home-p-x.img",
+                "lib-p-keep-x.img",
+                "t-e-tmdbm5-logo.img",
+                "t-p-tmdbm5.img"
+            ]
+        );
         let _ = std::fs::remove_dir_all(root);
+
+        let ep = Ep {
+            id: "abc".into(),
+            season: 2,
+            no: 3,
+            still: Some("tag".into()),
+            ..Default::default()
+        };
+        let face = Person {
+            id: "77".into(),
+            name: "Jo Doe".into(),
+            photo: Some("p".into()),
+            ..Default::default()
+        };
+        let mut info = Info {
+            key: Some("tmdbtv9".into()),
+            logo: Some("/l/123456789".into()),
+            ..Default::default()
+        };
+        let names =
+            |i: &Info| [Pic::Logo, Pic::Still(&ep), Pic::Face(&face)].map(|p| pic_file("lib", "x", i, p).unwrap());
+        assert_eq!(
+            names(&info),
+            [
+                format!("{DIR}/cache/t-e-tmdbtv9-logo.img"),
+                format!("{DIR}/cache/t-e-tmdbtv9-s2e3.img"),
+                format!("{DIR}/cache/t-e-tmdbtv9-cJoDoe.img"),
+            ]
+        );
+        info.key = None;
+        assert_eq!(names(&info)[0], format!("{DIR}/cache/lib-e-x-logo23456789.img"));
+
+        // A picture the server changed is deleted, so the page fetches it again; the others stay.
+        info.key = Some("tmdbtv9".into());
+        info.cast = vec![face.clone()];
+        let old = Got::Loaded(Box::new(info.clone()), vec![], (0, 0));
+        info.logo = Some("/l/new".into());
+        let new = Got::Loaded(Box::new(info.clone()), vec![], (0, 0));
+        std::fs::create_dir_all(format!("{root}{DIR}/cache")).unwrap();
+        let [logo, _, face_file] = names(&info);
+        for f in [&logo, &face_file] {
+            std::fs::write(format!("{root}{f}"), "x").unwrap();
+        }
+        drop_changed(root, "lib", "x", &old, &new);
+        assert!(!std::path::Path::new(&format!("{root}{logo}")).exists());
+        assert!(std::path::Path::new(&format!("{root}{face_file}")).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn room_is_made_from_cast_photos_first_then_stills() {
+        let t = |s: u64| std::time::UNIX_EPOCH + Duration::from_secs(s);
+        let files = [
+            ("t-e-tmdbtv9-s1e2.img", 1),
+            ("t-e-tmdbtv9-cJoDoe.img", 5),
+            ("t-p-tmdbtv9.img", 0),
+            ("t-e-tmdbtv9-logo.img", 0),
+            ("lib-e-x-eabc123.img", 0),
+            ("t-e-tmdbm5-cAnn.img", 2),
+            ("lib-d-x-page", 0),
+        ];
+        let order = evict_order(files.iter().map(|(n, s)| (n.to_string(), t(*s))).collect());
+        assert_eq!(
+            order,
+            [
+                "t-e-tmdbm5-cAnn.img",
+                "t-e-tmdbtv9-cJoDoe.img",
+                "lib-e-x-eabc123.img",
+                "t-e-tmdbtv9-s1e2.img"
+            ]
+        );
+        let root = std::env::temp_dir().join(format!("tvl-free-{}", std::process::id()));
+        let root = root.to_str().unwrap();
+        std::fs::create_dir_all(format!("{root}{DIR}")).unwrap();
+        assert!(free_mb(root).is_some_and(|mb| mb > 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Run with `PAGES=<cache dir> cargo test --release -- --ignored saved_pages`: every saved page there draws
+    /// the same once trimmed to the fields the page reads.
+    #[test]
+    #[ignore]
+    fn saved_pages_keep_what_the_page_reads() {
+        let dir = std::env::var("PAGES").unwrap();
+        let mut n = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with("-page") {
+                continue;
+            }
+            let v: Value = serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+            let jf = name.starts_with("lib-");
+            assert_eq!(parse(jf, &trim(&v)), parse(jf, &v), "{name}");
+            assert!(tmdb_key(&trim(&v)).is_some(), "{name}");
+            n += 1;
+        }
+        assert!(n > 0);
     }
 
     #[test]
