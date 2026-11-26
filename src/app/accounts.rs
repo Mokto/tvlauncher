@@ -144,7 +144,7 @@ impl App {
     }
 
     pub(super) fn picker_key(&mut self, dx: i32, dy: i32, ok: bool, back: bool) {
-        let editable = self.manager() && self.editing.is_none();
+        let editing = self.editing.filter(|_| self.manager());
         let Mode::Picker(p) = &mut self.mode else { return };
         let selected = p.selected;
         match p.target {
@@ -155,7 +155,7 @@ impl App {
             }
             Target::Profile if ok => self.select_profile(selected),
             Target::Picture(i) if back => self.manage_profile(i),
-            Target::Picture(i) if ok && editable => {
+            Target::Picture(i) if ok && editing == Some(i) => {
                 let mut list = self.profiles.clone();
                 list[i].avatar = selected;
                 if self.update_profiles(list) {
@@ -180,28 +180,32 @@ impl App {
     }
 
     pub(super) fn profile_entries(&self) -> Vec<Entry> {
-        std::iter::once(Entry {
-            act: Act::AddProfile,
-            title: "Add profile".into(),
-            desc: "Create a Manager, Adult or Kid profile.".into(),
-            value: Value::Text("Add".into()),
-        })
-        .chain(self.profiles.iter().enumerate().map(|(i, p)| {
-            Entry {
+        self.profiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Entry {
                 act: Act::Profile(i),
                 title: p.name.clone(),
                 desc: if Some(i) == self.active {
-                    "Current profile"
+                    "Watching now"
                 } else if p.pin.is_empty() {
                     "No PIN"
                 } else {
                     "PIN protected"
                 }
                 .into(),
-                value: Value::Text(p.role.label().into()),
-            }
-        }))
-        .collect()
+                value: Value::Profile {
+                    avatar: p.avatar,
+                    role: p.role.label().into(),
+                },
+            })
+            .chain(std::iter::once(Entry {
+                act: Act::AddProfile,
+                title: "Add profile".into(),
+                desc: "Create a Manager, Adult or Kid profile.".into(),
+                value: Value::Text("Add".into()),
+            }))
+            .collect()
     }
 
     pub(super) fn add_profile(&mut self) {
@@ -216,49 +220,98 @@ impl App {
     }
 
     pub(super) fn manage_profile(&mut self, i: usize) {
-        let p = &self.profiles[i];
-        let title = format!("{} · {}", p.name, p.role.label());
-        let mut list = vec![
-            (Opt::ProfileMedia(i), "Jellyfin, Plex and Tabs".into()),
-            (Opt::RenameProfile(i), "Rename".into()),
-            (
-                Opt::ProfilePin(i),
-                if p.pin.is_empty() { "Set PIN" } else { "Change PIN" }.into(),
-            ),
-        ];
-        if p.role == Role::Kid {
-            list.push((Opt::ProfileApps(i), format!("Allowed apps ({})", p.apps.len())));
+        if self.editing == Some(i) {
+            self.show_settings();
+        } else {
+            self.reload_profile(self.active, Some(i));
         }
-        list.push((Opt::ProfilePicture(i), "Profile picture".into()));
-        if !p.pin.is_empty() {
-            list.push((Opt::RemovePin(i), "Remove PIN".into()));
-        }
-        self.show_menu(&title, list, 0);
     }
 
-    fn profile_apps(&mut self, i: usize, selected: Option<&str>) {
+    pub(super) fn identity_entries(&self, i: usize) -> Vec<Entry> {
         let p = &self.profiles[i];
-        let mut list: Vec<_> = self
-            .all_apps()
-            .map(|app| {
-                let state = if p.allows(&app.id) { "Allowed" } else { "Blocked" };
-                (
-                    Opt::ToggleApp(i, app.id.clone()),
-                    format!("{} · {state}", jellyfin::clip(&app.title, 35)),
-                )
-            })
-            .collect();
-        list.sort_by(|a, b| a.1.cmp(&b.1));
-        let sel = selected
-            .and_then(|id| {
-                list.iter()
-                    .position(|(o, _)| matches!(o, Opt::ToggleApp(_, app) if app == id))
-            })
-            .unwrap_or(0);
-        if list.is_empty() {
-            list.push((Opt::Close, "No apps found".into()));
+        let row = |act, title: &str, desc: &str, value: &str| Entry {
+            act,
+            title: title.into(),
+            desc: desc.into(),
+            value: Value::Text(value.into()),
+        };
+        let mut rows = vec![
+            row(
+                Act::ProfileName,
+                "Name",
+                "The name shown in the profile picker.",
+                &p.name,
+            ),
+            row(
+                Act::ProfilePicture,
+                "Profile picture",
+                "Choose a Midnight Matinee character.",
+                avatars::NAMES[p.avatar],
+            ),
+            row(
+                Act::ProfilePin,
+                "Profile PIN",
+                "Optional four-digit code to open this profile.",
+                if p.pin.is_empty() { "Set PIN" } else { "Change PIN" },
+            ),
+        ];
+        if !p.pin.is_empty() {
+            rows.push(row(
+                Act::RemovePin,
+                "Remove PIN",
+                "This profile will open without a code.",
+                "Remove",
+            ));
         }
-        self.show_menu("Allowed apps · OK to toggle", list, sel);
+        rows
+    }
+
+    fn installed_apps(&self) -> Vec<(&str, &str)> {
+        let mut apps: Vec<_> = self
+            .all_apps()
+            .map(|app| (app.title.as_str(), app.id.as_str()))
+            .collect();
+        apps.sort_unstable();
+        apps.dedup();
+        apps
+    }
+
+    pub(super) fn allowed_app_entries(&self, i: usize) -> Vec<Entry> {
+        let p = &self.profiles[i];
+        let apps = self.installed_apps();
+        let count = apps.iter().filter(|(_, id)| p.allows(id)).count();
+        std::iter::once(Entry {
+            act: Act::None,
+            title: format!("{count} apps allowed"),
+            desc: "Only apps turned on here appear for this Kid profile. OK on an app to toggle it.".into(),
+            value: Value::Text(String::new()),
+        })
+        .chain(apps.into_iter().enumerate().map(|(n, (title, id))| Entry {
+            act: Act::AllowedApp(n),
+            title: jellyfin::clip(title, 40),
+            desc: String::new(),
+            value: Value::Switch(p.allows(id)),
+        }))
+        .collect()
+    }
+
+    pub(super) fn toggle_allowed_app(&mut self, i: usize, n: usize) {
+        if self.profiles[i].role != Role::Kid {
+            return;
+        }
+        let Some((_, id)) = self.installed_apps().get(n).copied() else {
+            return;
+        };
+        let mut list = self.profiles.clone();
+        let apps = &mut list[i].apps;
+        if apps.iter().any(|app| app == id) {
+            apps.retain(|app| app != id);
+        } else {
+            apps.push(id.into());
+        }
+        if self.update_profiles(list) {
+            self.show_settings();
+        }
     }
 
     fn update_profiles(&mut self, list: Vec<Profile>) -> bool {
@@ -282,11 +335,13 @@ impl App {
     }
 
     pub(super) fn account_option(&mut self, opt: &Opt) {
-        if !self.manager() || self.editing.is_some() {
+        if !self.manager() {
             return;
         }
         match *opt {
-            Opt::NewProfile(r) => self.ask(Ask::NewProfile(r), "New profile", r.label(), "Name", ""),
+            Opt::NewProfile(r) if self.editing.is_none() && self.device_settings.is_none() => {
+                self.ask(Ask::NewProfile(r), "New profile", r.label(), "Name", "")
+            }
             Opt::RenameProfile(i) => self.ask(
                 Ask::ProfileName(i),
                 "Rename profile",
@@ -314,19 +369,6 @@ impl App {
                 }
             }
             Opt::ProfilePicture(i) => self.choose_picture(i),
-            Opt::ProfileApps(i) => self.profile_apps(i, None),
-            Opt::ToggleApp(i, ref id) => {
-                let mut list = self.profiles.clone();
-                let apps = &mut list[i].apps;
-                match apps.iter().position(|a| a == id) {
-                    Some(at) => drop(apps.remove(at)),
-                    None => apps.push(id.clone()),
-                }
-                if self.update_profiles(list) {
-                    self.profile_apps(i, Some(id));
-                }
-            }
-            Opt::ProfileMedia(i) => self.reload_profile(self.active, Some(i)),
             _ => {}
         }
     }
@@ -344,7 +386,7 @@ impl App {
             }
             return;
         }
-        if !self.manager() || self.editing.is_some() {
+        if !self.manager() {
             return;
         }
         let mut list = self.profiles.clone();
@@ -410,6 +452,7 @@ impl App {
         };
         if self.update_profiles(list) {
             if new {
+                self.manage_profile(i);
                 self.choose_picture(i);
             } else {
                 self.manage_profile(i);
