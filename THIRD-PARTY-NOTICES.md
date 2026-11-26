@@ -64,3 +64,7 @@ launcher never links it, and it only loads when the owner installs it from Setti
 corresponding source, the build scripts, the patch, `LICENSE` and `NOTICE` are in `vendor/earc_route/` of the repository
 and in `earc_route-source/` of the package. It is built for webOS 6 kernel 4.4.84; the loader and the module refuse
 anything else. It contains no LG code.
+
+## Luma (idea only)
+
+The early start at boot (`takeover.sh`, `early_on`) follows the approach of [Luma](https://github.com/ecklf/lg-luma) (MIT, "Luma contributors"): an LS2 dynamic service defined in `/var/luna-service2`, started by a compositor key-filter script before the Homebrew hooks run. No Luma code is included; the scripts here are written for this project.
