@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 const SHELF: f32 = 0.84;
 /// How long OK is held on an app before its options open.
 const HOLD_MS: u32 = 700;
+const DISMISSED_MAX: usize = 200;
 
 /// How films are delivered (`film::DIRECT`), as Settings words it.
 const DIRECT_MODES: [(&str, &str); 3] = [("auto", "Automatic"), ("off", "Off"), ("force", "Forced")];
@@ -72,6 +73,8 @@ enum Opt {
     Show,
     Pin,
     Unpin,
+    /// Take the focused Continue watching card off its row.
+    Dismiss,
     /// Ask for confirmation before uninstalling the focused app.
     AskUninstall,
     Uninstall,
@@ -439,6 +442,7 @@ impl App {
             let cached: Vec<Item> = jellyfin::cached(&app.profile_root)
                 .iter()
                 .map(|w| jf.cfg.item(w, &jf_app))
+                .filter(|i| !app.prefs.dismissed.contains(&i.key))
                 .collect();
             if !app.row_off(WATCH) {
                 app.rows[WATCH].items = cached;
@@ -452,6 +456,7 @@ impl App {
                 app.rows[PLEX].items = plex::cached(&app.profile_root)
                     .iter()
                     .map(|t| t.item(&plex_app))
+                    .filter(|i| !app.prefs.dismissed.contains(&i.key))
                     .collect();
             }
             app.start_plex(cfg);
@@ -1568,6 +1573,7 @@ impl App {
         if self.row_off(r) {
             items.clear();
         }
+        items.retain(|i| !self.prefs.dismissed.contains(&i.key));
         let (key, col) = (self.focused_key(), self.rows[self.cur_row].col);
         let mut old = std::mem::take(&mut self.rows[r].items);
         for it in &mut items {
@@ -2446,6 +2452,10 @@ impl App {
         }
         let Some((r, c)) = self.focused() else { return };
         let it = &self.rows[r].items[c];
+        if matches!(r, WATCH | PLEX) {
+            let title = it.title.clone();
+            return self.show_menu(&title, vec![(Opt::Dismiss, "Remove from Continue watching".into())], 0);
+        }
         if it.kind != Kind::App {
             return;
         }
@@ -2778,6 +2788,14 @@ impl App {
                 self.prefs.hidden.push(key);
             }
             Opt::Show => self.prefs.hidden.retain(|k| *k != key),
+            Opt::Dismiss => {
+                self.prefs.dismissed.push(key.clone());
+                let extra = self.prefs.dismissed.len().saturating_sub(DISMISSED_MAX);
+                self.prefs.dismissed.drain(..extra);
+                self.prefs.save();
+                self.rows[self.cur_row].items.retain(|i| i.key != key);
+                return self.refocus(None, col);
+            }
             Opt::RefreshJellyfin => return self.refresh_jellyfin(),
             Opt::SignOut => return self.sign_out(),
             Opt::RefreshYoutube => return self.refresh_youtube(true),

@@ -13,7 +13,7 @@ Press Home to pick up where you left off on Jellyfin or Plex, see what’s on li
 ## What you can do
 
 - **Make Home yours.** Pin, reorder or hide apps, switch HDMI inputs, and choose which tabs appear, in what order, for each profile. Use the D-pad to move around and hold OK for an item’s menu. The Magic Remote’s pointer stays off; a click acts as OK.
-- **Browse Jellyfin and Plex without opening another app.** Resume from Home or browse poster libraries, then explore a title’s seasons, episodes, cast and related titles. Cached rows stay visible when your server is asleep; tvlauncher doesn’t wake it.
+- **Browse Jellyfin and Plex without opening another app.** Resume from Home, where the focused episode shows its season and episode number. Browse poster libraries to explore seasons, episodes, cast and related titles. Cached rows stay visible when your server is asleep; tvlauncher doesn’t wake it.
 - **Play films and episodes in the launcher.** Get chapters, seek thumbnails, subtitle and audio controls, and skip or next-episode prompts when the server provides the relevant metadata. You can also open titles in an external app, such as Native Jelly or PlxNative.
 - **Watch live TV from your own source.** Bring an M3U playlist or Xtream Codes login and an XMLTV guide. Browse what’s on now and next, favourite channels and watch in the built-in player. No channels are bundled.
 - **Give each viewer a profile.** Managers, Adults and Kids can have separate media sign-ins, tabs and playback preferences, with illustrated avatars and optional PINs. Managers can choose which apps Kids see.
