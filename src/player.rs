@@ -853,7 +853,7 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
     ));
     // Only a registered Home hears the Home key (as a relaunch) while another window is in front.
     crate::lifecycle::RELAUNCH.store(false, Ordering::SeqCst);
-    crate::lifecycle::register(wake);
+    let mine = crate::lifecycle::register(wake);
     let mut asked: Option<Instant> = None;
     let status = loop {
         if asked.is_none() && crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
@@ -874,6 +874,9 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
         std::thread::sleep(Duration::from_millis(50));
     };
     log(&format!("player: ended {status} after {} ms", t.elapsed().as_millis()));
+    if mine {
+        crate::lifecycle::unregister();
+    }
     unsafe {
         SDL_ShowWindow(win);
         SDL_RaiseWindow(win);

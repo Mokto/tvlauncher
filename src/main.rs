@@ -147,6 +147,9 @@ fn main() -> ExitCode {
         let (refresh, res) = jellyfin::spawn(root.clone(), cfg.clone(), wake);
         Jelly { cfg, refresh, res }
     });
+    if on_tv {
+        lifecycle::watch_home(wake);
+    }
     if on_tv && std::path::Path::new(&format!("{DIR}/register")).exists() {
         lifecycle::register(wake);
     }

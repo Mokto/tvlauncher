@@ -3,13 +3,15 @@ use crate::sdl::{log, Event, SDL_PushEvent};
 use std::ffi::{c_int, CStr};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const CRASH_FILE: &CStr = c"/tmp/tvlauncher-crashes";
 
 pub static RELAUNCH: AtomicBool = AtomicBool::new(false);
 static REGISTERED: AtomicBool = AtomicBool::new(false);
+/// The `luna-send` that holds the registration, 0 when none (or when [`unregister`] ended it).
+static HOLDER: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn on_crash(sig: c_int) {
     // Only async-signal-safe calls: open, write, close, signal, raise. One line per crash, the time in seconds;
@@ -59,9 +61,11 @@ pub fn note_failed_start() {
 /// process exits too: it restarts at standby, and a launcher left over from before is no longer known as Home.
 ///
 /// Opt-in (`<DIR>/register`): not yet seen to bring the window to the front on a relaunch.
-pub fn register(wake: u32) {
+///
+/// False when it was registered already.
+pub fn register(wake: u32) -> bool {
     if REGISTERED.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     std::thread::spawn(move || {
         let child = Command::new("/usr/bin/luna-send")
@@ -79,6 +83,7 @@ pub fn register(wake: u32) {
         let Ok(mut child) = child else {
             return log("register: luna-send did not start");
         };
+        HOLDER.store(child.id() as i32, Ordering::SeqCst);
         let mut registered: Option<Instant> = None;
         for line in BufReader::new(child.stdout.take().expect("piped"))
             .lines()
@@ -101,9 +106,64 @@ pub fn register(wake: u32) {
                 std::process::exit(0);
             }
         }
-        if registered.is_some() {
+        let _ = child.wait();
+        if registered.is_some() && HOLDER.load(Ordering::SeqCst) != 0 {
             log("register: the app manager went away");
             std::process::exit(0);
         }
     });
+    true
 }
+
+/// Ends the registration. While registered, the Home key is ignored with the launcher in front (seen on the TV);
+/// unregistered, the app manager restarts the launcher, which lands on Home.
+pub fn unregister() {
+    let pid = HOLDER.swap(0, Ordering::SeqCst);
+    if pid > 0 {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        log("register: ended");
+    }
+    REGISTERED.store(false, Ordering::SeqCst);
+}
+
+/// Watches the remotes for the Home button. The app manager ignores it while Home is in front, so the launcher hears it
+/// here and starts over as on a relaunch. The devices are only read, never grabbed: the TV still gets every key.
+/// Remotes that pair later are picked up within 30 s.
+#[cfg(target_os = "linux")]
+pub fn watch_home(wake: u32) {
+    use std::collections::HashSet;
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    /// The Magic Remote's Home button, as the kernel reports it (read on the C1).
+    const KEY_HOME: u16 = 773;
+    std::thread::spawn(move || {
+        let open: Arc<Mutex<HashSet<String>>> = Arc::default();
+        loop {
+            let nodes = std::fs::read_dir("/dev/input").into_iter().flatten().flatten();
+            for path in nodes.map(|e| e.path().display().to_string()) {
+                if !path.contains("/event") || !open.lock().unwrap().insert(path.clone()) {
+                    continue;
+                }
+                let open = open.clone();
+                std::thread::spawn(move || {
+                    if let Ok(mut f) = std::fs::File::open(&path) {
+                        let mut ev = [0u8; std::mem::size_of::<libc::input_event>()];
+                        while f.read_exact(&mut ev).is_ok() {
+                            let e: libc::input_event = unsafe { std::ptr::read_unaligned(ev.as_ptr().cast()) };
+                            if e.type_ == 1 && e.code == KEY_HOME && e.value == 1 {
+                                log("key Home");
+                                RELAUNCH.store(true, Ordering::SeqCst);
+                                unsafe { SDL_PushEvent(&mut Event::new(wake)) };
+                            }
+                        }
+                    }
+                    open.lock().unwrap().remove(&path);
+                });
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn watch_home(_wake: u32) {}
