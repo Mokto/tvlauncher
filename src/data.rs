@@ -570,16 +570,29 @@ impl Prefs {
         p.save();
     }
 
+    pub fn init_profile(root: &str, profile_root: &str) -> std::io::Result<()> {
+        let device = Self::load(root);
+        std::fs::create_dir_all(format!("{profile_root}{DIR}"))?;
+        Self {
+            direct: device.direct,
+            max_mbps: device.max_mbps,
+            lossless: device.lossless,
+            ..Self::load(profile_root)
+        }
+        .write()
+    }
+
     pub fn save(&self) {
+        if self.write().is_err() {
+            crate::sdl::log(&format!("could not save {}", self.path));
+        }
+    }
+
+    fn write(&self) -> std::io::Result<()> {
         let body =
             json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort, "nextEp": self.next_ep, "subSize": self.look.sub_size, "subPos": self.look.sub_pos, "subBg": self.look.sub_bg, "subColor": self.look.sub_color, "skipBy": self.look.skip })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
-        if std::fs::write(&tmp, body)
-            .and_then(|()| std::fs::rename(&tmp, &self.path))
-            .is_err()
-        {
-            crate::sdl::log(&format!("could not save {}", self.path));
-        }
+        std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path))
     }
 }

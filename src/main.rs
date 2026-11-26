@@ -4,6 +4,7 @@
 //! points and inputs over luna-send and the icons straight from the app folders.
 //! `LAUNCHER_ROOT=<dir>` runs it on a desktop against files from tools/pull-fixtures.sh.
 mod app;
+mod avatars;
 #[cfg(target_arch = "arm")]
 mod compat;
 mod data;
@@ -23,6 +24,7 @@ mod login;
 mod net;
 mod player;
 mod plex;
+mod profiles;
 mod sdl;
 mod settings;
 mod subs;
@@ -30,15 +32,15 @@ mod ts;
 mod tv;
 mod youtube;
 
-use app::{App, Background, Jelly};
+use app::App;
 use data::{Luna, DIR};
 use gfx::{Gfx, H, W};
 use sdl::*;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::channel;
 
 extern "C" fn log_line(_: *mut c_void, category: c_int, _: c_int, msg: *const c_char) {
     if category == LOG_CATEGORY_APPLICATION {
@@ -128,33 +130,6 @@ fn main() -> ExitCode {
     // Threads wake the loop with this event when they have something for it.
     let wake = unsafe { SDL_RegisterEvents(1) };
 
-    // Decoding a 1080p background takes longer than a frame, so it happens on a thread. Only the latest request is decoded.
-    let (bg_req, req_rx) = channel::<(u64, Option<String>)>();
-    let (res_tx, bg_res) = channel();
-    std::thread::spawn(move || {
-        while let Ok(mut req) = req_rx.recv() {
-            while let Ok(newer) = req_rx.try_recv() {
-                req = newer;
-            }
-            let surf = req.1.and_then(|p| {
-                let s = Surf::load(&p)?;
-                // YouTube's pictures are small; everything else is a 1080p backdrop.
-                if p.contains("/cache/yt-") {
-                    return Some(gfx::blur(&s).unwrap_or(s));
-                }
-                Some(s)
-            });
-            if res_tx.send((req.0, surf)).is_err() {
-                break;
-            }
-            unsafe { SDL_PushEvent(&mut Event::new(wake)) };
-        }
-    });
-
-    let jf = jellyfin::Config::load(&root).map(|cfg| {
-        let (refresh, res) = jellyfin::spawn(root.clone(), cfg.clone(), wake);
-        Jelly { cfg, refresh, res }
-    });
     if on_tv {
         lifecycle::watch_home(wake);
     }
@@ -173,17 +148,14 @@ fn main() -> ExitCode {
         player::film_shot(&g, what);
         return save_bmp(ren, args.get(2).map_or("build/film.bmp", String::as_str));
     }
-    let mut app = App::new(
-        g,
-        Luna { root },
-        win,
-        Background {
-            req: bg_req,
-            res: bg_res,
-        },
-        jf,
-        wake,
-    );
+    let list = match profiles::load(&root) {
+        Ok(list) => list,
+        Err(e) => {
+            log(&format!("profiles: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut app = App::new(Rc::new(g), Luna { root }, win, wake, list);
 
     if on_tv {
         app.play_file();

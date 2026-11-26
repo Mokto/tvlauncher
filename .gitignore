@@ -7,4 +7,6 @@ youtube.json
 dist/
 plex.json
 iptv.json
+profiles.json
+profiles/
 rustc-ice-*.txt
