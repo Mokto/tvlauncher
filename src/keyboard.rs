@@ -133,11 +133,13 @@ impl Prompt {
     ) -> Self {
         let pin = keypad.is_some();
         let mut p = Prompt {
-            title: g.text(if pin { g.f_hero } else { g.f_label }, title, 0),
+            title: (!title.is_empty())
+                .then(|| g.text(if pin { g.f_title } else { g.f_label }, title, 0))
+                .flatten(),
             body: g.text(
                 if pin { g.f_sub } else { g.f_menu },
                 body,
-                if pin { 600 } else { PANEL_W as u32 - 96 },
+                if pin { 800 } else { PANEL_W as u32 - 96 },
             ),
             hint: hint.to_string(),
             text: text.to_string(),
@@ -176,10 +178,8 @@ impl Prompt {
             .map(|r| {
                 r.iter()
                     .map(|(k, _)| {
-                        let font = if self.pin.is_none() {
+                        let font = if self.pin.is_none() || k.len() == 1 {
                             g.f_menu
-                        } else if k.len() == 1 {
-                            g.f_hero
                         } else {
                             g.f_label
                         };
@@ -276,67 +276,39 @@ impl Prompt {
     }
 
     fn draw_pin(&self, g: &Gfx, avatar: usize) {
-        const WIDTH: f32 = 168.0;
-        const HEIGHT: f32 = 116.0;
-        const GAP: f32 = 16.0;
+        const WIDTH: f32 = 116.0;
+        const HEIGHT: f32 = 80.0;
+        const GAP: f32 = 12.0;
+        const AVATAR: f32 = 136.0;
         let wide = 3.0 * WIDTH + 2.0 * GAP;
-        let left = 1032.0;
+        let left = (W - wide) / 2.0;
         let center = |t: Option<&Tex>, cx: f32, cy: f32, color| {
             if let Some(t) = t {
                 g.put(Some(t), cx - t.w as f32 / 2.0, cy - t.h as f32 / 2.0, color, 1.0);
             }
         };
-        g.fill(
-            rgb(46, 57, 76),
-            1.0,
-            FRect {
-                x: 0.0,
-                y: 0.0,
-                w: W,
-                h: H,
-            },
-        );
-        let accent = avatars::accent(avatar);
-        let lift = |c: u8| c.saturating_add(46);
-        g.tint(&g.soft, rgb(lift(accent.r), lift(accent.g), lift(accent.b)), 0.88);
-        g.copy(
-            &g.soft,
-            None,
-            FRect {
-                x: -480.0,
-                y: -630.0,
-                w: 2040.0,
-                h: 2070.0,
-            },
-        );
-        g.tint(&g.soft, rgb(87, 98, 144), 0.72);
-        g.copy(
-            &g.soft,
-            None,
-            FRect {
-                x: 590.0,
-                y: -650.0,
-                w: 2050.0,
-                h: 2480.0,
-            },
-        );
+        avatars::backdrop(g);
 
-        let intro = 252.0;
-        avatars::draw(g, avatar, intro, 290.0, 152.0);
-        g.put(self.title.as_ref(), intro, 480.0, TEXT, 1.0);
-        g.put(self.body.as_ref(), intro, 592.0, TEXT, 0.88);
-
-        g.rounded(left, 202.0, wide, 92.0, 22.0, rgb(31, 42, 61), 0.72);
-        center(self.field.as_ref(), left + wide / 2.0, 248.0, TEXT);
+        avatars::draw(g, avatar, (W - AVATAR) / 2.0, 182.0, AVATAR);
+        let field_y = if let Some(title) = &self.title {
+            center(Some(title), W / 2.0, 360.0, TEXT);
+            center(self.body.as_ref(), W / 2.0, 418.0, TEXT);
+            465.0
+        } else {
+            center(self.body.as_ref(), W / 2.0, 354.0, TEXT);
+            402.0
+        };
+        g.rounded(left, field_y, wide, 68.0, 34.0, BLACK, 0.40);
+        center(self.field.as_ref(), W / 2.0, field_y + 34.0, TEXT);
         for (r, row) in self.keys.iter().enumerate() {
             for (i, key) in row.iter().enumerate() {
                 let x = left + i as f32 * (WIDTH + GAP);
-                let y = 322.0 + r as f32 * (HEIGHT + GAP);
+                let y = field_y + 88.0 + r as f32 * (HEIGHT + GAP);
                 let on = self.sel == (r, i);
                 let delete = r == 3 && i == 0;
                 if on || !delete {
-                    let fill = if on { WHITE } else { rgb(64, 76, 105) };
-                    g.rounded(x, y, WIDTH, HEIGHT, 25.0, fill, if on { 1.0 } else { 0.86 });
+                    let fill = if on { WHITE } else { BLACK };
+                    g.rounded(x, y, WIDTH, HEIGHT, HEIGHT / 2.0, fill, if on { 1.0 } else { 0.25 });
                 }
                 center(
                     key.as_ref(),
