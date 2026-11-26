@@ -444,6 +444,8 @@ pub struct Prefs {
     pub order: Vec<String>,
     /// Apps pinned to the Pinned apps row, in the order of that row.
     pub pinned: Vec<String>,
+    /// Keys (`jf:<id>`, `plex:<server>:<key>`) removed from the Continue watching rows, newest last.
+    pub dismissed: Vec<String>,
     /// The Jellyfin server signed in to last, offered again the next time.
     pub jf_server: Option<String>,
     /// The app that opens a Jellyfin item.
@@ -529,6 +531,7 @@ impl Prefs {
             hidden: list("hidden"),
             order: list("order"),
             pinned: list("pinned"),
+            dismissed: list("dismissed"),
             jf_server: v["jfServer"].as_str().map(String::from),
             jf_app: v["jfApp"].as_str().map(String::from),
             plex_app: v["plexApp"].as_str().map(String::from),
@@ -590,7 +593,7 @@ impl Prefs {
 
     fn write(&self) -> std::io::Result<()> {
         let body =
-            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort, "nextEp": self.next_ep, "subSize": self.look.sub_size, "subPos": self.look.sub_pos, "subBg": self.look.sub_bg, "subColor": self.look.sub_color, "skipBy": self.look.skip })
+            json!({ "hidden": self.hidden, "order": self.order, "pinned": self.pinned, "dismissed": self.dismissed, "jfServer": self.jf_server, "jfApp": self.jf_app, "plexApp": self.plex_app, "debloat": self.debloat, "tvFavs": self.tv_favs, "tabs": self.tabs, "tabsOff": self.tabs_off, "tabNames": self.tab_names, "rowsOff": self.rows_off, "jfPlayer": self.jf_player, "lossless": self.lossless, "direct": self.direct, "maxMbps": self.max_mbps, "audioLang": self.audio_lang, "subMode": self.sub_mode, "subLang": self.sub_lang, "libSort": self.lib_sort, "nextEp": self.next_ep, "subSize": self.look.sub_size, "subPos": self.look.sub_pos, "subBg": self.look.sub_bg, "subColor": self.look.sub_color, "skipBy": self.look.skip })
                 .to_string();
         let tmp = format!("{}.tmp", self.path);
         std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path))
