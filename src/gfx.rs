@@ -49,6 +49,7 @@ pub struct Gfx {
     pub f_sub: *mut Opaque,
     pub f_clock: *mut Opaque,
     pub f_menu: *mut Opaque,
+    pub f_small: *mut Opaque,
     pub circle: Tex,
     pub soft: Tex,
     pub hgrad: Tex,
@@ -70,6 +71,7 @@ impl Gfx {
             f_sub: font(regular, 30),
             f_clock: font(regular, 34),
             f_menu: font(semibold, 34),
+            f_small: font(regular, 26),
             root: root.to_string(),
             ren,
             circle: gen(ren, 2 * RAD, 2 * RAD, f_circle),
@@ -422,8 +424,17 @@ fn logo_box(s: &Surf) -> Option<(Rect, Color)> {
     ))
 }
 
+/// `src` as ARGB, or None when it is wholly transparent: some servers keep empty logos.
+pub fn visible(src: &Surf) -> Option<Surf> {
+    let (w, h) = src.size();
+    let s = cover(src, w, h, 0)?;
+    let stride = unsafe { (*s.0).pitch as usize / 4 };
+    let px = unsafe { std::slice::from_raw_parts((*s.0).pixels as *const u32, stride * h as usize) };
+    px.iter().any(|p| p >> 24 > 16).then_some(s)
+}
+
 /// `src` scaled to fill `w` x `h` (cropped in the middle), with corners of radius `r` made transparent.
-fn cover(src: &Surf, w: i32, h: i32, r: i32) -> Option<Surf> {
+pub fn cover(src: &Surf, w: i32, h: i32, r: i32) -> Option<Surf> {
     let (sw, sh) = src.size();
     let (cw, ch) = if sw * h > sh * w {
         (sh * w / h, sh)

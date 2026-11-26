@@ -234,6 +234,8 @@ pub struct App {
     tab: String,
     /// The page of a library title, over its tab.
     detail: Option<Box<detail::Page>>,
+    /// The title pages a related title was opened from, for Back.
+    detail_back: Vec<String>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -326,6 +328,7 @@ impl App {
             in_settings: false,
             ok_down: None,
             detail: None,
+            detail_back: vec![],
             cog_f: 0.0,
         };
         if let Some(jf) = &app.jf {
@@ -981,6 +984,13 @@ impl App {
                     d.reload();
                 }
             }
+            detail::Act::Open(id) => {
+                let from = self.detail.as_ref().map(|d| d.id().to_string());
+                self.go_to_page(&id);
+                if self.detail.as_ref().is_some_and(|d| d.id() == id) {
+                    self.detail_back.extend(from);
+                }
+            }
             detail::Act::Mark(id, played) => {
                 if let Some(d) = &mut self.detail {
                     detail::mark(d.backend.clone(), id.clone(), played);
@@ -1436,9 +1446,19 @@ impl App {
         if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
             self.tab.clear();
         }
-        if self.detail.as_mut().and_then(|d| d.poll(&self.g)) == Some(true) {
-            self.detail = None;
-            self.open_in_app();
+        match self.detail.as_mut().and_then(|d| d.poll(&self.g)) {
+            Some(true) => {
+                self.detail = None;
+                self.detail_back.clear();
+                self.open_in_app();
+            }
+            Some(false) => {
+                let libs = &self.libs;
+                if let Some(d) = &mut self.detail {
+                    d.keep_related(|id| libs.iter().any(|l| l.pages.values().any(|p| p.has(id))));
+                }
+            }
+            None => {}
         }
         let tab = self.tab.clone();
         for lib in &mut self.libs {
@@ -1516,6 +1536,7 @@ impl App {
         }
         let active = !top && matches!(self.mode, Mode::Browse) && self.detail.is_none();
         if let Some(d) = &mut self.detail {
+            d.away = top;
             anim |= d.animate(dt);
         }
         for (id, p) in self.libs.iter_mut().flat_map(|l| &mut l.pages) {
@@ -1599,27 +1620,30 @@ impl App {
                 h: H,
             },
         );
-        g.tint(&g.vgrad, BG, SHELF);
-        g.copy(
-            &g.vgrad,
-            None,
-            FRect {
-                x: 0.0,
-                y: 280.0,
-                w: W,
-                h: 330.0,
-            },
-        );
-        g.fill(
-            BG,
-            SHELF,
-            FRect {
-                x: 0.0,
-                y: 610.0,
-                w: W,
-                h: H,
-            },
-        );
+        // A title's page shows the backdrop down to its buttons, and darkens the rest itself.
+        if self.detail.is_none() {
+            g.tint(&g.vgrad, BG, SHELF);
+            g.copy(
+                &g.vgrad,
+                None,
+                FRect {
+                    x: 0.0,
+                    y: 280.0,
+                    w: W,
+                    h: 330.0,
+                },
+            );
+            g.fill(
+                BG,
+                SHELF,
+                FRect {
+                    x: 0.0,
+                    y: 610.0,
+                    w: W,
+                    h: H,
+                },
+            );
+        }
         g.tint(&g.vgrad, BG, 0.85);
         let top = FRect {
             x: 0.0,
@@ -2607,9 +2631,29 @@ impl App {
             self.ok_down = None;
         }
         match &mut self.mode {
-            Mode::Browse if self.detail.is_some() => {
+            // The tabs or the cog over a title's page: Down or Back returns to the page, another tab closes it.
+            Mode::Browse if self.detail.is_some() && (self.tabs_f || self.cog) => {
+                let tab = self.tab.clone();
                 if back {
+                    (self.tabs_f, self.cog) = (false, false);
+                } else {
+                    self.top_key(dx, dy, ok);
+                }
+                if self.tab != tab {
                     self.detail = None;
+                    self.detail_back.clear();
+                }
+                self.animating = true;
+                return true;
+            }
+            Mode::Browse if self.detail.is_some() => {
+                if dy < 0 && self.detail.as_ref().is_some_and(|d| d.at_top()) {
+                    self.focus_top();
+                } else if back {
+                    match self.detail_back.pop() {
+                        Some(prev) => self.go_to_page(&prev),
+                        None => self.detail = None,
+                    }
                     self.animating = true;
                 } else if ok {
                     self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
@@ -2808,7 +2852,7 @@ impl App {
     fn ok_up(&mut self) {
         if self.detail.is_some() {
             if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
-                if let Some(a) = self.detail.as_ref().and_then(|d| d.tap()) {
+                if let Some(a) = self.detail.as_mut().and_then(|d| d.tap()) {
                     self.detail_act(a);
                 }
             }
@@ -2846,6 +2890,7 @@ impl App {
         self.in_settings = false;
         self.ok_down = None;
         self.detail = None;
+        self.detail_back.clear();
         self.cog = false;
         self.tabs_f = false;
         self.tab.clear();

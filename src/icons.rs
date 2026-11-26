@@ -20,9 +20,10 @@ pub enum Icon {
     Video,
     Lock,
     Power,
+    Person,
 }
 
-pub const ALL: [Icon; 17] = [
+pub const ALL: [Icon; 18] = [
     Icon::Play,
     Icon::Pause,
     Icon::Subtitles,
@@ -40,6 +41,7 @@ pub const ALL: [Icon; 17] = [
     Icon::Video,
     Icon::Lock,
     Icon::Power,
+    Icon::Person,
 ];
 
 /// The size the icons are made at, in pixels; they are drawn at this size or a little smaller.
@@ -158,6 +160,10 @@ fn shape(icon: Icon, p: P) -> f32 {
                 .min(seg(p, (0.36, -0.3), (0.36, 0.0), T));
             let body = rbox(p, (0.0, 0.3), (0.62, 0.46), 0.14).max(-circle(p, (0.0, 0.26), 0.12));
             shackle.min(body)
+        }
+        Icon::Person => {
+            let shoulders = rbox(p, (0.0, 0.62), (0.66, 0.36), 0.34).max(y - 0.8);
+            circle(p, (0.0, -0.3), 0.34).min(shoulders.max(-circle(p, (0.0, -0.3), 0.46)))
         }
         Icon::Power => {
             let arc = ring(p, (0.0, 0.08), 0.66, T).max(-(x.abs() - 0.3).max(y + 0.1));

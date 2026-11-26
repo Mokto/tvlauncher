@@ -57,6 +57,32 @@ impl Source {
         }
     }
 
+    /// The title's logo, with its transparency: a PNG.
+    pub fn logo(&self, id: &str, tag: &str) -> Option<String> {
+        match self {
+            Source::None => None,
+            Source::Jellyfin(server) => Some(format!(
+                "{server}/Items/{id}/Images/Logo?maxWidth=720&format=Png&tag={tag}"
+            )),
+            Source::Plex { base, token } => Some(format!(
+                "{base}/photo/:/transcode?width=720&height=280&minSize=0&upscale=0&format=png&url={}&X-Plex-Token={token}",
+                encode(tag)
+            )),
+        }
+    }
+
+    /// A person's photo or a poster, at least `w` wide. Plex fetches the picture when `tag` is an address of its
+    /// own (cast photos are on plex.tv), and scales it.
+    pub fn picture(&self, id: &str, tag: &str, w: u32) -> Option<String> {
+        match self {
+            Source::Plex { base, token } => Some(format!(
+                "{base}/photo/:/transcode?width={w}&height={w}&minSize=1&upscale=1&url={}&X-Plex-Token={token}",
+                encode(tag)
+            )),
+            _ => self.still(id, tag, w),
+        }
+    }
+
     fn url(&self, id: &str, backdrop: bool, tag: &str) -> Option<String> {
         match self {
             Source::None => None,
@@ -347,6 +373,22 @@ pub(crate) fn prune(root: &str, pre: &str, keep: &HashSet<String>) {
     }
 }
 
+/// Where a picture is cached: named after its tag (Jellyfin) or the end of its path (Plex, a timestamp), so a new
+/// picture gets a new name. `kind` is `p` for a poster, `b` for a backdrop; `id` comes first after it, as [`prune`]
+/// reads it.
+pub(crate) fn pic_path(pre: &str, kind: char, id: &str, tag: &str) -> Option<String> {
+    let end: String = tag
+        .rsplit('/')
+        .next()?
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    Some(format!(
+        "{DIR}/cache/{pre}-{kind}-{id}-{}.img",
+        &end[end.len().saturating_sub(8)..]
+    ))
+}
+
 /// The Jellyfin user's libraries and their titles.
 pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool) -> Result<(), String> {
     if !force && fresh(root, JELLYFIN) {
@@ -612,26 +654,18 @@ impl Page {
         self.titles.get(*l.idx.get(l.col)?)
     }
 
-    /// Where a picture is cached: named after its tag (Jellyfin) or the end of its path (Plex, a timestamp), so
-    /// a new picture gets a new name.
     fn path(pre: &str, t: &Title, backdrop: bool) -> Option<String> {
         let tag = if backdrop {
             t.backdrop.as_ref()
         } else {
             t.poster.as_ref()
         }?;
-        let end: String = tag
-            .rsplit('/')
-            .next()?
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
-        let kind = if backdrop { 'b' } else { 'p' };
-        Some(format!(
-            "{DIR}/cache/{pre}-{kind}-{}-{}.img",
-            t.id,
-            &end[end.len().saturating_sub(8)..]
-        ))
+        pic_path(pre, if backdrop { 'b' } else { 'p' }, &t.id, tag)
+    }
+
+    /// Whether the page lists the title `id`.
+    pub fn has(&self, id: &str) -> bool {
+        self.titles.iter().any(|t| t.id == id)
     }
 
     /// The posters on screen: (line, position in it, title).
