@@ -236,6 +236,7 @@ pub struct App {
     win: *mut Opaque,
     profiles: Vec<Profile>,
     active: Option<usize>,
+    switch_from: Option<usize>,
     editing: Option<usize>,
     profile_root: String,
     profile_f: bool,
@@ -317,6 +318,7 @@ pub struct App {
     /// OK is held on an app: since when. A tap launches it when OK is released, a hold opens its options.
     ok_down: Option<u32>,
     cog_f: f32,
+    profile_expand: f32,
 }
 
 impl App {
@@ -364,6 +366,7 @@ impl App {
             win,
             profiles,
             active,
+            switch_from: None,
             editing,
             profile_root,
             profile_f: false,
@@ -425,6 +428,7 @@ impl App {
             prefetch,
             _prefetch_live: prefetch_live,
             cog_f: 0.0,
+            profile_expand: 0.0,
         };
         if app.active.is_none() {
             app.choose_profile(0, "");
@@ -471,6 +475,7 @@ impl App {
         } else {
             app.load();
         }
+        app.tab = app.landing_tab();
         app.pick_home_bg(true);
         if app.editing.is_some() {
             app.show_settings();
@@ -870,6 +875,7 @@ impl App {
             .map(|(i, (key, name, on))| {
                 let plex = self.libs.iter().any(|l| l.plex && l.views.iter().any(|v| v.id == key));
                 let what = match (key.as_str(), plex) {
+                    ("", _) => "Apps and Continue watching. Home is used if no other tabs are available.",
                     ("tv", _) => "The live TV guide.",
                     (_, true) => "A library on your Plex server.",
                     _ => "A library on your Jellyfin server.",
@@ -879,13 +885,13 @@ impl App {
             })
             .collect::<Vec<_>>();
         use crate::icons::Icon;
-        let tabs = (!tabs.is_empty()).then_some(("Tabs", Icon::Tabs, tabs));
+        let tabs = ("Tabs", Icon::Tabs, tabs);
         let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", Icon::Play, player));
         let accounts = self
             .editing
             .is_none()
             .then(|| ("Profiles", Icon::Person, self.profile_entries()));
-        tabs.into_iter()
+        std::iter::once(tabs)
             .chain(accounts)
             .chain([("Jellyfin", Icon::Server, jellyfin), ("Plex", Icon::Server, plex)])
             .chain(player.filter(|_| !self.kid()))
@@ -1271,14 +1277,15 @@ impl App {
         self.animating = true;
     }
 
-    /// The tabs after Home that can be shown, in the user's order: (key, name, shown).
+    /// The available tabs in the user's order: (key, name, shown).
     fn all_tabs(&self) -> Vec<(String, String, bool)> {
-        let mut v: Vec<(String, String)> = self
-            .libs
-            .iter()
-            .flat_map(|l| &l.views)
-            .map(|v| (v.id.clone(), v.name.clone()))
-            .collect();
+        let mut v = vec![(String::new(), "Home".to_string())];
+        v.extend(
+            self.libs
+                .iter()
+                .flat_map(|l| &l.views)
+                .map(|v| (v.id.clone(), v.name.clone())),
+        );
         if self.tv.is_some() {
             v.push(("tv".into(), "Live TV".into()));
         }
@@ -1290,7 +1297,10 @@ impl App {
         // A library that is new since the tabs were moved goes just before Live TV, which stays last.
         let pos = |k: &str| self.prefs.tabs.iter().position(|t| t == k);
         let new = pos("tv").unwrap_or(usize::MAX);
-        v.sort_by_key(|(k, _)| pos(k).unwrap_or(new));
+        v.sort_by_key(|(k, _)| match pos(k) {
+            Some(i) => (true, i),
+            None => (!k.is_empty(), new),
+        });
         v.into_iter()
             .map(|(k, n)| {
                 let on = !self.prefs.tabs_off.contains(&k);
@@ -1299,12 +1309,17 @@ impl App {
             .collect()
     }
 
-    /// The tabs at the top: Home, then the shown ones. Just Home means there is no tab bar.
     fn tabs(&self) -> Vec<(String, String)> {
-        let rest = self.all_tabs().into_iter().filter(|t| t.2).map(|(k, n, _)| (k, n));
-        std::iter::once((String::new(), "Home".to_string()))
-            .chain(rest)
-            .collect()
+        visible_tabs(self.all_tabs())
+    }
+
+    fn landing_tab(&self) -> String {
+        let tabs = self.tabs();
+        if tabs.iter().any(|(k, _)| k.is_empty()) {
+            String::new()
+        } else {
+            tabs.into_iter().next().unwrap().0
+        }
     }
 
     fn on_tv(&self) -> bool {
@@ -1644,7 +1659,11 @@ impl App {
                 match got {
                     library::Got::Views(views) => {
                         let lib = &mut self.libs[i];
-                        new_tabs |= lib.views.iter().map(|v| &v.id).ne(views.iter().map(|v| &v.id));
+                        new_tabs |= lib
+                            .views
+                            .iter()
+                            .map(|v| (&v.id, &v.name))
+                            .ne(views.iter().map(|v| (&v.id, &v.name)));
                         lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
                         lib.views = views;
                     }
@@ -1669,8 +1688,15 @@ impl App {
         if new_tabs && matches!(self.mode, Mode::Settings(_)) {
             self.show_settings();
         }
-        if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
-            self.tab.clear();
+        let tabs = self.tabs();
+        if self.tabs_f && tabs.len() < 2 {
+            self.tabs_f = false;
+            self.focus_top();
+        }
+        if !tabs.iter().any(|(k, _)| *k == self.tab) {
+            self.tab = self.landing_tab();
+            self.detail = None;
+            self.detail_back.clear();
         }
         match self.detail.as_mut().and_then(|d| d.poll(&self.g)) {
             Some(true) => {
@@ -1762,6 +1788,10 @@ impl App {
             anim |= ease(g, f32::from(v), dt, 5.0);
         }
         anim |= ease(&mut self.cog_f, f32::from(self.cog), dt, 14.0);
+        let target = f32::from(self.profile_f);
+        let step = dt / 0.18;
+        self.profile_expand += (target - self.profile_expand).clamp(-step, step);
+        anim |= self.profile_expand != target;
         let top = self.top();
         if let Some(tv) = &mut self.tv {
             anim |= tv.page.animate(dt);
@@ -2034,12 +2064,6 @@ impl App {
     /// The clock, the cog and, once live TV is set up, the Home and TV tabs.
     fn draw_top(&mut self) {
         let tabs = self.tabs();
-        for (_, name) in &tabs {
-            if !self.tab_tex.contains_key(name) {
-                self.tab_tex
-                    .insert(name.clone(), self.g.text(self.g.f_row, &jellyfin::clip(name, 36), 0));
-            }
-        }
         let g = &self.g;
         let (hour, min) = local_time();
         if min != self.clock_min {
@@ -2051,22 +2075,39 @@ impl App {
         let ch = self.clock.as_ref().map_or(40.0, |t| t.h as f32);
         let (cx, cy) = (W - MARGIN - cw - 76.0, 56.0 + ch / 2.0);
         let mut profile_width = 0.0;
-        if self.profiles.len() > 1 {
-            profile_width = self.profile_label.as_ref().map_or(0.0, |t| t.w as f32) + 92.0;
-            let color = if self.profile_f { BLACK } else { TEXT };
-            if self.profile_f {
-                g.rounded(MARGIN, cy - 32.0, profile_width, 64.0, 22.0, WHITE, 1.0);
-            }
-            if let Some(i) = self.active {
-                avatars::draw(g, self.profiles[i].avatar, MARGIN + 12.0, cy - 22.0, 44.0);
-            }
-            g.put(
-                self.profile_label.as_ref(),
-                MARGIN + 70.0,
-                cy - self.profile_label.as_ref().map_or(0.0, |t| t.h as f32 / 2.0),
-                color,
-                1.0,
+        if let Some(i) = self.active.filter(|_| self.profiles.len() > 1) {
+            const HEIGHT: f32 = 72.0;
+            const AVATAR: f32 = 58.0;
+            const NAME_X: f32 = 82.0;
+            let name = self.profile_label.as_ref();
+            profile_width = NAME_X + name.map_or(0.0, |t| t.w as f32) + 30.0;
+            let t = self.profile_expand;
+            let t = t * t * (3.0 - 2.0 * t);
+            let width = HEIGHT + (profile_width - HEIGHT) * t;
+            let border = 0.22 + 0.30 * t;
+            g.rounded(MARGIN, cy - HEIGHT / 2.0, width, HEIGHT, HEIGHT / 2.0, WHITE, border);
+            g.rounded(
+                MARGIN + 2.0,
+                cy - HEIGHT / 2.0 + 2.0,
+                width - 4.0,
+                HEIGHT - 4.0,
+                HEIGHT / 2.0 - 2.0,
+                BLACK,
+                0.8,
             );
+            avatars::draw(
+                g,
+                self.profiles[i].avatar,
+                MARGIN + (HEIGHT - AVATAR) / 2.0,
+                cy - AVATAR / 2.0,
+                AVATAR,
+            );
+            if let Some(name) = name {
+                let alpha = clamp((width - NAME_X - name.w as f32 - 12.0) / 18.0, 0.0, 1.0);
+                if alpha > 0.0 {
+                    g.put(Some(name), MARGIN + NAME_X, cy - name.h as f32 / 2.0, WHITE, alpha);
+                }
+            }
         }
 
         if self.manager() {
@@ -2090,6 +2131,12 @@ impl App {
         }
         if tabs.len() < 2 {
             return;
+        }
+        for (_, name) in &tabs {
+            if !self.tab_tex.contains_key(name) {
+                self.tab_tex
+                    .insert(name.clone(), g.text(g.f_row, &jellyfin::clip(name, 36), 0));
+            }
         }
         let texs: Vec<Option<&Tex>> = tabs.iter().map(|(_, n)| self.tab_tex[n].as_ref()).collect();
         let widths: Vec<f32> = texs.iter().map(|t| t.map_or(0.0, |t| t.w as f32) + 64.0).collect();
@@ -2180,7 +2227,7 @@ impl App {
             self.tabs_f = true;
         } else if self.manager() {
             self.cog = true;
-        } else {
+        } else if self.profiles.len() > 1 {
             self.profile_f = true;
         }
     }
@@ -2754,9 +2801,12 @@ impl App {
             }
             Opt::TabRename(k) => {
                 let own = self.libs.iter().flat_map(|l| &l.views).find(|v| v.id == *k);
-                let own = own.map_or("Live TV", |v| v.name.as_str()).to_string();
+                let own = own.map_or_else(
+                    || if k.is_empty() { "Home".into() } else { "Live TV".into() },
+                    |v| v.name.clone(),
+                );
                 let now = self.prefs.tab_names.get(k).cloned().unwrap_or_default();
-                let body = format!("Leave it empty for the library's own name, {own}.");
+                let body = format!("Leave it empty to restore the default name: {own}.");
                 return self.ask(Ask::TabName(k.clone()), "Rename tab", &body, &own, &now);
             }
             Opt::TabMove(k, d) => {
@@ -3028,13 +3078,12 @@ impl App {
                     (self.tabs_f, self.cog, self.profile_f) = (false, false, false);
                     return true;
                 }
-                if back && !self.tab.is_empty() {
-                    self.tab.clear();
-                    self.tabs_f = false;
-                    return true;
-                }
                 if back {
-                    // BACK on the TV: Home has nowhere to go back to.
+                    let landing = self.landing_tab();
+                    if self.tab != landing {
+                        self.tab = landing;
+                        return true;
+                    }
                     return self.luna.root.is_empty();
                 }
                 if self.top() {
@@ -3111,7 +3160,7 @@ impl App {
         }
         let row = tv.page.row();
         match tv.page.key(&tv.list, &tv.guide, dx, dy) {
-            tv::Out::Top => self.tabs_f = true,
+            tv::Out::Top => self.focus_top(),
             tv::Out::Ok(i) => self.watch(i),
             tv::Out::Stay => {}
         }
@@ -3125,6 +3174,9 @@ impl App {
     /// The keys on a library tab. OK waits for its release: a tap opens the title, a hold opens the options.
     fn lib_key(&mut self, dx: i32, dy: i32, ok: bool, options: bool) {
         let Some(p) = self.lib_page_mut() else {
+            if dy < 0 {
+                self.focus_top();
+            }
             return;
         };
         if options {
@@ -3134,7 +3186,7 @@ impl App {
                 self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
             }
         } else if p.key(dx, dy) {
-            self.tabs_f = true;
+            self.focus_top();
         }
     }
 
@@ -3254,11 +3306,12 @@ impl App {
         self.in_settings = false;
         self.ok_down = None;
         self.profile_f = false;
+        self.profile_expand = 0.0;
         self.detail = None;
         self.detail_back.clear();
         self.cog = false;
         self.tabs_f = false;
-        self.tab.clear();
+        self.tab = self.landing_tab();
         self.refresh_tv(false);
         self.load();
         for r in &mut self.rows {
@@ -3270,6 +3323,26 @@ impl App {
         self.refresh_jellyfin();
         self.refresh_youtube(false);
         self.refresh_plex();
+    }
+}
+
+fn visible_tabs(tabs: Vec<(String, String, bool)>) -> Vec<(String, String)> {
+    let mut home = None;
+    let shown: Vec<_> = tabs
+        .into_iter()
+        .filter_map(|(key, name, on)| {
+            if !on && key.is_empty() {
+                home = Some((key, name));
+                None
+            } else {
+                on.then_some((key, name))
+            }
+        })
+        .collect();
+    if shown.is_empty() {
+        home.into_iter().collect()
+    } else {
+        shown
     }
 }
 
@@ -3329,5 +3402,21 @@ fn local_time() -> (i32, i32) {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&now, &mut tm);
         (tm.tm_hour, tm.tm_min)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_tabs;
+
+    #[test]
+    fn hidden_home_returns_only_when_no_other_tabs_are_visible() {
+        let home = (String::new(), "Home".into(), false);
+        let films = ("films".into(), "Films".into(), true);
+        assert_eq!(
+            visible_tabs(vec![home.clone(), films]),
+            [("films".into(), "Films".into())]
+        );
+        assert_eq!(visible_tabs(vec![home]), [(String::new(), "Home".into())]);
     }
 }

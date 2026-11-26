@@ -2,7 +2,7 @@ use crate::data::{write_private, DIR};
 use serde_json::{json, Value};
 use std::io;
 
-pub const AVATAR_COUNT: usize = 6;
+pub const AVATAR_COUNT: usize = crate::avatars::NAMES.len();
 pub const NEW_PIN_LEN: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,7 +78,7 @@ pub fn load(root: &str) -> io::Result<Vec<Profile>> {
                     .as_u64()
                     .and_then(|id| usize::try_from(id).ok())
                     .filter(|&id| id < AVATAR_COUNT)
-                    .unwrap_or(i % AVATAR_COUNT);
+                    .unwrap_or(i % 6); // Keep the original six-picture assignment for profiles without a saved choice.
                 (valid_name(&name) && valid_pin(&pin)).then_some(Profile {
                     name,
                     role,

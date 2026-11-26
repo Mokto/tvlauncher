@@ -69,7 +69,7 @@ Each film, series or collection library of the signed-in user gets a tab after H
 
 ## Profiles
 
-Go to **Settings → Profiles** to add a profile. The first profile, **Owner**, is a Manager and keeps the existing setup. Pick a profile from the full-screen **Who’s watching?** page at startup if there’s more than one (or if the only one has a PIN). With more than one profile, go Up to the top bar, then Left to the profile picture and press OK to switch. Managers can choose from the built-in pictures when adding a profile, or change the picture in **Settings → Profiles**. Returning from an app or pressing Home keeps the active profile.
+Go to **Settings → Profiles** to add a profile. The first profile, **Owner**, is a Manager and keeps the existing setup. Pick a profile from the full-screen **Who’s watching?** page with circular avatars at startup if there’s more than one (or if the only one has a PIN). With more than one profile, the top-left circle shows your picture and expands to show your name when focused. Go Up to the top bar, then Left to the picture and press OK to switch. Press Back in the picker to return to the current profile; Back at startup does not bypass the picker or a PIN. Managers can choose from 38 built-in **Midnight Matinee** pictures when adding a profile, or change the picture in **Settings → Profiles**. Returning from an app or pressing Home keeps the active profile.
 
 - **Manager:** Full access. Choose a profile in **Settings → Profiles → Jellyfin, Plex and Tabs** to sign it in, choose which tabs to show, and rename or reorder them. Back returns to the Manager’s settings. Each profile has its own media credentials, library cache and Continue watching rows. Boot, ads and privacy settings, YouTube and IPTV sources remain shared; Kids don’t see the shared sources.
 - **Adult:** Full viewing and app access without launcher settings or app management.
@@ -79,7 +79,7 @@ A Manager can optionally set or remove a four-digit PIN on any profile. The keyp
 
 ## Tabs
 
-Tabs appear at the top once there is more than Home: the Jellyfin libraries, the Plex ones, then **Live TV** when live TV is set up. Up from the first row reaches them, Left and Right switch tabs (Right past the last one reaches the cog), and Back on a tab returns to its start and then to Home. Settings → **Tabs** lists them with a switch each; OK on one offers *Hide* or *Show*, *Rename*, *Move left* and *Move right*. *Rename* takes a name on the on-screen keyboard; an empty one puts the library's own name back. The order, the hidden tabs and the names given are kept in `state.json`, by library id, so renaming a library on the server keeps its place.
+Settings → **Tabs** lets each profile show, hide, rename or move **Home**, Jellyfin and Plex library tabs, and **Live TV** when configured. If Home is hidden, the launcher opens the first visible tab instead. If no tabs are available, Home comes back as a fallback. The tab bar only appears when two or more tabs are visible. Up from the first row reaches it. Left and Right switch tabs (Right past the last one reaches the cog), and Back returns to the start of the tab, then to the profile's landing tab. Clearing a custom name restores the default: library tab names come from Jellyfin or Plex. Tab order, visibility and custom names are kept in the profile's `state.json`.
 
 ## Plex
 

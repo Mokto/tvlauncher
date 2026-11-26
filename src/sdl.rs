@@ -188,10 +188,12 @@ extern "C" {
     pub fn SDL_FreeSurface(s: *mut Surface);
     pub fn SDL_UpperBlitScaled(src: *mut Surface, srcrect: *const Rect, dst: *mut Surface, dstrect: *mut Rect)
         -> c_int;
+    pub fn SDL_RWFromConstMem(mem: *const c_void, size: c_int) -> *mut Opaque;
     pub fn SDL_RWFromFile(file: *const c_char, mode: *const c_char) -> *mut Opaque;
     pub fn SDL_SaveBMP_RW(s: *mut Surface, dst: *mut Opaque, freedst: c_int) -> c_int;
 
     pub fn IMG_Init(flags: c_int) -> c_int;
+    pub fn IMG_Load_RW(src: *mut Opaque, freesrc: c_int) -> *mut Surface;
     pub fn IMG_Load(file: *const c_char) -> *mut Surface;
 
     pub fn TTF_Init() -> c_int;
@@ -226,6 +228,15 @@ impl Surf {
         let s = unsafe { IMG_Load(cstr(path).as_ptr()) };
         (!s.is_null()).then_some(Surf(s))
     }
+    pub fn from_bytes(bytes: &[u8]) -> Option<Surf> {
+        let rw = unsafe { SDL_RWFromConstMem(bytes.as_ptr().cast(), bytes.len().try_into().ok()?) };
+        if rw.is_null() {
+            return None;
+        }
+        let s = unsafe { IMG_Load_RW(rw, 1) };
+        (!s.is_null()).then_some(Surf(s))
+    }
+
     pub fn size(&self) -> (i32, i32) {
         unsafe { ((*self.0).w, (*self.0).h) }
     }

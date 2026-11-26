@@ -56,6 +56,7 @@ pub struct Gfx {
     pub hgrad: Tex,
     pub vgrad: Tex,
     pub gear: Tex,
+    pub(crate) avatar_atlas: std::cell::OnceCell<Option<Tex>>,
     /// `icons::ALL` in order.
     icons: Vec<Tex>,
 }
@@ -81,6 +82,7 @@ impl Gfx {
             hgrad: gen(ren, 256, 1, f_hgrad),
             vgrad: gen(ren, 1, 256, f_vgrad),
             gear: gen(ren, 128, 128, f_gear),
+            avatar_atlas: std::cell::OnceCell::new(),
             icons: crate::icons::ALL
                 .iter()
                 .map(|i| {

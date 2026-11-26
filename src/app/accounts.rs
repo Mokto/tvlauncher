@@ -20,7 +20,7 @@ pub(super) struct Picker {
     selected: usize,
 }
 
-const COLS: usize = 6;
+const COLS: usize = 7;
 const VISIBLE_ROWS: usize = 2;
 
 fn move_card(i: usize, count: usize, dx: i32, dy: i32) -> usize {
@@ -56,42 +56,52 @@ impl Picker {
         let center = |t: Option<&Tex>, x: f32, y, color| {
             g.put(t, x - t.map_or(0.0, |t| t.w as f32 / 2.0), y, color, 1.0);
         };
-        g.fill(
-            BG,
-            1.0,
-            FRect {
-                x: 0.0,
-                y: 0.0,
-                w: W,
-                h: H,
-            },
-        );
+        avatars::backdrop(g);
+        let pictures = matches!(self.target, Target::Picture(_));
         let many = self.cards.len() > COLS;
-        let title_y = if many { 88.0 } else { 192.0 };
+        let title_y = if many { 88.0 } else { 120.0 };
         center(self.title.as_ref(), W / 2.0, title_y, TEXT);
         center(self.note.as_ref(), W / 2.0, title_y + 105.0, YELLOW);
         center(self.help.as_ref(), W / 2.0, 1000.0, DIM);
-        let first_row = (self.selected / COLS).saturating_sub(VISIBLE_ROWS - 1);
-        const SIZE: f32 = 208.0;
-        const STEP: f32 = 260.0;
-        for (row, cards) in self.cards.chunks(COLS).enumerate().skip(first_row).take(VISIBLE_ROWS) {
-            let margin = (W - (cards.len() - 1) as f32 * STEP - SIZE) / 2.0;
-            let y = if many {
+        let visible_rows = if pictures { 3 } else { VISIBLE_ROWS };
+        let first_row = (self.selected / COLS).saturating_sub(visible_rows - 1);
+        let size = if pictures { 168.0 } else { 220.0 };
+        for (row, cards) in self.cards.chunks(COLS).enumerate().skip(first_row).take(visible_rows) {
+            let step = if pictures {
+                240.0
+            } else if cards.len() == COLS {
+                252.0
+            } else {
+                292.0
+            };
+            let cols = if pictures { COLS } else { cards.len() };
+            let margin = (W - (cols - 1) as f32 * step - size) / 2.0;
+            let y = if pictures {
+                230.0 + (row - first_row) as f32 * 245.0
+            } else if many {
                 262.0 + (row - first_row) as f32 * 344.0
             } else {
                 390.0
             };
             for (col, card) in cards.iter().enumerate() {
-                let x = margin + col as f32 * STEP;
+                let x = margin + col as f32 * step;
                 let on = row * COLS + col == self.selected;
                 if on {
-                    g.rounded(x - 7.0, y - 7.0, SIZE + 14.0, SIZE + 14.0, 39.0, WHITE, 1.0);
+                    g.rounded(
+                        x - 7.0,
+                        y - 7.0,
+                        size + 14.0,
+                        size + 14.0,
+                        (size + 14.0) / 2.0,
+                        WHITE,
+                        1.0,
+                    );
                 }
-                avatars::draw(g, card.avatar, x, y, SIZE);
-                let name_y = y + SIZE + 20.0;
+                avatars::draw(g, card.avatar, x, y, size);
+                let name_y = y + size + 20.0;
                 center(
                     card.name.as_ref(),
-                    x + SIZE / 2.0,
+                    x + size / 2.0,
                     name_y,
                     if on { WHITE } else { TEXT },
                 );
@@ -114,8 +124,9 @@ impl App {
     }
 
     pub(super) fn switch_profiles(&mut self) {
-        let selected = self.active.unwrap_or(0);
+        let Some(selected) = self.active else { return };
         self.reload_profile(None, None);
+        self.switch_from = Some(selected);
         self.choose_profile(selected, "");
     }
 
@@ -137,6 +148,11 @@ impl App {
         let Mode::Picker(p) = &mut self.mode else { return };
         let selected = p.selected;
         match p.target {
+            Target::Profile if back => {
+                if let Some(i) = self.switch_from.take() {
+                    self.reload_profile(Some(i), None);
+                }
+            }
             Target::Profile if ok => self.select_profile(selected),
             Target::Picture(i) if back => self.manage_profile(i),
             Target::Picture(i) if ok && editable => {
@@ -159,13 +175,7 @@ impl App {
         } else if self.pin_retry.is_some_and(|until| until > Instant::now()) {
             self.choose_profile(i, "Try again in a few seconds");
         } else {
-            self.ask(
-                Ask::Unlock(i),
-                "Unlock profile",
-                &self.profiles[i].name.clone(),
-                "PIN",
-                "",
-            );
+            self.ask(Ask::Unlock(i), "", &self.profiles[i].name.clone(), "PIN", "");
         }
     }
 
@@ -414,11 +424,11 @@ mod tests {
 
     #[test]
     fn profile_grid_does_not_wrap_or_select_missing_cards() {
-        assert_eq!(move_card(5, 8, 1, 0), 5);
-        assert_eq!(move_card(5, 8, 0, 1), 7);
-        assert_eq!(move_card(6, 8, -1, 0), 6);
-        assert_eq!(move_card(7, 8, 0, 1), 7);
-        assert_eq!(move_card(7, 8, 0, -1), 1);
+        assert_eq!(move_card(6, 9, 1, 0), 6);
+        assert_eq!(move_card(6, 9, 0, 1), 8);
+        assert_eq!(move_card(7, 9, -1, 0), 7);
+        assert_eq!(move_card(8, 9, 0, 1), 8);
+        assert_eq!(move_card(8, 9, 0, -1), 1);
         assert_eq!(move_card(0, 1, 1, 0), 0);
     }
 }
