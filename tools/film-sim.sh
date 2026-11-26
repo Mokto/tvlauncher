@@ -4,8 +4,8 @@
 # decoded or shown but the controls, so this checks the flow (reading, pause, seeking, tracks, subtitles, reports),
 # not what the TV does with the stream. Needs ffmpeg and node on the PATH, and the host FFmpeg libraries
 # (`make ffmpeg-host`).
-# Usage: sh tools/film-sim.sh [keys]    keys as "seconds:key,..." with enter, left, right, up, down, esc
-#   e.g. sh tools/film-sim.sh "3:enter,5:enter,7:right,16:esc"
+# Usage: sh tools/film-sim.sh [keys]    keys as "seconds:key,..." with enter, play, left, right, up, down, esc
+#   e.g. sh tools/film-sim.sh "3:enter,5:enter,7:right,16:esc,17:esc"
 set -eu
 cd "$(dirname "$0")/.."
 D=build/film-sim
@@ -29,7 +29,7 @@ node tools/fake-media.js "$D" 8780 > "$D/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER' EXIT
 sleep 1
-FILM_KEYS="${1:-6:esc}" DYLD_INSERT_LIBRARIES=build/fake-sf/libplayerAPIs.so.1 DYLD_LIBRARY_PATH=build/fake-sf \
+FILM_KEYS="${1:-6:esc,7:esc}" DYLD_INSERT_LIBRARIES=build/fake-sf/libplayerAPIs.so.1 DYLD_LIBRARY_PATH=build/fake-sf \
   LAUNCHER_ROOT="$R" target/release/tvlauncher --film-sim m1
 echo "--- what the server heard:"
 grep -E "REPORT|RANGE|TILE" "$D/server.log" | cut -c1-160
