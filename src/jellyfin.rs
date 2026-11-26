@@ -148,6 +148,7 @@ pub fn sign_out(root: &str, cfg: &Config) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+    crate::detail::prune_pictures(root);
 }
 
 /// The cache holds YouTube's files too: these are Jellyfin's.

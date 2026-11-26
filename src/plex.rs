@@ -154,6 +154,7 @@ pub fn sign_out(root: &str) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+    crate::detail::prune_pictures(root);
 }
 
 // ---- sign-in -----------------------------------------------------------------------------------------------
@@ -609,7 +610,11 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
     }
     let mut keep = HashSet::new();
     for (view, key, base, token) in found {
-        let body = get_json(&format!("{base}/library/sections/{key}/all"), &h(&token), 60)?;
+        let body = get_json(
+            &format!("{base}/library/sections/{key}/all?includeGuids=1"),
+            &h(&token),
+            60,
+        )?;
         let list: Vec<library::Title> = body["MediaContainer"]["Metadata"]
             .as_array()
             .into_iter()
@@ -625,6 +630,7 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
     }
     if all {
         library::prune(root, PLEX, &keep);
+        crate::detail::prune_pictures(root);
     }
     Ok(())
 }
