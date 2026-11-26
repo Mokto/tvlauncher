@@ -17,6 +17,18 @@ stop_home() {
   sleep 2
 }
 
+# Home started by the app manager is running, or this launches it, unless the TV started on an input or an app.
+start_home_if_free() {
+  i=0
+  while pgrep -f "^$EXE" >/dev/null && [ $i -lt 12 ]; do usleep 250000; i=$((i + 1)); done
+  usleep 500000
+  pgrep -f "^$EXE" >/dev/null && return 0
+  fg=$(luna luna://com.webos.applicationManager/getForegroundAppInfo '{}' | sed -n 's/.*"appId" *: *"\([^"]*\)".*/\1/p')
+  if [ -z "$fg" ] || [ "$fg" = com.webos.app.home ]; then
+    luna luna://com.webos.applicationManager/launch '{"id":"com.webos.app.home"}' >/dev/null
+  fi
+}
+
 # Crashes of the launcher in the last minute: it appends the time (seconds) of each one to $CRASHES.
 crashes() {
   n=0
@@ -69,6 +81,76 @@ role_off() {
   ls-control scan-services >/dev/null 2>&1
 }
 
+# Early start. LG's Home is up at about 18 s into a boot, but webosbrew's hooks only run at 35 s or later, so the boot hook alone
+# leaves LG's Home on screen for ~20 s. Two things run earlier (the idea is Luma's, see THIRD-PARTY-NOTICES.md): ls-hubd reads
+# /var/luna-service2 at core-boot-done (~13 s) and starts a dynamic service as root on the first call, and LG's compositor loads
+# a key-filter script (the key filters in configd) within seconds of boot. The script calls the service, whose program is
+# $EARLY_SH: it runs `takeover.sh early`. Everything is best effort; boot.sh at ~35 s is still there as the fallback.
+EARLY_NAME=com.webos.service.tvlauncherearly
+EARLY_DIR=${EARLY_DIR:-/var/lib/tvlauncher}
+EARLY_SH=$EARLY_DIR/early.sh
+EARLY_JS=$EARLY_DIR/home-filter.js
+LS2=${LS2:-/var/luna-service2}
+KEYFILTERS=com.webos.surfacemanager.keyFilters
+configs() { luna-send -n 1 -w 5000 luna://com.webos.service.config/"$1" "$2" </dev/null; }
+# The filter list as one JSON line, or nothing when configd does not answer.
+filters_get() {
+  configs getConfigs "{\"configNames\":[\"$KEYFILTERS\"]}" | tr -d '\n' |
+    sed -n "s/.*\"$KEYFILTERS\": *\(\[[^]]*\]\).*/\1/p"
+}
+# Our entry out of the list, and added again when $1 is on.
+filters_set() {
+  list=$(filters_get)
+  [ -n "$list" ] || return 1
+  new=$(printf '%s' "$list" | sed 's/, *{[^}]*tvlauncherKey[^}]*}//g; s/{[^}]*tvlauncherKey[^}]*} *,\{0,1\}//g')
+  [ "$1" = on ] && new=$(printf '%s' "$new" | sed "s|\]\$|,{\"handler\":\"tvlauncherKey\",\"file\":\"$EARLY_JS\"}]|")
+  [ "$new" = "$list" ] || configs setConfigs "{\"configs\":{\"$KEYFILTERS\":$new}}" >/dev/null
+}
+early_on() {
+  mkdir -p $EARLY_DIR $LS2/services.d $LS2/roles.d $LS2/api-permissions.d $LS2/manifests.d || return 1
+  printf '#!/bin/sh\nexec sh "%s/takeover.sh" early\n' "$D" > $EARLY_SH && chmod 755 $EARLY_SH
+  cat > $EARLY_JS <<'EOF2'
+/* tvlauncher: asks the early-start service to make the launcher Home while the TV boots. Keys pass through unchanged. */
+var tvlauncherBooting = false;
+var tvlauncherTries = 0;
+function tvlauncherPing() {
+  if (!tvlauncherBooting || tvlauncherTries >= 20) return;
+  tvlauncherTries++;
+  genericTimer.set(2000, tvlauncherPing);
+  lunaCall.send('com.webos.service.tvlauncherearly', '/prepare', '{}', function () {});
+}
+function init() {
+  try {
+    lunaCall.subscribe('com.webos.bootManager', '/getBootStatus', '{}', function (payload) {
+      try {
+        var r = typeof payload === 'string' ? JSON.parse(payload) : payload;
+        if (!r || !r.returnValue || !r.signals) return;
+        if (r.signals['boot-done']) tvlauncherBooting = false;
+        else if (!tvlauncherTries && !tvlauncherBooting) { tvlauncherBooting = true; tvlauncherPing(); }
+      } catch (e) { console.warn('tvlauncher filter: ' + e); }
+    }, true);
+  } catch (e) { console.warn('tvlauncher filter: ' + e); }
+}
+function tvlauncherKey() { return KeyPolicy.NextPolicy; }
+EOF2
+  printf '[D-BUS Service]\nName=%s\nExec=%s\nType=dynamic\n' $EARLY_NAME $EARLY_SH > $LS2/services.d/$EARLY_NAME.service
+  cat > $LS2/roles.d/$EARLY_NAME.json <<EOF2
+{"exeName":"$EARLY_SH","type":"regular","allowedNames":["$EARLY_NAME"],"permissions":[{"service":"$EARLY_NAME","inbound":["com.webos.starfish.keyfilters"],"outbound":[]}]}
+EOF2
+  echo "{\"all\":[\"$EARLY_NAME/prepare\"]}" > $LS2/api-permissions.d/$EARLY_NAME.json
+  cat > $LS2/manifests.d/$EARLY_NAME.json <<EOF2
+{"id":"$EARLY_NAME","version":"1.0.0","serviceFiles":["$LS2/services.d/$EARLY_NAME.service"],"roleFiles":["$LS2/roles.d/$EARLY_NAME.json"],"apiPermissionFiles":["$LS2/api-permissions.d/$EARLY_NAME.json"]}
+EOF2
+  ls-control scan-volatile-dirs >/dev/null 2>&1
+  filters_set on
+}
+early_off() {
+  filters_set off
+  rm -f $LS2/services.d/$EARLY_NAME.service $LS2/roles.d/$EARLY_NAME.json $LS2/api-permissions.d/$EARLY_NAME.json \
+    $LS2/manifests.d/$EARLY_NAME.json $EARLY_SH $EARLY_JS
+  ls-control scan-volatile-dirs >/dev/null 2>&1
+}
+
 HOOK=/var/lib/webosbrew/init.d/20-tvlauncher-home
 MADE=$D/made-cytv-disable
 case "$1" in
@@ -82,10 +164,12 @@ boot)
     chmod 755 "$D/boot.sh"
     if [ -d $CYTV ] && [ ! -e $CYTV/DISABLE ]; then touch $CYTV/DISABLE && touch "$MADE"; fi
     ln -sf "$D/boot.sh" $HOOK
+    early_on || echo "the early start could not be set up; Home starts at the webosbrew hook instead"
     ;;
   off)
     rm -f $HOOK
-    [ -f "$MADE" ] && { rm -f $CYTV/DISABLE "$MADE"; }
+    early_off
+    if [ -f "$MADE" ]; then rm -f $CYTV/DISABLE "$MADE"; fi
     ;;
   status) [ -L $HOOK ] ;;
   *) echo "usage: $0 boot on|off|status"; exit 2 ;;
@@ -103,8 +187,28 @@ watch)
     fi
   done
   ;;
+early)
+  # From the early service, as root, ~15 s into a boot: only the mount and stopping LG's Home (the app manager starts it again,
+  # now as the launcher). Opens nothing, so an input the TV starts on stays. Silent exit when the boot option is not on.
+  exec 9>/tmp/tvlauncher-early.lock
+  flock -w 10 9 || exit 1
+  [ -f $MARK ] && exit 0
+  [ -e "$D/NOBOOT" ] || [ ! -L $HOOK ] || [ ! -x "$D/tvlauncher" ] && exit 1
+  mount --bind "$D/tvlauncher" $EXE || exit 1
+  role_on
+  touch $MARK
+  rm -f $CRASHES
+  (sh "$D/takeover.sh" watch </dev/null >/dev/null 2>&1 &)
+  pkill -f "^$EXE"
+  start_home_if_free
+  echo "$(date): early start, uptime $(cut -d' ' -f1 /proc/uptime)" >> /tmp/tvlauncher-early.log
+  ;;
 on)
-  [ -f $MARK ] && { echo "already Home; run off first"; exit 1; }
+  if [ -f $MARK ]; then
+    # boot.sh after the early start: only what the early start leaves out
+    [ -n "$BOOT" ] && { pkill -f "[c]leanyourtv/watchdog.sh"; start_home_if_free; [ -f "$D/debloat.sh" ] && sh "$D/debloat.sh" apply </dev/null >/dev/null 2>&1; exit 0; }
+    echo "already Home; run off first"; exit 1
+  fi
   [ -x "$D/tvlauncher" ] || { echo "$D/tvlauncher missing"; exit 1; }
   # CleanYourTV's watchdog would see its stand-in gone and put its own Home back
   pkill -f "[c]leanyourtv/watchdog.sh"

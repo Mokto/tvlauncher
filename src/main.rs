@@ -108,6 +108,14 @@ fn main() -> ExitCode {
     }
     unsafe { SDL_LogSetOutputFunction(log_line, std::ptr::null_mut()) };
     log(&format!("tvlauncher start: {}", args.get(1).map_or("", String::as_str)));
+    // The app manager preloads Home hidden in the background (after a boot, say). A window now would cover the input the TV
+    // started on; a real launch kills this process and starts a new one.
+    if on_tv && args.get(1).is_some_and(|a| a.contains("\"reason\":\"preload\"")) {
+        log("preload: no window until the app manager launches Home for real");
+        loop {
+            std::thread::park();
+        }
+    }
     let started = start(&root, shot.is_some());
     let Some((win, ren)) = started else {
         if on_tv {
