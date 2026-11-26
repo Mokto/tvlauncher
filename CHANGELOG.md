@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0](https://github.com/Mokto/tvlauncher/compare/v0.2.0...v0.3.0) (2026-11-26)
+
+
+### Features
+
+* a smaller picture cache, shared between Jellyfin and Plex ([#11](https://github.com/Mokto/tvlauncher/issues/11)) ([60bd25a](https://github.com/Mokto/tvlauncher/commit/60bd25a66c0669ac908899f4c36f8a8963b09e72))
+* add a built-in film player for Jellyfin and Plex titles ([#8](https://github.com/Mokto/tvlauncher/issues/8)) ([585c529](https://github.com/Mokto/tvlauncher/commit/585c529182a7da4eb3b9873a7dded143a1973a91))
+* faster cold boot and first Home paint ([#6](https://github.com/Mokto/tvlauncher/issues/6)) ([fad53f4](https://github.com/Mokto/tvlauncher/commit/fad53f4bf617a07dbac6ceaa5dd797797426bd5f))
+* Jellyfin and Plex library tabs ([#7](https://github.com/Mokto/tvlauncher/issues/7)) ([f20251a](https://github.com/Mokto/tvlauncher/commit/f20251a1a59626d7ca47531849822b94394e5d28))
+* live TV tab with a programme guide, HLS, M3U and Xtream sources ([08af576](https://github.com/Mokto/tvlauncher/commit/08af576247a781c17adf485645754591a3a18c1e))
+* local profiles with Manager, Adult and Kid roles, avatars and optional PINs ([#12](https://github.com/Mokto/tvlauncher/issues/12)) ([8abf1cd](https://github.com/Mokto/tvlauncher/commit/8abf1cd43f735c50912e722d2b9203b73e6db6e2))
+* play a live MPEG-TS stream through LG's media pipeline ([4528ab1](https://github.com/Mokto/tvlauncher/commit/4528ab106e84ca7cfcdf58bf421a5f32a4c21fd7))
+* richer title pages, Home key fix, AV1/VP9 direct play and player polish ([#9](https://github.com/Mokto/tvlauncher/issues/9)) ([38797a9](https://github.com/Mokto/tvlauncher/commit/38797a9c3b5082c26c127c05b4881bbfee7e026b))
+* start as Home earlier in a boot, and keep a background preload from covering the input ([#10](https://github.com/Mokto/tvlauncher/issues/10)) ([690bc16](https://github.com/Mokto/tvlauncher/commit/690bc167ad2a98006c0de49621713ea01e6b7d5a))
+
 ## [0.2.0](https://github.com/Mokto/tvlauncher/compare/v0.1.0...v0.2.0) (2026-11-24)
 
 
