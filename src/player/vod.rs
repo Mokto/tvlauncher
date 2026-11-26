@@ -216,7 +216,7 @@ impl Player {
         });
         let t = Instant::now();
         let d = loop {
-            if matches!(fkey(), Some(Fk::Back)) {
+            if matches!(fkey(), Some(Fk::Back | Fk::Stop)) {
                 return Ok(None);
             }
             match rx.try_recv() {
@@ -261,7 +261,7 @@ impl Player {
         log(&format!("film: {why}"));
         osd.say(g, Some(why));
         loop {
-            if matches!(fkey(), Some(Fk::Back)) {
+            if matches!(fkey(), Some(Fk::Back | Fk::Stop)) {
                 return Vod::Exit(at, false);
             }
             vframe(g, osd, at / TICKS, false, None, Over::default());
@@ -452,7 +452,7 @@ impl Player {
         };
         let t = Instant::now();
         let (video, audio, dv) = loop {
-            if matches!(fkey(), Some(Fk::Back)) {
+            if matches!(fkey(), Some(Fk::Back | Fk::Stop)) {
                 return Vod::Exit(start, false);
             }
             match run.q.pop_timeout(Duration::from_millis(16)) {
@@ -511,10 +511,10 @@ impl Player {
         while unsafe { (smp.loaded)(smp.obj) } & 0xff == 0 {
             let k = fkey();
             let err = ERROR.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if t.elapsed() > Duration::from_secs(10) || err.is_some() || matches!(k, Some(Fk::Back)) {
+            if t.elapsed() > Duration::from_secs(10) || err.is_some() || matches!(k, Some(Fk::Back | Fk::Stop)) {
                 smp.retire();
                 return match k {
-                    Some(Fk::Back) => Vod::Exit(start, false),
+                    Some(Fk::Back | Fk::Stop) => Vod::Exit(start, false),
                     _ => {
                         let why = err.unwrap_or("The TV's player did not start.".into());
                         self.or_server(g, osd, direct, &why, start)
@@ -567,6 +567,7 @@ impl Player {
         let mut menu: Option<Menu> = None;
         // A held Left or Right, its speed step, where the seek began, and when Info was last made.
         let (mut scrub, mut level, mut seek_from) = (None::<Scrub>, 0u8, 0i64);
+        let mut taps = SeekTaps::default();
         let mut info_at = Instant::now();
         let page_name = if it.series.is_some() {
             "Go to series"
@@ -649,10 +650,56 @@ impl Player {
             };
             let had_seek = seek.is_some();
             let key = fkey();
+            if !had_seek || !matches!(key, None | Some(Fk::Step(_) | Fk::Release)) {
+                taps = SeekTaps::default();
+                if scrub.is_none() {
+                    level = 0;
+                }
+            }
             if menu.is_some() {
                 osd.show();
             }
-            if let Some(m) = menu.as_mut() {
+            let toggle = matches!(key, Some(Fk::Pause))
+                || (matches!(key, Some(Fk::Toggle))
+                    && menu.is_none()
+                    && osd.focus.is_none()
+                    && seek.is_none()
+                    && up_left.is_none()
+                    && skip.is_none());
+            if matches!(key, Some(Fk::Stop)) {
+                break Vod::Exit(pos, false);
+            } else if matches!(key, Some(Fk::Back)) {
+                if seek.is_some() {
+                    (seek, scrub, level) = (None, None, 0);
+                    osd.show();
+                } else if menu.take().is_some() {
+                    osd.show();
+                } else if osd.controls_visible(paused) {
+                    osd.hide();
+                } else if up_left.is_some() {
+                    up.dismissed = true;
+                } else {
+                    break Vod::Exit(pos, false);
+                }
+            } else if toggle {
+                if clock.running() || paused {
+                    paused = !paused;
+                    log(&format!(
+                        "film: {} at {} s",
+                        if paused { "paused" } else { "resumed" },
+                        pos / TICKS
+                    ));
+                    if paused {
+                        unsafe { (smp.pause)(smp.obj) };
+                        clock.hold();
+                    } else {
+                        unsafe { (smp.play)(smp.obj) };
+                        clock.run();
+                    }
+                    film::report(it, Note::Progress, pos, paused, direct, false);
+                    osd.show();
+                }
+            } else if let Some(m) = menu.as_mut() {
                 let opt = match m.picked() {
                     Some(Pick::Opt(o)) => Some(*o),
                     _ => None,
@@ -692,7 +739,7 @@ impl Player {
                         }
                         *m = Menu::options(g, &choice.look, choice.delay_ms, m.sel);
                     }
-                    (Some(Fk::Back), _) | (Some(Fk::Step(-1)), _) => menu = None,
+                    (Some(Fk::Step(-1)), _) => menu = None,
                     (Some(Fk::Up), _) => m.step(-1),
                     (Some(Fk::Down), _) => m.step(1),
                     (Some(Fk::Toggle), _) => {
@@ -763,7 +810,7 @@ impl Player {
             } else if osd.focus.is_some() {
                 match key {
                     Some(Fk::Step(d)) => osd.step(d),
-                    Some(Fk::Up | Fk::Back) => {
+                    Some(Fk::Up) => {
                         osd.focus = None;
                         osd.show();
                     }
@@ -792,7 +839,7 @@ impl Player {
                         smp.retire();
                         return Vod::Next;
                     }
-                    Some(Fk::Toggle | Fk::Back) => {
+                    Some(Fk::Toggle) => {
                         log("film: watches the credits");
                         up.dismissed = true;
                     }
@@ -803,13 +850,8 @@ impl Player {
                 }
             } else {
                 match key {
-                    Some(Fk::Back) if seek.is_some() => {
-                        (seek, scrub, level) = (None, None, 0);
-                        osd.show();
-                    }
-                    Some(Fk::Back) => break Vod::Exit(pos, false),
                     Some(Fk::Up) => osd.show(),
-                    Some(Fk::Down) => osd.focus_buttons(),
+                    Some(Fk::Down) if seek.is_none() => osd.focus_buttons(),
                     Some(Fk::Chapter(d)) if !it.chapters.is_empty() => {
                         let cur = seek.map_or(pos, |s| s.0 * TICKS);
                         let now = extras::chapter_at(&it.chapters, cur);
@@ -841,34 +883,19 @@ impl Player {
                             osd.show();
                         }
                     }
-                    Some(Fk::Toggle | Fk::Pause) if clock.running() || paused => {
-                        paused = !paused;
-                        log(&format!(
-                            "film: {} at {} s",
-                            if paused { "paused" } else { "resumed" },
-                            pos / TICKS
-                        ));
-                        if paused {
-                            unsafe { (smp.pause)(smp.obj) };
-                            clock.hold();
-                        } else {
-                            unsafe { (smp.play)(smp.obj) };
-                            clock.run();
-                        }
-                        film::report(it, Note::Progress, pos, paused, direct, false);
-                        osd.show();
-                    }
                     // The key comes again while it is held: the hold is already scrubbing.
                     Some(Fk::Step(d)) if scrub.as_ref().is_some_and(|s| s.dir == d) => {}
                     Some(Fk::Step(d)) => {
                         let base = seek.map_or(pos / TICKS, |s| s.0);
-                        let to = (base + d * SKIPS[choice.look.skip]).clamp(0, top);
+                        let (step, speed) = taps.step(d, SKIPS[choice.look.skip]);
+                        level = speed;
+                        let to = (base + step).clamp(0, top);
                         seek = Some((to, Instant::now()));
                         scrub = Some(Scrub::new(d, to as f64));
                         osd.show();
                     }
                     Some(Fk::Release) => {
-                        (scrub, level) = (None, 0);
+                        scrub = None;
                         if let Some(s) = seek.as_mut() {
                             s.1 = Instant::now();
                         }
@@ -884,7 +911,10 @@ impl Player {
             if let Some(s) = scrub.as_mut() {
                 match s.advance(top) {
                     Some(l) => {
-                        level = l;
+                        if l > 0 {
+                            level = l;
+                            taps = SeekTaps::default();
+                        }
                         seek = Some((s.at as i64, Instant::now()));
                     }
                     None => (scrub, level) = (None, 0),
@@ -1159,7 +1189,7 @@ impl Player {
         let t = Instant::now();
         loop {
             match fkey() {
-                Some(Fk::Back) => return false,
+                Some(Fk::Back | Fk::Stop) => return false,
                 Some(Fk::Toggle) => return true,
                 _ => {}
             }
@@ -1173,7 +1203,7 @@ impl Player {
 }
 
 /// `FILM_KEYS="3:enter,6:right,9:down"` on a desktop run: presses these keys that many seconds in (Back is `esc`,
-/// `rightup` lets go of Right).
+/// `rightup` lets go of Right and `play` tests the dedicated Play/Pause key).
 pub fn film_sim_keys() {
     let script = std::env::var("FILM_KEYS").unwrap_or_default();
     let keys: Vec<(u64, i32)> = script
@@ -1182,6 +1212,7 @@ pub fn film_sim_keys() {
             let (t, name) = k.split_once(':')?;
             let sym = match name {
                 "enter" => K_RETURN,
+                "play" => AUDIO_PLAY,
                 "left" => K_LEFT,
                 "right" => K_RIGHT,
                 "up" => K_UP,

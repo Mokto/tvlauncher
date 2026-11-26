@@ -10,9 +10,10 @@ use std::ffi::c_int;
 
 pub enum Fk {
     Back,
+    Stop,
     /// OK: pauses, or skips what the button on screen offers.
     Toggle,
-    /// The remote's Play and Pause keys: always pause.
+    /// Dedicated transport key, independent of the focused control.
     Pause,
     /// The next (1) or the previous (-1) chapter.
     Chapter(i32),
@@ -26,16 +27,18 @@ pub enum Fk {
     Down,
 }
 
+pub const AUDIO_PLAY: i32 = (1 << 30) | 261;
+
 /// The remote while a title plays.
 pub fn fkey() -> Option<Fk> {
     if STOP.load(Ordering::SeqCst) || crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
-        return Some(Fk::Back);
+        return Some(Fk::Stop);
     }
     let mut e = Event::new(0);
     while unsafe { SDL_PollEvent(&mut e) } != 0 {
         if e.kind() == QUIT {
             unsafe { SDL_PushEvent(&mut Event::new(QUIT)) };
-            return Some(Fk::Back);
+            return Some(Fk::Stop);
         }
         let (sym, wcode) = (e.key_sym(), e.key_wcode());
         if e.kind() == KEYUP && (sym == K_LEFT || sym == K_RIGHT) {
@@ -44,14 +47,19 @@ pub fn fkey() -> Option<Fk> {
         if e.kind() != KEYDOWN {
             continue;
         }
-        // 413 is the remote's Stop
-        if sym == K_ESCAPE || wcode == WCODE_BACK || wcode == 413 {
+        if wcode == 413 {
+            return Some(Fk::Stop);
+        }
+        if sym == K_ESCAPE || wcode == WCODE_BACK {
+            if e.key_repeat() {
+                continue;
+            }
             return Some(Fk::Back);
         }
         match (sym, wcode) {
             // 415 and 19 are the remote's Play and Pause
             (K_RETURN | K_KP_ENTER, _) => return Some(Fk::Toggle),
-            (_, 415 | 19) => return Some(Fk::Pause),
+            (AUDIO_PLAY, _) | (_, 415 | 19) => return Some(Fk::Pause),
             (K_PAGEDOWN, _) => return Some(Fk::Chapter(1)),
             (K_PAGEUP, _) => return Some(Fk::Chapter(-1)),
             (K_LEFT, _) => return Some(Fk::Step(-1)),
@@ -100,6 +108,23 @@ fn sub_ink(l: &Look) -> Color {
 }
 
 // ---- seeking ------------------------------------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct SeekTaps {
+    dir: i64,
+    count: u8,
+}
+
+impl SeekTaps {
+    pub fn step(&mut self, dir: i64, step: i64) -> (i64, u8) {
+        if self.dir != dir {
+            *self = Self { dir, count: 0 };
+        }
+        self.count = (self.count + 1).min(5);
+        let level = self.count.saturating_sub(2);
+        (dir * (step << level), level + 1)
+    }
+}
 
 /// A held Left or Right: the place it has reached, in seconds, and since when it is held.
 pub struct Scrub {
@@ -243,6 +268,7 @@ pub struct Osd {
     at: Label,
     ends: Label,
     delta: Label,
+    hint: Label,
     status: Option<Tex>,
     chapters: Vec<Chapter>,
     /// The chapter whose name is drawn, and the name.
@@ -250,7 +276,8 @@ pub struct Osd {
     skip: Option<(SegKind, Tex)>,
     /// A status that goes by itself (a failed subtitle download), unlike an error that stays until Back.
     status_until: Option<Instant>,
-    until: Instant,
+    until: Option<Instant>,
+    seek_hint: Option<Tex>,
     buttons: Vec<(Btn, Option<Tex>)>,
     /// The focused button, when the focus is on the buttons rather than on the bar.
     pub focus: Option<usize>,
@@ -260,7 +287,7 @@ impl Osd {
     pub fn new(g: &Gfx, it: &Item) -> Osd {
         let total_s = it.total / TICKS;
         Osd {
-            name: g.text(g.f_row, &crate::jellyfin::clip(&it.name, 40), 0),
+            name: g.text(g.f_title, &crate::jellyfin::clip(&it.name, 40), 0),
             sub: g.text(g.f_sub, &it.sub, 1000),
             big_name: g.text(g.f_title, &crate::jellyfin::clip(&it.name, 48), 0),
             stage: Label::default(),
@@ -278,12 +305,14 @@ impl Osd {
             at: Label::default(),
             ends: Label::default(),
             delta: Label::default(),
+            hint: Label::default(),
             status: None,
             chapters: it.chapters.clone(),
             chapter: (None, None),
             skip: None,
             status_until: None,
-            until: Instant::now() + Duration::from_secs(6),
+            until: Some(Instant::now() + Duration::from_secs(6)),
+            seek_hint: g.text(g.f_label, "OK to jump   ·   Back to cancel", 0),
             buttons: vec![],
             focus: None,
         }
@@ -316,7 +345,18 @@ impl Osd {
     }
 
     pub fn show(&mut self) {
-        self.until = Instant::now() + Duration::from_secs(5);
+        self.until = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    pub fn controls_visible(&self, paused: bool) -> bool {
+        self.until.is_some_and(|until| paused || Instant::now() < until)
+            || (self.status.is_some() && self.status_until.is_none_or(|until| Instant::now() < until))
+    }
+
+    pub fn hide(&mut self) {
+        self.until = None;
+        self.focus = None;
+        (self.status, self.status_until) = (None, None);
     }
 
     pub fn say(&mut self, g: &Gfx, s: Option<&str>) {
@@ -387,43 +427,71 @@ impl Osd {
         if self.status_until.is_some_and(|t| Instant::now() > t) {
             (self.status, self.status_until) = (None, None);
         }
+        if seeking.is_none() && !self.controls_visible(paused) {
+            self.focus = None;
+            return None;
+        }
         if paused && seeking.is_none() && self.focus.is_none() {
             let d = 132.0;
             g.rounded((W - d) / 2.0, (H - d) / 2.0 - 60.0, d, d, d / 2.0, PANEL, 0.75);
             g.icon(Icon::Pause, (W - 60.0) / 2.0, (H - 60.0) / 2.0 - 60.0, 60.0, TEXT, 1.0);
         }
-        if !(paused || seeking.is_some() || self.status.is_some() || Instant::now() < self.until) {
-            self.focus = None;
-            return None;
-        }
         let shown = seeking.map_or(pos_s, |s| s.to);
-        let (x, w, h) = (MARGIN, W - 2.0 * MARGIN, 230.0);
-        let y = H - h - 64.0;
-        g.rounded(x, y, w, h, 28.0, PANEL, 0.94);
-        g.put(self.name.as_ref(), x + 48.0, y + 28.0, TEXT, 1.0);
-        g.put(self.sub.as_ref(), x + 48.0, y + 88.0, DIM, 1.0);
-        let mut bx = x + w - 48.0;
+        let (x, y, w) = (MARGIN, H - 294.0, W - 2.0 * MARGIN);
+        let fade = H - 520.0;
+        let solid = y + 74.0;
+        g.tint(&g.vgrad, BLACK, 0.90);
+        g.copy(
+            &g.vgrad,
+            None,
+            FRect {
+                x: 0.0,
+                y: fade,
+                w: W,
+                h: solid - fade,
+            },
+        );
+        g.fill(
+            BLACK,
+            0.90,
+            FRect {
+                x: 0.0,
+                y: solid,
+                w: W,
+                h: H - solid,
+            },
+        );
+        g.put(self.name.as_ref(), x, y, WHITE, 1.0);
+        if seeking.is_none() {
+            g.put(self.sub.as_ref(), x, y + 55.0, TEXT, 0.85);
+            let hint = if self.focus.is_some() {
+                "Up to seek bar"
+            } else if self.buttons.is_empty() {
+                "Left / Right to seek"
+            } else {
+                "Left / Right to seek   ·   Down for controls"
+            };
+            if let Some(t) = self.hint.set(g, g.f_label, hint) {
+                g.put(Some(t), x + w - t.w as f32, y + 64.0, TEXT, 0.90);
+            }
+        }
+        let button_y = y + 192.0;
+        let mut bx = x + w;
         for (i, (b, t)) in self.buttons.iter().enumerate().rev() {
             let tw = t.as_ref().map_or(0.0, |t| t.w as f32);
-            let (pw, ph, ic) = (tw + 104.0, 64.0, 34.0);
+            let (pw, ph, ic) = (tw + 82.0, 64.0, 30.0);
             bx -= pw;
             let on = self.focus == Some(i);
             let ink = if on { rgb(20, 22, 25) } else { TEXT };
-            g.rounded(
-                bx,
-                y + 26.0,
-                pw,
-                ph,
-                ph / 2.0,
-                if on { TEXT } else { rgb(70, 74, 80) },
-                1.0,
-            );
-            g.icon(b.icon(), bx + 26.0, y + 26.0 + (ph - ic) / 2.0, ic, ink, 1.0);
+            if on {
+                g.rounded(bx, button_y, pw, ph, 14.0, WHITE, 1.0);
+            }
+            g.icon(b.icon(), bx + 20.0, button_y + (ph - ic) / 2.0, ic, ink, 1.0);
             let th = t.as_ref().map_or(0.0, |t| t.h as f32);
-            g.put(t.as_ref(), bx + 74.0, y + 26.0 + (ph - th) / 2.0, ink, 1.0);
-            bx -= 14.0;
+            g.put(t.as_ref(), bx + 62.0, button_y + (ph - th) / 2.0, ink, 1.0);
+            bx -= 8.0;
         }
-        let (bx, bw, by) = (x + 48.0, w - 96.0, y + h - 76.0);
+        let (bx, bw, by) = (x, w, y + 114.0);
         let frac = if self.total_s > 0 {
             (shown as f32 / self.total_s as f32).clamp(0.0, 1.0)
         } else {
@@ -435,51 +503,61 @@ impl Osd {
             top: y,
             frac,
         });
-        if let Some(s) = &self.status {
-            g.put(Some(s), x + 48.0, y + 146.0, DIM, 1.0);
+        if let Some(s) = self.status.as_ref().filter(|_| seeking.is_none()) {
+            g.put(Some(s), x, by + 24.0, TEXT, 1.0);
             return bar;
         }
-        g.rounded(bx, by, bw, 8.0, 4.0, BLACK, 0.5);
-        if bw * frac >= 8.0 {
-            g.rounded(bx, by, bw * frac, 8.0, 4.0, TEXT, 1.0);
+        let timeline = self.focus.is_none();
+        g.rounded(bx, by, bw, 6.0, 3.0, WHITE, 0.33);
+        if bw * frac >= 6.0 {
+            g.rounded(bx, by, bw * frac, 6.0, 3.0, WHITE, if timeline { 1.0 } else { 0.65 });
         }
         if self.total_s > 0 {
             for c in self.chapters.iter().filter(|c| c.start > 0) {
                 let f = (c.start / TICKS) as f32 / self.total_s as f32;
-                g.rounded(bx + bw * f - 2.0, by - 6.0, 4.0, 20.0, 2.0, DIM, 1.0);
+                g.rounded(bx + bw * f - 2.0, by - 7.0, 4.0, 20.0, 2.0, WHITE, 0.50);
             }
         }
+        let head = bx + bw * frac;
+        let (r, ink) = if timeline { (13.0, WHITE) } else { (8.0, DIM) };
+        g.rounded(head - r, by + 3.0 - r, 2.0 * r, 2.0 * r, r, ink, 1.0);
         if let Some(s) = seeking {
-            let head = bx + bw * frac;
-            g.rounded(head - 12.0, by - 8.0, 24.0, 24.0, 12.0, TEXT, 1.0);
             let d = s.to - s.from;
             let text = format!("{}{}", if d < 0 { "-" } else { "+" }, film::clock(d.abs()));
-            let dots = if s.level > 0 { 4.0 * 18.0 + 12.0 } else { 0.0 };
             if let Some(t) = self.delta.set(g, g.f_sub, &text) {
-                let tw = t.w as f32 + dots;
-                let tx = (head - tw / 2.0).clamp(bx, bx + bw - tw);
-                let ty = by - 18.0 - t.h as f32;
-                g.put(Some(t), tx, ty, TEXT, 1.0);
-                for i in 0..if s.level > 0 { 4u8 } else { 0 } {
-                    let on = i < s.level;
-                    let dx = tx + t.w as f32 + 12.0 + f32::from(i) * 18.0;
-                    g.rounded(
-                        dx,
-                        ty + t.h as f32 / 2.0 - 6.0,
-                        12.0,
-                        12.0,
-                        6.0,
-                        if on { YELLOW } else { DIM },
+                let arrows = f32::from(s.level.max(1));
+                let arrow_w = 14.0 * arrows + 12.0;
+                let tw = t.w as f32 + arrow_w;
+                let x = (head - tw / 2.0).clamp(bx, bx + bw - tw);
+                let y = by - 18.0 - t.h as f32;
+                let (icon, tx, ax) = if d < 0 {
+                    (Icon::Left, x + arrow_w, x)
+                } else {
+                    (Icon::Right, x, x + t.w as f32 + 12.0)
+                };
+                g.put(Some(t), tx, y, TEXT, 1.0);
+                for i in 0..s.level.max(1) {
+                    g.icon(
+                        icon,
+                        ax + f32::from(i) * 14.0,
+                        y + (t.h as f32 - 24.0) / 2.0,
+                        24.0,
+                        TEXT,
                         1.0,
                     );
                 }
             }
         }
-        let state = if paused { Icon::Pause } else { Icon::Play };
-        g.icon(state, bx, by + 28.0, 30.0, TEXT, 1.0);
+        if seeking.is_some() {
+            g.put(self.seek_hint.as_ref(), x, button_y + 18.0, TEXT, 1.0);
+        }
+        if seeking.is_none() {
+            let state = if paused { Icon::Pause } else { Icon::Play };
+            g.icon(state, bx, by + 28.0, 30.0, TEXT, 1.0);
+        }
         let tx = bx + 46.0;
         let at = self.at.set(g, g.f_sub, &film::clock(shown)).map(|t| (t.w as f32, t));
-        if let Some((_, t)) = at {
+        if let Some((_, t)) = at.filter(|_| seeking.is_none()) {
             g.put(Some(t), tx, by + 24.0, TEXT, 1.0);
         }
         let at_w = at.map_or(0.0, |a| a.0);
@@ -488,19 +566,18 @@ impl Osd {
             let name = now.map(|i| crate::jellyfin::clip(&self.chapters[i].name, 60));
             self.chapter = (now, name.and_then(|n| g.text(g.f_sub, &n, 0)));
         }
-        if let Some(n) = &self.chapter.1 {
-            g.put(Some(n), tx + at_w + 40.0, by + 24.0, DIM, 1.0);
+        if let Some(n) = self.chapter.1.as_ref().filter(|_| seeking.is_none()) {
+            g.put(Some(n), tx + at_w + 36.0, by + 24.0, TEXT, 0.82);
         }
-        let total_w = self.total.as_ref().map_or(0.0, |t| t.w as f32);
         if let Some(t) = &self.total {
-            g.put(Some(t), bx + bw - total_w, by + 24.0, DIM, 1.0);
+            g.put(Some(t), bx + bw - t.w as f32, by + 24.0, TEXT, 1.0);
         }
-        if self.total_s > 0 {
+        if self.total_s > 0 && seeking.is_none() {
             let left = (self.total_s - shown).max(0);
             let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
             let text = format!("Ends at {}", super::super::hm(now + left));
-            if let Some(t) = self.ends.set(g, g.f_sub, &text) {
-                g.put(Some(t), bx + bw - total_w - 40.0 - t.w as f32, by + 24.0, DIM, 1.0);
+            if let Some(t) = self.ends.set(g, g.f_small, &text) {
+                g.put(Some(t), x, button_y + 18.0, DIM, 1.0);
             }
         }
         bar
@@ -1288,10 +1365,20 @@ impl Menu {
         let w = if self.btn == Btn::Info { 1040.0 } else { 820.0 };
         let h = head + shown as f32 * ROW + foot + 24.0;
         let (x, y) = (W - MARGIN - w, ((H - 340.0 - h) / 2.0).max(40.0));
-        g.rounded(x, y, w, h, 28.0, PANEL, 0.96);
-        g.icon(self.btn.icon(), x + 36.0, y + 26.0, 36.0, DIM, 1.0);
+        g.rounded(x, y, w, h, 22.0, PANEL, 0.98);
+        g.icon(self.btn.icon(), x + 36.0, y + 26.0, 36.0, TEXT, 1.0);
+        g.fill(
+            WHITE,
+            0.14,
+            FRect {
+                x: x + 28.0,
+                y: y + 73.0,
+                w: w - 56.0,
+                h: 1.0,
+            },
+        );
         let th = self.title.as_ref().map_or(0.0, |t| t.h as f32);
-        g.put(self.title.as_ref(), x + 88.0, y + 26.0 + (36.0 - th) / 2.0, DIM, 1.0);
+        g.put(self.title.as_ref(), x + 88.0, y + 26.0 + (36.0 - th) / 2.0, TEXT, 1.0);
         for (n, row) in self.rows.iter().enumerate().skip(first).take(shown) {
             let ry = y + head + (n - first) as f32 * ROW;
             let on = self.sel == Some(n);
@@ -1368,23 +1455,75 @@ pub fn vframe(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<
     unsafe { SDL_RenderPresent(g.ren) };
 }
 
+fn subtitle_lift(bar: Option<&Bar>, rects: impl Iterator<Item = FRect>) -> f32 {
+    let Some(bar) = bar else { return 0.0 };
+    let (top, bottom) = rects.fold((H, 0.0_f32), |(top, bottom), r| (top.min(r.y), bottom.max(r.y + r.h)));
+    (bottom - (bar.top - 26.0)).max(0.0).min(top.max(0.0))
+}
+
 fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<Seeking>, over: Over) {
     if let Some(l) = over.loading.filter(|l| l.full) {
         return osd.draw_loading(g, l.stage);
     }
-    // The subtitle stands above the controls when they are up.
     let geom = osd.draw(g, pos_s, paused, seeking);
-    let bar = geom.is_some();
+    let bar = geom.as_ref();
     if over.loading.is_some() {
         spinner(g, W / 2.0, H / 2.0 - 60.0, 30.0, osd.started.elapsed().as_secs_f32());
     }
-    if let (Some(t), Some(b), true) = (over.thumb, &geom, seeking.is_some()) {
+    if let (Some(b), true) = (bar, seeking.is_some()) {
         let w = 420.0;
-        let h = w * t.h as f32 / t.w.max(1) as f32;
+        let (pad, label_h) = (8.0, 60.0);
+        let image_h = over
+            .thumb
+            .map_or(0.0, |t| (w - 2.0 * pad) * t.h as f32 / t.w.max(1) as f32);
         let x = (b.x + b.w * b.frac - w / 2.0).clamp(MARGIN, W - MARGIN - w);
-        let y = b.top - h - 28.0;
-        g.rounded(x - 6.0, y - 6.0, w + 12.0, h + 12.0, 14.0, TEXT, 1.0);
-        g.copy(t, None, FRect { x, y, w, h });
+        let y = b.top - image_h - label_h - 32.0;
+        g.rounded(x, y, w, image_h + label_h + pad, 12.0, rgb(20, 23, 27), 1.0);
+        if let Some(t) = over.thumb {
+            g.copy(
+                t,
+                None,
+                FRect {
+                    x: x + pad,
+                    y: y + pad,
+                    w: w - 2.0 * pad,
+                    h: image_h,
+                },
+            );
+        }
+        let label_y = y + image_h + pad;
+        if let Some(t) = &osd.at.1 {
+            let tw = t.w as f32;
+            let tx = x + if osd.chapter.1.is_some() { 24.0 } else { (w - tw) / 2.0 };
+            g.put(Some(t), tx, label_y + (label_h - t.h as f32) / 2.0, WHITE, 1.0);
+            if let Some(ch) = &osd.chapter.1 {
+                let cx = tx + tw + 32.0;
+                let cw = ch.w as f32;
+                let k = ((x + w - 24.0 - cx) / cw.max(1.0)).clamp(0.0, 1.0);
+                let ch_h = ch.h as f32 * k;
+                g.fill(
+                    WHITE,
+                    0.20,
+                    FRect {
+                        x: cx - 16.0,
+                        y: label_y + 16.0,
+                        w: 1.0,
+                        h: 28.0,
+                    },
+                );
+                g.tint(ch, TEXT, 0.88);
+                g.copy(
+                    ch,
+                    None,
+                    FRect {
+                        x: cx,
+                        y: label_y + (label_h - ch_h) / 2.0,
+                        w: cw * k,
+                        h: ch_h,
+                    },
+                );
+            }
+        }
     }
     let card = over.up.is_some();
     if let (Some((c, left, of)), None) = (over.up, over.menu) {
@@ -1396,33 +1535,47 @@ fn draw_over(g: &Gfx, osd: &mut Osd, pos_s: i64, paused: bool, seeking: Option<S
     let look = clamp_look(over.look);
     let ink = sub_ink(&look);
     if let Some(a) = over.ass.filter(|_| seeking.is_none()) {
+        let lift = subtitle_lift(bar, a.pics.iter().map(|(_, dst)| *dst));
         for (t, dst) in &a.pics {
             g.tint(t, ink, 1.0);
-            g.copy(t, None, *dst);
+            g.copy(
+                t,
+                None,
+                FRect {
+                    y: dst.y - lift,
+                    ..*dst
+                },
+            );
         }
     }
     let raise = RAISES[look.sub_pos].1;
     if let Some(s) = over.shown.filter(|_| seeking.is_none()) {
         // A picture subtitle grows with the size from the bottom middle of the screen, as text does.
         let k = SIZES[look.sub_size].1 as f32 / 44.0;
+        let image_rect = |d: &FRect| FRect {
+            x: W / 2.0 + (d.x - W / 2.0) * k,
+            y: (H - (H - d.y) * k - raise).max(0.0),
+            w: d.w * k,
+            h: d.h * k,
+        };
+        let lift = subtitle_lift(bar, s.images.iter().map(|(_, d)| image_rect(d)));
         for (t, d) in &s.images {
-            let dst = FRect {
-                x: W / 2.0 + (d.x - W / 2.0) * k,
-                y: (H - (H - d.y) * k - raise).max(0.0),
-                w: d.w * k,
-                h: d.h * k,
-            };
+            let mut dst = image_rect(d);
+            dst.y -= lift;
             g.tint(t, ink, 1.0);
             g.copy(t, None, dst);
         }
         if !s.lines.is_empty() {
             let w = s.lines.iter().map(|t| t.w).max().unwrap_or(0) as f32;
             let h: f32 = s.lines.iter().map(|t| t.h as f32).sum();
-            let top = if s.top {
-                70.0
-            } else {
-                (if bar { H - 320.0 } else { H - 120.0 - raise }) - h
+            let y = if s.top { 70.0 } else { H - 120.0 - raise - h };
+            let rect = FRect {
+                x: (W - w) / 2.0,
+                y,
+                w,
+                h,
             };
+            let top = y - subtitle_lift(bar, std::iter::once(rect));
             if look.sub_bg {
                 g.rounded((W - w) / 2.0 - 20.0, top - 10.0, w + 40.0, h + 20.0, 16.0, BLACK, 0.6);
             }
@@ -1460,7 +1613,7 @@ pub fn up_frame(g: &Gfx, card: &mut UpCard, left: f32, of: f32) {
 }
 
 /// `--film-shot out.bmp [what]` on a desktop: the controls over a stand-in picture (no player). `what` is `seek` (a
-/// held seek), `options`, `subs`, `info`, `next` (the next episode's card) or `load` (the first start).
+/// held seek), `seek-no-thumb`, `buttons`, `options`, `subs`, `info`, `next`, `load`, or `bitmap` / `bitmap-hidden`.
 pub fn shot(g: &Gfx, what: &str) {
     let it = Item {
         backend: film::Backend::Jellyfin(crate::jellyfin::Config::default()),
@@ -1522,6 +1675,10 @@ pub fn shot(g: &Gfx, what: &str) {
         osd.step(n);
     };
     let menu = match what {
+        "buttons" => {
+            focus(&mut osd, 0);
+            None
+        }
         "options" => {
             focus(&mut osd, 3);
             Some(Menu::options(g, &look, 300, Some(4)))
@@ -1556,13 +1713,20 @@ pub fn shot(g: &Gfx, what: &str) {
     });
     let mut shown = Shown::default();
     shown.update(g, &events, 1_234_000);
-    g.fill(rgb(54, 78, 112), 1.0, SCREEN);
+    let demo = |i| {
+        Surf::load(&format!("{}{}/cache/bg-demo{i}.img", g.root, crate::data::DIR)).and_then(|s| Tex::new(g.ren, &s))
+    };
+    if let Some(t) = demo(1) {
+        g.copy(&t, None, SCREEN);
+    } else {
+        g.fill(rgb(54, 78, 112), 1.0, SCREEN);
+    }
     let (w, h) = (320, 180);
     let px: Vec<u8> = (0..w * h)
         .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
         .collect();
-    let thumb = Tex::rgba(g.ren, w, h, &px);
-    let seeking = (what == "seek").then_some(Seeking {
+    let thumb = demo(2).or_else(|| Tex::rgba(g.ren, w, h, &px));
+    let seeking = matches!(what, "seek" | "seek-no-thumb").then_some(Seeking {
         to: 2410,
         from: 1234,
         level: 2,
@@ -1587,15 +1751,31 @@ pub fn shot(g: &Gfx, what: &str) {
         session: String::new(),
     };
     let mut card = UpCard::new(g, &next, true);
-    if what == "next" {
-        osd.until = Instant::now();
+    if matches!(what, "next" | "bitmap-hidden") {
+        osd.hide();
+    }
+    if matches!(what, "bitmap" | "bitmap-hidden") {
+        let mut y = H - 150.0;
+        for t in shown.lines.drain(..) {
+            let (w, h) = (t.w as f32, t.h as f32);
+            shown.images.push((
+                t,
+                FRect {
+                    x: (W - w) / 2.0,
+                    y,
+                    w,
+                    h,
+                },
+            ));
+            y += h;
+        }
     }
     osd.started -= Duration::from_secs(2);
     let over = Over {
         shown: Some(&shown),
         menu: menu.as_ref(),
-        skip: (what == "seek").then_some(SegKind::Intro),
-        thumb: thumb.as_ref(),
+        skip: None,
+        thumb: thumb.as_ref().filter(|_| what == "seek"),
         ass: None,
         look,
         loading: (what == "load").then_some(Loading {
@@ -1610,6 +1790,35 @@ pub fn shot(g: &Gfx, what: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rapid_seek_taps_ramp_and_reverse_at_normal_speed() {
+        let mut taps = SeekTaps::default();
+        let steps: Vec<_> = (0..6).map(|_| taps.step(1, 10)).collect();
+        assert_eq!(steps, [(10, 1), (10, 1), (20, 2), (40, 3), (80, 4), (80, 4)]);
+        assert_eq!(taps.step(-1, 10), (-10, 1));
+    }
+
+    #[test]
+    fn subtitle_group_lifts_only_to_clear_visible_controls() {
+        let bar = Bar {
+            x: 0.0,
+            w: W,
+            top: 786.0,
+            frac: 0.0,
+        };
+        let rect = |y| FRect {
+            x: 0.0,
+            y,
+            w: 240.0,
+            h: 40.0,
+        };
+        let group = [rect(880.0), rect(940.0)];
+        assert_eq!(subtitle_lift(None, group.into_iter()), 0.0);
+        assert_eq!(subtitle_lift(Some(&bar), group.into_iter()), 220.0);
+        assert_eq!(subtitle_lift(Some(&bar), [rect(70.0)].into_iter()), 0.0);
+        assert_eq!(subtitle_lift(Some(&bar), [rect(50.0), rect(940.0)].into_iter()), 50.0);
+    }
 
     fn text(start: i64, end: Option<i64>, s: &str) -> SubEv {
         SubEv {
