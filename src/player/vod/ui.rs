@@ -1459,9 +1459,9 @@ pub fn up_frame(g: &Gfx, card: &mut UpCard, left: f32, of: f32) {
     unsafe { SDL_RenderPresent(g.ren) };
 }
 
-/// `--film-shot out.bmp [what]` on a desktop: the controls over a stand-in picture (no player). `what` is `seek` (a
+/// `--film-shot out.bmp [what] [backdrop]` on a desktop: the controls over a stand-in picture (no player). `what` is `seek` (a
 /// held seek), `options`, `subs`, `info`, `next` (the next episode's card) or `load` (the first start).
-pub fn shot(g: &Gfx, what: &str) {
+pub fn shot(g: &Gfx, what: &str, backdrop: Option<&Tex>) {
     let it = Item {
         backend: film::Backend::Jellyfin(crate::jellyfin::Config::default()),
         audio: vec![],
@@ -1486,9 +1486,9 @@ pub fn shot(g: &Gfx, what: &str) {
         series: None,
         source: "s".into(),
         direct: String::new(),
-        name: "The Silent Harbour".into(),
-        sub: "Harbour Lights   S2 E5".into(),
-        total: 5400 * TICKS,
+        name: "The Martian".into(),
+        sub: String::new(),
+        total: 8640 * TICKS,
         resume: 0,
         session: String::new(),
     };
@@ -1556,7 +1556,11 @@ pub fn shot(g: &Gfx, what: &str) {
     });
     let mut shown = Shown::default();
     shown.update(g, &events, 1_234_000);
-    g.fill(rgb(54, 78, 112), 1.0, SCREEN);
+    if let Some(tex) = backdrop {
+        g.copy(tex, None, SCREEN);
+    } else {
+        g.fill(rgb(54, 78, 112), 1.0, SCREEN);
+    }
     let (w, h) = (320, 180);
     let px: Vec<u8> = (0..w * h)
         .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
@@ -1594,8 +1598,8 @@ pub fn shot(g: &Gfx, what: &str) {
     let over = Over {
         shown: Some(&shown),
         menu: menu.as_ref(),
-        skip: (what == "seek").then_some(SegKind::Intro),
-        thumb: thumb.as_ref(),
+        skip: (what == "seek" && backdrop.is_none()).then_some(SegKind::Intro),
+        thumb: backdrop.or(thumb.as_ref()),
         ass: None,
         look,
         loading: (what == "load").then_some(Loading {

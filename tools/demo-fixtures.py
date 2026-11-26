@@ -153,9 +153,9 @@ def populate(root, regular, bold):
     return data
 
 
-def render(root, binary, name, keys):
+def render(root, binary, name, *args, mode='--shot'):
     bmp = root / f'{name}.bmp'
-    subprocess.run([str(binary), '--shot', str(bmp), keys], check=True, env={**os.environ, 'LAUNCHER_ROOT': str(root)})
+    subprocess.run([str(binary), mode, str(bmp), *args], check=True, env={**os.environ, 'LAUNCHER_ROOT': str(root)})
     with Image.open(bmp) as shot:
         if shot.size != (1920, 1080) or not shot.convert('RGB').getbbox():
             raise ValueError(f'{name}: expected a nonblank 1920×1080 screenshot, got {shot.size}')
@@ -179,12 +179,13 @@ def main():
                  'live-tv': 'URRRD', 'settings': 'URRRROLD'}
         for name, keys in shots.items():
             render(root, binary, name, keys)
+        render(root, binary, 'player', 'seek', data / 'cache/lib-b-movies5-demo.img', mode='--film-shot')
         (data / 'profiles.json').write_text(json.dumps([
             dict(name=name, avatar=avatar, role=role, pin=pin, apps=[])
             for name, avatar, role, pin in [('Maya', 5, 'Manager', ''), ('Alex', 8, 'Adult', ''), ('Sam', 11, 'Kid', '1234')]
         ]), encoding='utf-8')
         render(root, binary, 'profiles', '')
-        for name in [*shots, 'profiles']:
+        for name in [*shots, 'profiles', 'player']:
             (REPO / 'docs' / f'{name}.png').write_bytes((root / f'{name}.png').read_bytes())
 
 

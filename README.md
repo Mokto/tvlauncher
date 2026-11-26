@@ -4,7 +4,7 @@
 
 Press Home to pick up where you left off on Jellyfin or Plex, see what’s on live TV, or launch an app. tvlauncher puts them on one remote-friendly screen with an Android TV-style layout. Written in Rust, it draws through LG’s SDL2 and OpenGL ES stack without a browser or WebView.
 
-[**Download a release**](https://github.com/Mokto/tvlauncher/releases) · [Installation and rollback](#install-on-your-tv) · [User and developer guide](docs/guide.md)
+[**Download a release**](https://github.com/Mokto/tvlauncher/releases) · [Installation and rollback](#install-on-your-tv) · [Screenshots](#screenshots) · [User and developer guide](docs/guide.md)
 
 ![tvlauncher Home with a movie backdrop, Continue watching cards with progress bars, and an app row](docs/home.png)
 
@@ -19,35 +19,6 @@ Press Home to pick up where you left off on Jellyfin or Plex, see what’s on li
 - **Give each viewer a profile.** Managers, Adults and Kids can have separate media sign-ins, tabs and playback preferences, with illustrated avatars and optional PINs. Managers can choose which apps Kids see.
 - **Keep shared settings separate.** Use **This TV** to manage startup, receiver setup, live sources, opt-in unofficial YouTube recommendations and optional blocking of LG ads and telemetry.
 
-<details>
-<summary>More screenshots: Movies, Shows, title pages, Live TV, profiles and Settings</summary>
-
-**Browse the library.** Poster grid with a backdrop and details for the focused movie.
-
-![Movies tab with Arrival selected above a grid of films](docs/movies.png)
-
-**Find a series.** TV shows have their own library tab.
-
-![Shows tab with Severance selected alongside Andor, Breaking Bad, Chernobyl, Planet Earth II and The Bear](docs/shows.png)
-
-**Pick up where you left off.** A title page with resume, play-from-start and watched controls.
-
-![Movie detail page for The Martian with a 4K label and a Resume button](docs/title.png)
-
-**See what’s on.** Current and upcoming programmes, with favourite channels first.
-
-![Live TV guide with channel logos, favourite markers and programme times](docs/live-tv.png)
-
-**Switch viewers.** Each profile has its own avatar and preferences.
-
-![Who’s watching screen with three illustrated profile avatars](docs/profiles.png)
-
-**Manage people and the TV separately.** Edit profiles without switching who’s watching.
-
-![Settings screen with Profiles and This TV sections](docs/settings.png)
-
-</details>
-
 ## Install on your TV
 
 You need a **rooted LG TV with the Homebrew Channel** and **root SSH access with a key**. This replaces the Home screen; it’s not a store app. The guide describes the `main` branch. Check the [release notes](CHANGELOG.md) for what’s in your download.
@@ -59,6 +30,43 @@ You need a **rooted LG TV with the Homebrew Channel** and **root SSH access with
 **To go back:** run `ssh root@<tv-ip> sh /media/developer/tvlauncher/takeover.sh off`, or reboot if **Start as Home** is off. Three crashes in a minute also restore the previous Home; a hang needs a manual rollback or reboot.
 
 **To keep it after reboot:** enable **Settings → This TV → Startup → Start as Home**. Turn that off before rolling back permanently, or run `ssh root@<tv-ip> sh /media/developer/tvlauncher/takeover.sh boot off` before `takeover.sh off`. To update, run the installer from the new release.
+
+## Screenshots
+
+### Movie library
+
+Browse posters while the focused film’s backdrop and synopsis stay in view.
+
+![Movies tab with Arrival selected above a grid of films](docs/movies.png)
+
+### Built-in player
+
+Scrub with a preview thumbnail or open subtitles, audio, chapters and playback options from the same bar. This simulator capture uses generated artwork in place of video.
+
+![The Martian player controls with a seek thumbnail, timeline and audio and subtitle buttons](docs/player.png)
+
+### Profiles
+
+Choose who’s watching to load their media accounts, tabs and playback preferences.
+
+![Who’s watching screen with three illustrated profile avatars](docs/profiles.png)
+
+### Settings
+
+Edit profiles without switching viewers, or open **This TV** for settings shared by everyone.
+
+![Settings with separate Profiles and This TV sections, showing the shared device settings](docs/settings.png)
+
+<details>
+<summary>More screenshots: Shows, movie details and Live TV</summary>
+
+![Shows tab with Severance selected alongside Andor, Breaking Bad, Chernobyl, Planet Earth II and The Bear](docs/shows.png)
+
+![Movie detail page for The Martian with a 4K label and a Resume button](docs/title.png)
+
+![Live TV guide with channel logos, favourite markers and programme times](docs/live-tv.png)
+
+</details>
 
 ## Set up your media
 
