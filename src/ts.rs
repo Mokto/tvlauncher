@@ -5,6 +5,9 @@
 pub enum Codec {
     H264,
     H265,
+    /// Only from a film file, and only on a TV whose table lists the decoder (`ff::demux::tv_decodes`).
+    Av1,
+    Vp9,
     Aac,
     Ac3,
     Eac3,
@@ -18,6 +21,8 @@ impl Codec {
         match self {
             Codec::H264 => "H264",
             Codec::H265 => "H265",
+            Codec::Av1 => "AV1",
+            Codec::Vp9 => "VP9",
             Codec::Aac => "AAC",
             Codec::Ac3 => "AC3",
             Codec::Eac3 => "AC3 PLUS",

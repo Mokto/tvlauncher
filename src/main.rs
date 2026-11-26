@@ -12,6 +12,7 @@ mod ff;
 mod film;
 mod gfx;
 mod hls;
+mod icons;
 mod iptv;
 mod jellyfin;
 mod keyboard;
@@ -146,6 +147,9 @@ fn main() -> ExitCode {
         let (refresh, res) = jellyfin::spawn(root.clone(), cfg.clone(), wake);
         Jelly { cfg, refresh, res }
     });
+    if on_tv {
+        lifecycle::watch_home(wake);
+    }
     if on_tv && std::path::Path::new(&format!("{DIR}/register")).exists() {
         lifecycle::register(wake);
     }
@@ -153,7 +157,12 @@ fn main() -> ExitCode {
         .get(1)
         .is_some_and(|a| a == "--film-shot" || a == "--film-menu-shot")
     {
-        player::film_shot(&g, args[1] == "--film-menu-shot");
+        let what = match args.get(3) {
+            Some(w) => w.as_str(),
+            None if args[1] == "--film-menu-shot" => "options",
+            None => "seek",
+        };
+        player::film_shot(&g, what);
         return save_bmp(ren, args.get(2).map_or("build/film.bmp", String::as_str));
     }
     let mut app = App::new(

@@ -22,6 +22,9 @@ const HOLD_MS: u32 = 700;
 /// How films are delivered (`film::DIRECT`), as Settings words it.
 const DIRECT_MODES: [(&str, &str); 3] = [("auto", "Automatic"), ("off", "Off"), ("force", "Forced")];
 
+/// What follows an episode (`Prefs::next_ep`), as Settings words it.
+const NEXT_MODES: [(&str, &str); 3] = [("countdown", "Countdown"), ("credits", "After credits"), ("off", "Off")];
+
 /// The choices of the server's streaming quality, in Mbps; 0 is no limit.
 const QUALITIES: [u32; 7] = [0, 40, 20, 12, 8, 4, 2];
 
@@ -87,6 +90,7 @@ enum Opt {
     /// The details of the focused programme.
     TvDetails,
     DirectMode(&'static str),
+    NextEp(&'static str),
     Quality(u32),
     /// The language films start in, how subtitles start, and their language ("" for none, else a `lang::LANGS` code).
     AudioLang(&'static str),
@@ -230,6 +234,9 @@ pub struct App {
     tab: String,
     /// The page of a library title, over its tab.
     detail: Option<Box<detail::Page>>,
+    /// The title pages a related title was opened from, for Back.
+    detail_back: Vec<String>,
+    prefetch: Sender<(detail::Backend, &'static str, library::Source, Vec<String>)>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     tab_tex: HashMap<String, Option<Tex>>,
@@ -259,6 +266,7 @@ pub struct App {
 impl App {
     pub fn new(g: Gfx, luna: Luna, win: *mut Opaque, bgl: Background, jf: Option<Jelly>, wake: u32) -> App {
         let prefs = Prefs::load(&luna.root);
+        let prefs_root = luna.root.clone();
         let rows = vec![
             Row::new("Pinned apps"),
             Row::new("Continue watching"),
@@ -322,6 +330,8 @@ impl App {
             in_settings: false,
             ok_down: None,
             detail: None,
+            detail_back: vec![],
+            prefetch: detail::prefetch(prefs_root),
             cog_f: 0.0,
         };
         if let Some(jf) = &app.jf {
@@ -612,6 +622,12 @@ impl App {
                 "The most the server may send when it converts a film: lower it on a slow connection. Direct Play is not limited.",
                 text(&quality),
             ),
+            entry(
+                Act::NextEp,
+                "Next episode",
+                "Countdown offers it on a card when the credits begin. After credits waits for the end. Off stops there.",
+                text(NEXT_MODES.iter().find(|m| m.0 == self.prefs.next_ep).map_or(NEXT_MODES[0].1, |m| m.1)),
+            ),
         ];
         let language = |code: &str, none: &str| match code {
             "" => none.to_string(),
@@ -723,20 +739,22 @@ impl App {
                 entry(Act::Tab(i), &name, &desc, Value::Switch(on))
             })
             .collect::<Vec<_>>();
-        let tabs = (!tabs.is_empty()).then_some(("Tabs", tabs));
-        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", player));
+        use crate::icons::Icon;
+        let tabs = (!tabs.is_empty()).then_some(("Tabs", Icon::Tabs, tabs));
+        let player = (self.jf.is_some() || self.px.is_some()).then_some(("Player", Icon::Play, player));
         tabs.into_iter()
-            .chain([("Jellyfin", jellyfin), ("Plex", plex)])
+            .chain([("Jellyfin", Icon::Server, jellyfin), ("Plex", Icon::Server, plex)])
             .chain(player)
             .chain([
-                ("Audio", audio),
-                ("YouTube", youtube),
-                ("Live TV", tv),
-                ("Ads and privacy", privacy),
-                ("Startup", startup),
+                ("Audio", Icon::Audio, audio),
+                ("YouTube", Icon::Video, youtube),
+                ("Live TV", Icon::Tv, tv),
+                ("Ads and privacy", Icon::Lock, privacy),
+                ("Startup", Icon::Power, startup),
             ])
-            .map(|(name, entries)| Category {
+            .map(|(name, icon, entries)| Category {
                 name: name.into(),
+                icon,
                 entries,
             })
             .collect()
@@ -916,28 +934,60 @@ impl App {
         lib.asked.clear();
     }
 
+    /// How a title page of library `view` reaches its server.
+    fn backend(&self, lib: &Lib, view: &str, src: &library::Source) -> Option<detail::Backend> {
+        match (src, &self.px, &self.jf) {
+            (library::Source::Plex { base, token }, Some(px), _) => {
+                let server = lib.views.iter().find(|v| v.id == view).map(|v| v.server.clone());
+                Some(detail::Backend::Plex(
+                    px.cfg.conn(base, token),
+                    server.unwrap_or_default(),
+                ))
+            }
+            (library::Source::Jellyfin(_), _, Some(jf)) => Some(detail::Backend::Jellyfin(jf.cfg.clone())),
+            _ => None,
+        }
+    }
+
     /// Opens the focused title's page, or its page in the media app when films do not play in the launcher.
     fn open_title(&mut self) {
         if !self.prefs.jf_player {
             return self.open_in_app();
         }
-        let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) else {
+        let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) else {
             return;
         };
         let page = &lib.pages[&self.tab];
         let Some(t) = page.title().cloned() else { return };
-        let backend = match (page.source(), &self.px, &self.jf) {
-            (library::Source::Plex { base, token }, Some(px), _) => {
-                let server = lib.views.iter().find(|v| v.id == self.tab).map(|v| v.server.clone());
-                detail::Backend::Plex(px.cfg.conn(&base, &token), server.unwrap_or_default())
-            }
-            (library::Source::Jellyfin(_), _, Some(jf)) => detail::Backend::Jellyfin(jf.cfg.clone()),
-            _ => return self.open_in_app(),
+        let src = page.source();
+        let Some(backend) = self.backend(lib, &self.tab, &src) else {
+            return self.open_in_app();
         };
         let pre = if lib.plex { library::PLEX } else { library::JELLYFIN };
-        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, page.source(), self.wake)));
-        lib.asked.clear();
+        let root = self.luna.root.clone();
+        self.detail = Some(Box::new(detail::Page::new(backend, t, pre, src, self.wake, root)));
+        if let Some(lib) = self.libs.iter_mut().find(|l| l.pages.contains_key(&self.tab)) {
+            lib.asked.clear();
+        }
         self.animating = true;
+    }
+
+    /// The page of the film or series `id` (Info → *Go to series* in the player), when a library tab has the title.
+    fn go_to_page(&mut self, id: &str) {
+        if self.detail.as_ref().is_some_and(|d| d.id() == id) {
+            return;
+        }
+        let tab = self.libs.iter_mut().find_map(|l| {
+            l.pages
+                .iter_mut()
+                .find_map(|(tab, p)| p.focus_id(id).then(|| tab.clone()))
+        });
+        let Some(tab) = tab else {
+            return log(&format!("player: no library tab has {id}"));
+        };
+        (self.tab, self.tabs_f, self.cog) = (tab, false, false);
+        self.mode = Mode::Browse;
+        self.open_title();
     }
 
     /// What a title's page asked for.
@@ -949,6 +999,13 @@ impl App {
                 }
                 if let Some(d) = &mut self.detail {
                     d.reload();
+                }
+            }
+            detail::Act::Open(id) => {
+                let from = self.detail.as_ref().map(|d| d.id().to_string());
+                self.go_to_page(&id);
+                if self.detail.as_ref().is_some_and(|d| d.id() == id) {
+                    self.detail_back.extend(from);
                 }
             }
             detail::Act::Mark(id, played) => {
@@ -1012,6 +1069,10 @@ impl App {
         let code = crate::player::run_child(self.win, self.wake, &["--film", spec]);
         let not_played = code.is_some_and(|c| c == 1 || c == i32::from(crate::film::ELSEWHERE));
         self.prefs.look = Prefs::load(&self.luna.root).look;
+        if let Ok(id) = std::fs::read_to_string(crate::player::PAGE) {
+            let _ = std::fs::remove_file(crate::player::PAGE);
+            self.go_to_page(id.trim());
+        }
         // What was watched moves up in Continue watching and in the libraries.
         self.refresh_jellyfin();
         self.refresh_plex();
@@ -1392,7 +1453,21 @@ impl App {
                         lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
                         lib.views = views;
                     }
-                    library::Got::Titles(view, titles, src) => self.set_titles(i, &view, titles, Some(src)),
+                    library::Got::Titles(view, titles, src) => {
+                        // The server has just answered: a good time to save its title pages ahead of time.
+                        if self.prefs.jf_player {
+                            if let Some(b) = self.backend(&self.libs[i], &view, &src) {
+                                let pre = if self.libs[i].plex {
+                                    library::PLEX
+                                } else {
+                                    library::JELLYFIN
+                                };
+                                let ids = titles.iter().map(|t| t.id.clone()).collect();
+                                let _ = self.prefetch.send((b, pre, src.clone(), ids));
+                            }
+                        }
+                        self.set_titles(i, &view, titles, Some(src))
+                    }
                 }
             }
         }
@@ -1402,9 +1477,19 @@ impl App {
         if !self.tabs().iter().any(|(k, _)| *k == self.tab) {
             self.tab.clear();
         }
-        if self.detail.as_mut().and_then(|d| d.poll(&self.g)) == Some(true) {
-            self.detail = None;
-            self.open_in_app();
+        match self.detail.as_mut().and_then(|d| d.poll(&self.g)) {
+            Some(true) => {
+                self.detail = None;
+                self.detail_back.clear();
+                self.open_in_app();
+            }
+            Some(false) => {
+                let libs = &self.libs;
+                if let Some(d) = &mut self.detail {
+                    d.keep_related(|id| libs.iter().any(|l| l.pages.values().any(|p| p.has(id))));
+                }
+            }
+            None => {}
         }
         let tab = self.tab.clone();
         for lib in &mut self.libs {
@@ -1482,6 +1567,7 @@ impl App {
         }
         let active = !top && matches!(self.mode, Mode::Browse) && self.detail.is_none();
         if let Some(d) = &mut self.detail {
+            d.away = top;
             anim |= d.animate(dt);
         }
         for (id, p) in self.libs.iter_mut().flat_map(|l| &mut l.pages) {
@@ -1565,27 +1651,30 @@ impl App {
                 h: H,
             },
         );
-        g.tint(&g.vgrad, BG, SHELF);
-        g.copy(
-            &g.vgrad,
-            None,
-            FRect {
-                x: 0.0,
-                y: 280.0,
-                w: W,
-                h: 330.0,
-            },
-        );
-        g.fill(
-            BG,
-            SHELF,
-            FRect {
-                x: 0.0,
-                y: 610.0,
-                w: W,
-                h: H,
-            },
-        );
+        // A title's page shows the backdrop down to its buttons, and darkens the rest itself.
+        if self.detail.is_none() {
+            g.tint(&g.vgrad, BG, SHELF);
+            g.copy(
+                &g.vgrad,
+                None,
+                FRect {
+                    x: 0.0,
+                    y: 280.0,
+                    w: W,
+                    h: 330.0,
+                },
+            );
+            g.fill(
+                BG,
+                SHELF,
+                FRect {
+                    x: 0.0,
+                    y: 610.0,
+                    w: W,
+                    h: H,
+                },
+            );
+        }
         g.tint(&g.vgrad, BG, 0.85);
         let top = FRect {
             x: 0.0,
@@ -2017,6 +2106,20 @@ impl App {
                 .collect();
             return self.show_menu("Direct Play", list, sel);
         }
+        if act == Act::NextEp {
+            let sel = NEXT_MODES.iter().position(|m| m.0 == self.prefs.next_ep).unwrap_or(0);
+            let list = NEXT_MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    (
+                        Opt::NextEp(m.0),
+                        format!("{}{}", m.1, if i == sel { "   (current)" } else { "" }),
+                    )
+                })
+                .collect();
+            return self.show_menu("Next episode", list, sel);
+        }
         if act == Act::Quality {
             let sel = QUALITIES.iter().position(|m| *m == self.prefs.max_mbps).unwrap_or(0);
             let list = QUALITIES
@@ -2329,6 +2432,11 @@ impl App {
                 self.prefs.save();
                 return;
             }
+            Opt::NextEp(m) => {
+                self.prefs.next_ep = m.to_string();
+                self.prefs.save();
+                return;
+            }
             Opt::Quality(m) => {
                 self.prefs.max_mbps = *m;
                 self.prefs.save();
@@ -2554,9 +2662,29 @@ impl App {
             self.ok_down = None;
         }
         match &mut self.mode {
-            Mode::Browse if self.detail.is_some() => {
+            // The tabs or the cog over a title's page: Down or Back returns to the page, another tab closes it.
+            Mode::Browse if self.detail.is_some() && (self.tabs_f || self.cog) => {
+                let tab = self.tab.clone();
                 if back {
+                    (self.tabs_f, self.cog) = (false, false);
+                } else {
+                    self.top_key(dx, dy, ok);
+                }
+                if self.tab != tab {
                     self.detail = None;
+                    self.detail_back.clear();
+                }
+                self.animating = true;
+                return true;
+            }
+            Mode::Browse if self.detail.is_some() => {
+                if dy < 0 && self.detail.as_ref().is_some_and(|d| d.at_top()) {
+                    self.focus_top();
+                } else if back {
+                    match self.detail_back.pop() {
+                        Some(prev) => self.go_to_page(&prev),
+                        None => self.detail = None,
+                    }
                     self.animating = true;
                 } else if ok {
                     self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
@@ -2755,7 +2883,7 @@ impl App {
     fn ok_up(&mut self) {
         if self.detail.is_some() {
             if let (Some(_), Mode::Browse) = (self.ok_down.take(), &self.mode) {
-                if let Some(a) = self.detail.as_ref().and_then(|d| d.tap()) {
+                if let Some(a) = self.detail.as_mut().and_then(|d| d.tap()) {
                     self.detail_act(a);
                 }
             }
@@ -2793,6 +2921,7 @@ impl App {
         self.in_settings = false;
         self.ok_down = None;
         self.detail = None;
+        self.detail_back.clear();
         self.cog = false;
         self.tabs_f = false;
         self.tab.clear();

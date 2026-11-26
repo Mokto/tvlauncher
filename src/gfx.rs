@@ -49,11 +49,14 @@ pub struct Gfx {
     pub f_sub: *mut Opaque,
     pub f_clock: *mut Opaque,
     pub f_menu: *mut Opaque,
+    pub f_small: *mut Opaque,
     pub circle: Tex,
     pub soft: Tex,
     pub hgrad: Tex,
     pub vgrad: Tex,
     pub gear: Tex,
+    /// `icons::ALL` in order.
+    icons: Vec<Tex>,
 }
 
 impl Gfx {
@@ -68,6 +71,7 @@ impl Gfx {
             f_sub: font(regular, 30),
             f_clock: font(regular, 34),
             f_menu: font(semibold, 34),
+            f_small: font(regular, 26),
             root: root.to_string(),
             ren,
             circle: gen(ren, 2 * RAD, 2 * RAD, f_circle),
@@ -75,7 +79,28 @@ impl Gfx {
             hgrad: gen(ren, 256, 1, f_hgrad),
             vgrad: gen(ren, 1, 256, f_vgrad),
             gear: gen(ren, 128, 128, f_gear),
+            icons: crate::icons::ALL
+                .iter()
+                .map(|i| {
+                    gen(ren, crate::icons::SIZE, crate::icons::SIZE, |x, y, w, _| {
+                        crate::icons::coverage(*i, x, y, w)
+                    })
+                })
+                .collect(),
         }
+    }
+
+    /// An icon `size` pixels wide with its top left at `(x, y)`.
+    pub fn icon(&self, icon: crate::icons::Icon, x: f32, y: f32, size: f32, c: Color, a: f32) {
+        let Some(t) = crate::icons::ALL
+            .iter()
+            .position(|i| *i == icon)
+            .and_then(|i| self.icons.get(i))
+        else {
+            return;
+        };
+        self.tint(t, c, a);
+        self.copy(t, None, FRect { x, y, w: size, h: size });
     }
 
     pub fn rp(&self, p: &str) -> String {
@@ -291,7 +316,7 @@ impl Gfx {
 }
 
 /// A white texture whose alpha is `f(x, y, w, h)`.
-fn gen(ren: *mut Opaque, w: i32, h: i32, f: fn(f32, f32, f32, f32) -> f32) -> Tex {
+fn gen(ren: *mut Opaque, w: i32, h: i32, f: impl Fn(f32, f32, f32, f32) -> f32) -> Tex {
     let s = Surf(unsafe { SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, PIXELFORMAT_ARGB8888) });
     let stride = unsafe { (*s.0).pitch as usize / 4 };
     let px = unsafe { (*s.0).pixels as *mut u32 };
@@ -399,8 +424,17 @@ fn logo_box(s: &Surf) -> Option<(Rect, Color)> {
     ))
 }
 
+/// `src` as ARGB, or None when it is wholly transparent: some servers keep empty logos.
+pub fn visible(src: &Surf) -> Option<Surf> {
+    let (w, h) = src.size();
+    let s = cover(src, w, h, 0)?;
+    let stride = unsafe { (*s.0).pitch as usize / 4 };
+    let px = unsafe { std::slice::from_raw_parts((*s.0).pixels as *const u32, stride * h as usize) };
+    px.iter().any(|p| p >> 24 > 16).then_some(s)
+}
+
 /// `src` scaled to fill `w` x `h` (cropped in the middle), with corners of radius `r` made transparent.
-fn cover(src: &Surf, w: i32, h: i32, r: i32) -> Option<Surf> {
+pub fn cover(src: &Surf, w: i32, h: i32, r: i32) -> Option<Surf> {
     let (sw, sh) = src.size();
     let (cw, ch) = if sw * h > sh * w {
         (sh * w / h, sh)

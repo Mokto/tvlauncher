@@ -1,10 +1,11 @@
 // A small Jellyfin for `sh tools/film-sim.sh` and `sh tools/tv-test.sh`: films with the user's views, byte ranges for
 // the file, a subtitle track and the playback reports (printed). Item `m1` is `<dir>/film.mkv`; any other id `x` is
-// `<dir>/x.mkv`. Runs on the TV's Node 8 too. Usage: node fake-media.js <media dir> <port>
+// `<dir>/x.mkv`. With FAKE_SERIES=1, `m1` and `m2` (the same file) are episodes 1 and 2 of series `s1`. Runs on the
+// TV's Node 8 too. Usage: node fake-media.js <media dir> <port>
 const http = require('http'), fs = require('fs'), path = require('path');
 const dir = process.argv[2] || '.', port = +process.argv[3] || 8780;
 const fileOf = (id) => {
-  if (id === 'm1') return path.join(dir, 'film.mkv');
+  if (id === 'm1' || (id === 'm2' && process.env.FAKE_SERIES)) return path.join(dir, 'film.mkv');
   const mkv = path.join(dir, id + '.mkv');
   return fs.existsSync(mkv) ? mkv : path.join(dir, id + '.mp4');
 };
@@ -28,7 +29,9 @@ http.createServer((req, res) => {
   const u = req.url.split('?')[0];
   const json = (o) => { const b = JSON.stringify(o); res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b); };
   let m;
-  if ((m = /^\/Users\/u1\/Items\/([\w-]+)$/.exec(u)) && fs.existsSync(fileOf(m[1]))) return json(Object.assign(item(m[1], m[1] === 'm1' ? 'The Test Film' : 'Test ' + m[1]), over(m[1])));
+  const ep = (id) => process.env.FAKE_SERIES ? { Type: 'Episode', SeriesId: 's1', SeriesName: 'Test Show', ParentIndexNumber: 1, IndexNumber: +id.slice(1) } : {};
+  if ((m = /^\/Users\/u1\/Items\/([\w-]+)$/.exec(u)) && fs.existsSync(fileOf(m[1]))) return json(Object.assign(item(m[1], m[1] === 'm1' ? 'The Test Film' : 'Test ' + m[1]), ep(m[1]), over(m[1])));
+  if (u === '/Shows/s1/Episodes') return json({ Items: /startItemId=m2/.test(req.url) ? [{ Id: 'm2' }] : [{ Id: 'm1' }, { Id: 'm2' }] });
   if (/^\/MediaSegments\/\w+$/.test(u)) return json({ Items: [{ Type: 'Intro', StartTicks: 20000000, EndTicks: 80000000 }, { Type: 'Outro', StartTicks: 270000000, EndTicks: 300000000 }] });
   if (/^\/Videos\/[\w-]+\/Trickplay\/320\/0\.jpg$/.test(u)) {
     const b = fs.readFileSync(path.join(dir, 'tile.jpg')); console.log('TILE', u);

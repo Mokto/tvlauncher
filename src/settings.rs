@@ -20,6 +20,8 @@ pub enum Act {
     /// How films are delivered (as they are, or by the server), and the most the server's conversion may send.
     Direct,
     Quality,
+    /// What follows an episode: a countdown during the credits, one after them, or nothing.
+    NextEp,
     /// Whether DTS and TrueHD go to a receiver unconverted.
     Lossless,
     /// Installs or removes the kernel module that the receiver link needs for TrueHD and full-rate DTS-HD.
@@ -50,6 +52,7 @@ pub struct Entry {
 
 pub struct Category {
     pub name: String,
+    pub icon: crate::icons::Icon,
     pub entries: Vec<Entry>,
 }
 
@@ -69,6 +72,7 @@ struct EntryTex {
 
 struct CatTex {
     name: Option<Tex>,
+    icon: crate::icons::Icon,
     entries: Vec<EntryTex>,
 }
 
@@ -129,6 +133,7 @@ impl Page {
             .into_iter()
             .map(|c| CatTex {
                 name: g.text(g.f_menu, &c.name, 0),
+                icon: c.icon,
                 entries: c
                     .entries
                     .into_iter()
@@ -201,15 +206,16 @@ impl Page {
             if here {
                 g.rounded(r.x, r.y, r.w, r.h, 20.0, if on { WHITE } else { PANEL }, 1.0);
             }
+            let colour = if on {
+                BLACK
+            } else if here {
+                TEXT
+            } else {
+                DIM
+            };
+            g.icon(c.icon, r.x + 30.0, r.y + (r.h - 40.0) / 2.0, 40.0, colour, 1.0);
             if let Some(t) = &c.name {
-                let colour = if on {
-                    BLACK
-                } else if here {
-                    TEXT
-                } else {
-                    DIM
-                };
-                g.put(Some(t), r.x + 36.0, r.y + (r.h - t.h as f32) / 2.0, colour, 1.0);
+                g.put(Some(t), r.x + 94.0, r.y + (r.h - t.h as f32) / 2.0, colour, 1.0);
             }
         }
         let Some(cat) = self.cats.get(self.cat) else { return };

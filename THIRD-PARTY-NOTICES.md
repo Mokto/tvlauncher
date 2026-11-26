@@ -51,6 +51,7 @@ and [PLX Native](https://github.com/GLinnik21/plx-native) by GLinnik21 (both GPL
 - `src/ff/`: the field offsets of FFmpeg's structures, the framing of H.264, H.265 and AAC for the pipeline
   (Annex-B, ADTS) and the conversion of TrueHD, FLAC and similar audio to AC-3 (`convert.rs`, with its tests);
 - the Dolby Vision declaration in the Load payload (`DolbyHdrInfo`);
+- `src/ff/av1.rs`: the AV1 temporal-unit framing (Native Jelly's `ff.rs`);
 - `src/ff/lossless.rs` and `src/ff/silent-eac3.bin`: the lossless audio carrier, from Native Jelly's `es_carrier.rs` and
   `es_swap.c` (pull request 46: DTS-HD and TrueHD bursts on LG's Dolby Digital Plus route, the TrueHD MAT packer ported
   from FFmpeg's `spdif` muxer) and the DTS core burst (`ff.rs`).

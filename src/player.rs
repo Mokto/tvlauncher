@@ -26,6 +26,8 @@ pub use vod::{child as film_child, child_in as film_child_in, film_sim_keys, sho
 /// For testing without the remote: `film:<item id>` or a stream address in this file makes the running launcher
 /// start the player process for it.
 pub const SPAWN: &str = "/tmp/tvlauncher-spawn";
+/// What the film player leaves for Home when the viewer asks for the title's page: the series' or the film's id.
+pub const PAGE: &str = "/tmp/tvlauncher-page";
 /// What a finished HLS playlist ends with: a film's end, an error for a channel.
 const ENDED: &str = "The stream ended.";
 /// The pipeline's app id. The media resource manager never gives a decoder to com.webos.app.home.
@@ -411,7 +413,9 @@ fn payload(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> Strin
 /// Dolby Vision. The node sits in `contents`, as Native Jelly sends it (`with_dolby_hdr_info`).
 fn payload_dv(app: &str, window: &str, video: Codec, audio: Option<Codec>, profile: Option<u8>) -> String {
     let p = payload_base(app, window, video, audio);
-    match profile.filter(|_| video == Codec::H265 || video == Codec::H264) {
+    // Profile 10 is Dolby Vision in AV1; the others are H.265's (and H.264's).
+    let fits = |p: &u8| matches!((video, p), (Codec::H265 | Codec::H264, 5 | 8) | (Codec::Av1, 10));
+    match profile.filter(fits) {
         Some(n) => p.replacen(
             r#""provider":"tvlauncher""#,
             &format!(r#""provider":"tvlauncher","DolbyHdrInfo":{{"trackType":"single","encryptionType":"clear","profileId":{n}}}"#),
@@ -422,7 +426,7 @@ fn payload_dv(app: &str, window: &str, video: Codec, audio: Option<Codec>, profi
 }
 
 fn payload_base(app: &str, window: &str, video: Codec, audio: Option<Codec>) -> String {
-    let (w, h) = if video == Codec::H265 {
+    let (w, h) = if matches!(video, Codec::H265 | Codec::Av1 | Codec::Vp9) {
         (3840, 2160)
     } else {
         (1920, 1080)
@@ -849,7 +853,7 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
     ));
     // Only a registered Home hears the Home key (as a relaunch) while another window is in front.
     crate::lifecycle::RELAUNCH.store(false, Ordering::SeqCst);
-    crate::lifecycle::register(wake);
+    let mine = crate::lifecycle::register(wake);
     let mut asked: Option<Instant> = None;
     let status = loop {
         if asked.is_none() && crate::lifecycle::RELAUNCH.load(Ordering::SeqCst) {
@@ -870,6 +874,9 @@ pub fn run_child(win: *mut Opaque, wake: u32, args: &[&str]) -> Option<i32> {
         std::thread::sleep(Duration::from_millis(50));
     };
     log(&format!("player: ended {status} after {} ms", t.elapsed().as_millis()));
+    if mine {
+        crate::lifecycle::unregister();
+    }
     unsafe {
         SDL_ShowWindow(win);
         SDL_RaiseWindow(win);

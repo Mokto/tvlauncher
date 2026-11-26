@@ -26,6 +26,10 @@ pub struct Track {
     pub forced: bool,
     /// Plex: where the server serves the track (`/library/streams/<id>`).
     pub key: String,
+    /// Subtitles for the deaf and hard of hearing; the track's own title, and its format ("SRT").
+    pub sdh: bool,
+    pub title: String,
+    pub format: String,
 }
 
 impl Track {
@@ -37,8 +41,26 @@ impl Track {
             lang: String::new(),
             forced: false,
             key: String::new(),
+            sdh: false,
+            title: String::new(),
+            format: String::new(),
         }
     }
+}
+
+/// A subtitle codec as the menu shows it, from FFmpeg's, Jellyfin's or Plex's name for it.
+pub fn sub_format(codec: &str) -> String {
+    match codec.to_lowercase().as_str() {
+        "subrip" | "srt" => "SRT",
+        "ass" | "ssa" => "ASS",
+        "hdmv_pgs_subtitle" | "pgssub" | "pgs" => "PGS",
+        "dvd_subtitle" | "dvdsub" | "vobsub" => "VobSub",
+        "dvb_subtitle" | "dvbsub" => "DVB",
+        "webvtt" | "vtt" => "WebVTT",
+        "" => "",
+        _ => "Text",
+    }
+    .into()
 }
 
 #[derive(Clone)]
@@ -123,13 +145,16 @@ pub fn resolve(root: &str, spec: &str) -> Result<Item, Why> {
     }
 }
 
-/// The episode that follows `it` in its series, if it is an episode and there is one the viewer has not seen. Call it
-/// after the end was reported: the server has marked `it` watched by then.
+/// The episode that follows `it` in its series, if it is an episode and not the last.
 pub fn next(it: &Item) -> Option<Item> {
-    let series = it.series.as_deref()?;
-    match &it.backend {
-        Backend::Jellyfin(c) => jellyfin::next(c, series, &it.id),
-        Backend::Plex(c) => plex::next(c, series, &it.id),
+    next_after(&it.backend, it.series.as_deref()?, &it.id)
+}
+
+/// The episode after `id` of `series`.
+pub fn next_after(backend: &Backend, series: &str, id: &str) -> Option<Item> {
+    match backend {
+        Backend::Jellyfin(c) => jellyfin::next(c, series, id),
+        Backend::Plex(c) => plex::next(c, series, id),
     }
 }
 

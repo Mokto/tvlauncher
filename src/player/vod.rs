@@ -28,7 +28,47 @@ enum Vod {
     Seek(i64),
     /// Carry on at this place with the server converting the film (the file cannot be played as it is).
     Server(i64, String),
+    /// The viewer took the next episode during the credits.
+    Next,
+    /// The viewer asked for the title's page (Info): stopped at this place.
+    Page(i64),
 }
+
+/// How a viewing ended.
+pub enum After {
+    Stopped,
+    /// Played to the end, the next episode not chosen yet.
+    Finished,
+    /// The next episode, chosen on its card during the credits.
+    PlayNext(Box<Item>),
+    /// Stopped, and Home should show the title's page.
+    Page,
+}
+
+/// The next episode's card during the credits, kept across seeks: the episode once the server has named it, and
+/// whether the viewer chose to watch the credits.
+#[derive(Default)]
+struct Up {
+    on: bool,
+    asked: Option<Receiver<Option<Item>>>,
+    next: Option<Item>,
+    card: Option<UpCard>,
+    dismissed: bool,
+}
+
+/// What one run plays: the title, where it comes from, where it starts, and whether it is a first start (the loading
+/// screen covers the screen) rather than a seek.
+#[derive(Clone, Copy)]
+struct Start<'a> {
+    g: &'a Gfx,
+    it: &'a Item,
+    src: &'a Source,
+    start: i64,
+    fresh: bool,
+}
+
+/// How long the card counts down before the next episode starts.
+const UP_SECS: i64 = 10;
 
 /// How the film comes to the TV.
 enum Source {
@@ -78,10 +118,10 @@ fn hls_run(url: &str, skip_s: f64) -> Run {
 }
 
 impl Player {
-    /// Plays `it` full screen until Back. Gives where it stopped, in ticks, and whether it played to the end.
-    pub fn film(&mut self, g: &Gfx, it: &Item) -> (i64, bool) {
+    /// Plays `it` full screen until Back. Gives where it stopped, in ticks, and how it ended. `countdown`: the next
+    /// episode's card comes up when the credits begin.
+    pub fn film(&mut self, g: &Gfx, it: &Item, countdown: bool) -> (i64, After) {
         let mut osd = Osd::new(g, it);
-        osd.say(g, Some("Loading..."));
         let mode = film::direct_mode();
         let forced = |why: &str| format!("Direct Play is forced, and this file cannot be played as it is: {why}");
         let mut src = if mode == 1 {
@@ -89,12 +129,13 @@ impl Player {
         } else {
             match self.open_file(g, it, &mut osd) {
                 Ok(Some(d)) => Source::File(d),
-                Ok(None) => return (it.resume, false),
+                Ok(None) => return (it.resume, After::Stopped),
                 Err(why) if mode == 2 => {
-                    return match self.vod_fail(g, &mut osd, &forced(&why), it.resume) {
-                        Vod::Exit(p, d) => (p, d),
-                        _ => (it.resume, false),
+                    let p = match self.vod_fail(g, &mut osd, &forced(&why), it.resume) {
+                        Vod::Exit(p, _) => p,
+                        _ => it.resume,
                     };
+                    return (p, After::Stopped);
                 }
                 Err(why) => {
                     log(&format!("film: the server will convert it: {why}"));
@@ -110,26 +151,46 @@ impl Player {
         let mut events = Events::default();
         let mut thumbs = Thumbs::new(it.trick.clone());
         let mut at = it.resume;
+        let mut up = Up {
+            on: countdown && it.series.is_some(),
+            ..Up::default()
+        };
+        let mut fresh = true;
         film::report(it, Note::Start, at, false, matches!(src, Source::File(_)), false);
-        let (pos, done) = loop {
-            let out = self.vod(g, it, &src, at, &mut osd, &mut choice, &mut events, &mut thumbs);
+        let (pos, after) = loop {
+            let run = Start {
+                g,
+                it,
+                src: &src,
+                start: at,
+                fresh,
+            };
+            let out = self.vod(run, &mut osd, &mut choice, &mut events, &mut thumbs, &mut up);
+            fresh = false;
             match out {
                 Vod::Seek(t) => at = t,
                 Vod::Server(t, why) if mode == 2 => {
                     break match self.vod_fail(g, &mut osd, &forced(&why), t) {
-                        Vod::Exit(p, d) => (p, d),
-                        _ => (t, false),
+                        Vod::Exit(p, _) => (p, After::Stopped),
+                        _ => (t, After::Stopped),
                     };
                 }
                 Vod::Server(t, why) => {
                     log(&format!("film: the server converts it from here: {why}"));
                     src = Source::Server;
                     events.clear();
-                    (choice.sub, at) = (choice.sub.filter(|s| s.server), t);
+                    (choice.sub, at, fresh) = (choice.sub.filter(|s| s.server), t, true);
                 }
-                Vod::Exit(pos, done) => break (pos, done),
+                Vod::Exit(pos, true) => break (pos, After::Finished),
+                Vod::Exit(pos, false) => break (pos, After::Stopped),
+                Vod::Next => match up.next.take() {
+                    Some(n) => break (it.total, After::PlayNext(Box::new(n))),
+                    None => break (it.total, After::Finished),
+                },
+                Vod::Page(pos) => break (pos, After::Page),
             }
         };
+        let done = matches!(after, After::Finished | After::PlayNext(_));
         film::report(
             it,
             Note::Stop,
@@ -138,7 +199,7 @@ impl Player {
             matches!(src, Source::File(_)),
             done,
         );
-        (pos, done)
+        (pos, after)
     }
 
     /// Opens the file while the viewer waits. Ok(None) when Back was pressed meanwhile, Err(why) when the file
@@ -162,7 +223,21 @@ impl Player {
             if t.elapsed() > Duration::from_secs(45) {
                 return Err("the server did not answer in time".into());
             }
-            vframe(g, osd, it.resume / TICKS, false, None, Over::default());
+            let loading = Some(Loading {
+                stage: "Opening the file",
+                full: true,
+            });
+            vframe(
+                g,
+                osd,
+                it.resume / TICKS,
+                false,
+                None,
+                Over {
+                    loading,
+                    ..Over::default()
+                },
+            );
         };
         d.info.plan(it.default_audio)?;
         Ok(Some(d))
@@ -199,21 +274,18 @@ impl Player {
                     t.audio.push(AudioRow {
                         index: i64::from(a.stream),
                         name: format!("{}{note}", a.name),
+                        lang: a.lang.clone(),
                     });
                 }
                 for s in &d.info.subs {
-                    t.subs.push(SubRow {
-                        index: i64::from(s.stream),
-                        name: s.name.clone(),
-                        server: false,
-                    });
+                    let i = i64::from(s.stream);
+                    t.subs
+                        .push(SubRow::new(i, false, &s.lang, s.forced, s.sdh, &s.title, &s.format));
                 }
                 for s in it.subs.iter().filter(|s| s.external) {
-                    t.subs.push(SubRow {
-                        index: s.index,
-                        name: s.name.clone(),
-                        server: true,
-                    });
+                    t.subs.push(SubRow::new(
+                        s.index, true, &s.lang, s.forced, s.sdh, &s.title, &s.format,
+                    ));
                 }
                 t
             }
@@ -224,34 +296,35 @@ impl Player {
                     .map(|a| AudioRow {
                         index: a.index,
                         name: a.name.clone(),
+                        lang: a.lang.clone(),
                     })
                     .collect(),
                 subs: it
                     .subs
                     .iter()
-                    .map(|s| SubRow {
-                        index: s.index,
-                        name: s.name.clone(),
-                        server: true,
-                    })
+                    .map(|s| SubRow::new(s.index, true, &s.lang, s.forced, s.sdh, &s.title, &s.format))
                     .collect(),
             },
         }
     }
 
     /// One run from `start` ticks, until Back, the end, or a seek.
-    #[allow(clippy::too_many_arguments)]
     fn vod(
         &mut self,
-        g: &Gfx,
-        it: &Item,
-        src: &Source,
-        start: i64,
+        run_of: Start,
         osd: &mut Osd,
         choice: &mut Choice,
         events: &mut Events,
         thumbs: &mut Thumbs,
+        up: &mut Up,
     ) -> Vod {
+        let Start {
+            g,
+            it,
+            src,
+            start,
+            fresh,
+        } = run_of;
         let direct = matches!(src, Source::File(_));
         let tracks = self.tracks(it, src);
         let mut btns = vec![];
@@ -395,7 +468,23 @@ impl Player {
                     self.vod_fail(g, osd, "The server did not start the video within a minute.", start)
                 };
             }
-            vframe(g, osd, start_s, false, None, Over::default());
+            let stage = if direct {
+                "Reading the file"
+            } else {
+                "The server is preparing the video"
+            };
+            let loading = Some(Loading { stage, full: fresh });
+            vframe(
+                g,
+                osd,
+                start_s,
+                false,
+                None,
+                Over {
+                    loading,
+                    ..Over::default()
+                },
+            );
         };
         log(&format!("film: video {video:?}, audio {audio:?}, dolby vision {dv:?}"));
         *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -404,7 +493,10 @@ impl Player {
             Err(e) => return self.vod_fail(g, osd, &e, start),
         };
         let smp = &self.smp.fresh();
-        let profile = dv.as_ref().filter(|d| matches!(d.profile, 5 | 8)).map(|d| d.profile);
+        let profile = dv
+            .as_ref()
+            .filter(|d| matches!(d.profile, 5 | 8 | 10))
+            .map(|d| d.profile);
         let profile = profile.filter(|_| dolby::tv_shows_dv());
         let p = cstr(&payload_dv(APP, &window.0.to_string_lossy(), video, audio, profile));
         if unsafe { (smp.load)(smp.obj, p.as_ptr(), on_event) } & 0xff == 0 {
@@ -425,7 +517,21 @@ impl Player {
                     }
                 };
             }
-            vframe(g, osd, start_s, false, None, Over::default());
+            let loading = Some(Loading {
+                stage: "Starting the TV's player",
+                full: fresh,
+            });
+            vframe(
+                g,
+                osd,
+                start_s,
+                false,
+                None,
+                Over {
+                    loading,
+                    ..Over::default()
+                },
+            );
         }
         SIZE.store(1920 << 16 | 1080, Ordering::SeqCst);
         let place = |size: u32| {
@@ -458,6 +564,25 @@ impl Player {
         // A held Left or Right, its speed step, where the seek began, and when Info was last made.
         let (mut scrub, mut level, mut seek_from) = (None::<Scrub>, 0u8, 0i64);
         let mut info_at = Instant::now();
+        let page_name = if it.series.is_some() {
+            "Go to series"
+        } else {
+            "Go to the film's page"
+        };
+        // The language the subtitle panel lists first: the one asked for in Settings, else the audio's.
+        let lead = {
+            let wanted = film::LANGS.lock().unwrap_or_else(|e| e.into_inner()).sub_lang.clone();
+            let audio = tracks
+                .audio
+                .iter()
+                .find(|a| Some(a.index) == choice.audio)
+                .map(|a| a.lang.clone());
+            if wanted.is_empty() {
+                audio.unwrap_or_default()
+            } else {
+                wanted
+            }
+        };
         // The time in the file of the run's time 0: what was asked for, then the keyframe it began on.
         let mut origin = start;
         let mut ass: Option<Ass> = None;
@@ -478,6 +603,41 @@ impl Player {
                 ));
             }
             let skip = extras::segment_at(&it.segments, pos).filter(|_| clock.running());
+            // The next episode: asked of the server a minute before the credits, offered on a card once they begin.
+            let credits = if up.on { credits_at(it) } else { None };
+            if let Some(c) = credits {
+                if up.asked.is_none() && up.next.is_none() && pos + 60 * TICKS >= c {
+                    let (tx, rx) = channel();
+                    let (b, series, id) = (it.backend.clone(), it.series.clone().unwrap_or_default(), it.id.clone());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(film::next_after(&b, &series, &id));
+                    });
+                    up.asked = Some(rx);
+                }
+                if let Some(got) = up.asked.as_ref().and_then(|r| r.try_recv().ok()) {
+                    up.asked = None;
+                    match got {
+                        Some(n) => {
+                            log(&format!("film: up next is {} ({})", n.name, n.sub));
+                            up.card = Some(UpCard::new(g, &n, true));
+                            up.next = Some(n);
+                        }
+                        None => up.on = false,
+                    }
+                }
+                // Back before the credits: the card comes again.
+                if pos + 2 * TICKS < c {
+                    up.dismissed = false;
+                }
+            }
+            let up_left = credits
+                .filter(|c| pos >= *c && up.card.is_some() && !up.dismissed)
+                .map(|c| (c + UP_SECS * TICKS - pos) as f32 / TICKS as f32);
+            if up_left.is_some_and(|l| l <= 0.0) && clock.running() {
+                log("film: the next episode starts");
+                smp.retire();
+                return Vod::Next;
+            }
             let top = if it.total > 0 {
                 (it.total / TICKS - 5).max(0)
             } else {
@@ -513,6 +673,7 @@ impl Player {
                         match o {
                             Opt::Size => l.sub_size = next(l.sub_size, SIZES.len()),
                             Opt::Raise => l.sub_pos = next(l.sub_pos, RAISES.len()),
+                            Opt::Color => l.sub_color = next(l.sub_color, COLORS.len()),
                             Opt::Bg => l.sub_bg = !l.sub_bg,
                             Opt::Skip => l.skip = next(l.skip, SKIPS.len()),
                             Opt::Delay if wrap => choice.delay_ms = 0,
@@ -558,6 +719,15 @@ impl Player {
                                 smp.retire();
                                 return Vod::Seek(t);
                             }
+                            Some(Pick::Restart) => {
+                                log("film: from the beginning");
+                                smp.retire();
+                                return Vod::Seek(0);
+                            }
+                            Some(Pick::Page) => {
+                                smp.retire();
+                                return Vod::Page(pos);
+                            }
                             Some(Pick::Audio(i)) if choice.audio != Some(i) => {
                                 choice.audio = Some(i);
                                 smp.retire();
@@ -582,10 +752,9 @@ impl Player {
                 {
                     info_at = Instant::now();
                     let ahead = (last[1] - clock.now().as_nanos() as i64) as f64 / 1e9;
-                    menu = Some(Menu::info(
-                        g,
-                        info_lines(src, &tracks, choice, video, profile, lossless_mode, ahead),
-                    ));
+                    let sel = menu.as_ref().and_then(|m| m.sel);
+                    let lines = info_lines(src, &tracks, choice, video, profile, lossless_mode, ahead);
+                    menu = Some(Menu::info(g, page_name, lines, sel));
                 }
             } else if osd.focus.is_some() {
                 match key {
@@ -598,17 +767,34 @@ impl Player {
                         info_at = Instant::now();
                         let ahead = (last[1] - clock.now().as_nanos() as i64) as f64 / 1e9;
                         menu = match osd.button() {
-                            Some(Btn::Subs) => Some(Menu::subs(g, &tracks, choice)),
+                            Some(Btn::Subs) => Some(Menu::subs(g, &tracks, choice, &lead)),
                             Some(Btn::Audio) => Some(Menu::audio(g, &tracks, choice)),
                             Some(Btn::Chapters) => Some(Menu::chapters(g, &it.chapters, pos)),
                             Some(Btn::Options) => Some(Menu::options(g, &choice.look, choice.delay_ms, None)),
                             Some(Btn::Info) => Some(Menu::info(
                                 g,
+                                page_name,
                                 info_lines(src, &tracks, choice, video, profile, lossless_mode, ahead),
+                                None,
                             )),
                             None => None,
                         };
                     }
+                    _ => {}
+                }
+            } else if let (Some(card), true) = (up.card.as_mut().filter(|_| up_left.is_some()), seek.is_none()) {
+                match key {
+                    Some(Fk::Toggle) if card.focus == 0 => {
+                        smp.retire();
+                        return Vod::Next;
+                    }
+                    Some(Fk::Toggle | Fk::Back) => {
+                        log("film: watches the credits");
+                        up.dismissed = true;
+                    }
+                    Some(Fk::Step(d)) => card.step(d),
+                    Some(Fk::Up) => osd.show(),
+                    Some(Fk::Down) => osd.focus_buttons(),
                     _ => {}
                 }
             } else {
@@ -813,7 +999,11 @@ impl Player {
                 placed = place(size);
             }
             if eof && pending.is_none() && clock.now().as_nanos() as i64 + 300_000_000 >= last[1] {
-                break Vod::Exit(it.total, true);
+                break if up_left.is_some() && !up.dismissed {
+                    Vod::Next
+                } else {
+                    Vod::Exit(it.total, true)
+                };
             }
             let ms = pos / 10_000 - choice.delay_ms;
             if choice.sub.is_some_and(|s| !s.server) {
@@ -842,6 +1032,14 @@ impl Player {
                 thumb,
                 ass: ass.as_ref().map(|_| &ass_layer),
                 look: choice.look,
+                loading: (!clock.running() && !paused).then_some(Loading {
+                    stage: "Buffering",
+                    full: fresh,
+                }),
+                up: match (up.card.as_mut(), up_left, seek) {
+                    (Some(c), Some(l), None) if !up.dismissed => Some((c, l, UP_SECS as f32)),
+                    _ => None,
+                },
             };
             let seeking = seek.map(|s| Seeking {
                 to: s.0,
@@ -920,18 +1118,29 @@ pub fn child_in(root: &str, spec: &str) -> ExitCode {
     };
     let mut it = it;
     loop {
-        let (pos, done) = p.film(&g, &it);
+        let (pos, after) = p.film(&g, &it, prefs.next_ep == "countdown");
         log(&format!(
             "film: stopped at {} s{}",
             pos / TICKS,
-            if done { " (finished)" } else { "" }
+            if matches!(after, After::Stopped | After::Page) {
+                ""
+            } else {
+                " (finished)"
+            }
         ));
-        if !done {
-            break;
-        }
-        match film::next(&it).filter(|n| p.next_up(&g, n)) {
-            Some(n) => it = n,
-            None => break,
+        match after {
+            After::Stopped => break,
+            After::Page => {
+                let page = it.series.as_deref().unwrap_or(&it.id);
+                let _ = std::fs::write(PAGE, page);
+                break;
+            }
+            After::PlayNext(n) => it = *n,
+            After::Finished if prefs.next_ep == "off" => break,
+            After::Finished => match film::next(&it).filter(|n| p.next_up(&g, n)) {
+                Some(n) => it = n,
+                None => break,
+            },
         }
     }
     ExitCode::SUCCESS
@@ -941,26 +1150,19 @@ impl Player {
     /// After an episode: the next one starts in five seconds, or at once with OK; Back ends the viewing. Gives
     /// whether to play it.
     fn next_up(&self, g: &Gfx, next: &Item) -> bool {
-        let mut osd = Osd::new(g, next);
-        let (t, mut shown) = (Instant::now(), 0);
+        let mut card = UpCard::new(g, next, false);
+        let t = Instant::now();
         loop {
             match fkey() {
                 Some(Fk::Back) => return false,
                 Some(Fk::Toggle) => return true,
                 _ => {}
             }
-            let left = 5u64.saturating_sub(t.elapsed().as_secs());
-            if left == 0 {
+            let left = 5.0 - t.elapsed().as_secs_f32();
+            if left <= 0.0 {
                 return true;
             }
-            if left != shown {
-                shown = left;
-                osd.say(
-                    g,
-                    Some(&format!("Next episode in {left} s. OK plays it now, Back stops.")),
-                );
-            }
-            vframe(g, &mut osd, 0, false, None, Over::default());
+            up_frame(g, &mut card, left, 5.0);
         }
     }
 }
@@ -1001,6 +1203,17 @@ pub fn film_sim_keys() {
     });
 }
 
+/// Where the next episode's card comes up: the start of the credits the server marked in the second half, else 20
+/// seconds before the end of an episode longer than two minutes.
+fn credits_at(it: &Item) -> Option<i64> {
+    let marked = it
+        .segments
+        .iter()
+        .find(|s| s.kind == extras::SegKind::Credits && s.start > it.total / 2)
+        .map(|s| s.start);
+    marked.or((it.total > 120 * TICKS).then(|| it.total - 20 * TICKS))
+}
+
 /// What Info says about what plays: how it comes, the picture, the sound and its way to the speakers, the subtitles
 /// and how far ahead the TV has it.
 fn info_lines(
@@ -1021,6 +1234,8 @@ fn info_lines(
     };
     let codec = match video {
         crate::ts::Codec::H265 => "H.265",
+        crate::ts::Codec::Av1 => "AV1",
+        crate::ts::Codec::Vp9 => "VP9",
         _ => "H.264",
     };
     let audio_name = tracks
@@ -1042,7 +1257,7 @@ fn info_lines(
     let sub = choice
         .sub
         .and_then(|s| tracks.subs.iter().find(|t| t.index == s.index))
-        .map_or("Off".to_string(), |t| t.name.clone());
+        .map_or("Off".to_string(), SubRow::describe);
     let timing = match choice.delay_ms {
         0 => String::new(),
         d => format!("   ·   {:+.1} s", d as f64 / 1000.0),

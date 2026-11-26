@@ -75,6 +75,10 @@ pub struct STrack {
     pub ass: bool,
     pub lang: String,
     pub forced: bool,
+    /// For the deaf and hard of hearing; the track's own title ("Signs & Songs"), and its format ("PGS").
+    pub sdh: bool,
+    pub title: String,
+    pub format: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -439,8 +443,36 @@ unsafe fn dovi_conf(cp: *const AVCodecParameters) -> Option<Dv> {
 }
 
 /// Video the TV's decoder takes: H.264 up to High profile (8 bit) and H.265 Main and Main 10.
+/// Whether the TV's own table of decoders lists `name` ("AV1", "VP9"): not every webOS 6 set has them.
+pub fn tv_decodes(name: &str) -> bool {
+    static TABLE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let v: serde_json::Value = std::fs::read("/etc/umediaserver/device_codec_capability_config.json")
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let rows = v["videoCodecs"].as_array().cloned().unwrap_or_default();
+        rows.iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_uppercase))
+            .collect()
+    });
+    table.iter().any(|n| n == name)
+}
+
+/// AV1 in its Main profile (8 and 10 bit) and VP9 in profile 0 (8 bit), when the TV lists their decoders. LG's
+/// pipeline on webOS 5 and later is not known to show 10-bit VP9 (profile 2) right, so the server converts that.
 fn video_refusal(name: &str, profile: c_int, bits: c_int) -> Option<String> {
+    video_refusal_on(name, profile, bits, tv_decodes)
+}
+
+fn video_refusal_on(name: &str, profile: c_int, bits: c_int, has: fn(&str) -> bool) -> Option<String> {
     match name {
+        "av1" if !has("AV1") => Some("this TV has no AV1 decoder".into()),
+        "av1" if matches!(profile, 0 | -99) => None,
+        "av1" => Some(format!("the TV decodes AV1 Main only, not profile {profile}")),
+        "vp9" if !has("VP9") => Some("this TV has no VP9 decoder".into()),
+        "vp9" if matches!(profile, 0 | -99) && bits <= 8 => None,
+        "vp9" => Some("the TV does not decode 10-bit VP9".into()),
         "h264" if matches!(profile, 66 | 77 | 88 | 100 | 578 | 579 | 580 | 581 | 583) || profile < 0 => {
             (bits > 8).then(|| "the TV does not decode 10-bit H.264".to_string())
         }
@@ -450,6 +482,45 @@ fn video_refusal(name: &str, profile: c_int, bits: c_int) -> Option<String> {
         "hevc" => Some(format!("the TV does not decode H.265 profile {profile}")),
         other => Some(format!("the TV does not decode {other} in a film file")),
     }
+}
+
+/// The profile of the file's first VP9 frame. FFmpeg is built without the VP9 parser, so the stream's own profile
+/// stays unknown, and a 10-bit file (profile 2) looks like any other.
+unsafe fn vp9_profile(f: &Fns, fmt: *mut AVFormatContext) -> Option<u8> {
+    let pkt = (f.av_packet_alloc)();
+    if pkt.is_null() {
+        return None;
+    }
+    let mut out = None;
+    for _ in 0..500 {
+        if (f.av_read_frame)(fmt, pkt) < 0 {
+            break;
+        }
+        let cp = stream_codecpar(*(*fmt).streams.add((*pkt).stream_index as usize));
+        if (*cp).codec_type == AVMEDIA_TYPE_VIDEO && (*pkt).size > 0 && codec_name(f, (*cp).codec_id) == "vp9" {
+            out = vp9_frame_profile(*(*pkt).data);
+        }
+        (f.av_packet_unref)(pkt);
+        if out.is_some() {
+            break;
+        }
+    }
+    (f.av_packet_free)(&mut { pkt });
+    out
+}
+
+/// The profile in an AV1 stream's `av1C` box (marker and version byte 0x81, then the 3-bit profile): FFmpeg is built
+/// without the AV1 parser, so it does not fill `profile` in.
+unsafe fn av1_profile(cp: *const AVCodecParameters) -> Option<c_int> {
+    if (*cp).extradata.is_null() || (*cp).extradata_size < 2 || *(*cp).extradata != 0x81 {
+        return None;
+    }
+    Some(c_int::from(*(*cp).extradata.add(1) >> 5))
+}
+
+/// A VP9 frame starts with the frame marker (2 bits, `10`), then the profile's low bit and its high bit.
+fn vp9_frame_profile(b: u8) -> Option<u8> {
+    (b >> 6 == 2).then_some((b >> 5 & 1) | (b >> 3 & 2))
 }
 
 unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
@@ -467,6 +538,8 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
             AVMEDIA_TYPE_VIDEO if info.video.is_none() && (*cp).width > 0 => {
                 let codec = match name.as_str() {
                     "hevc" => Codec::H265,
+                    "av1" => Codec::Av1,
+                    "vp9" => Codec::Vp9,
                     _ => Codec::H264,
                 };
                 info.video = Some(Video {
@@ -474,7 +547,11 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                     w: (*cp).width,
                     h: (*cp).height,
                     dv: dovi_conf(cp),
-                    refused: video_refusal(&name, (*cp).profile, (*cp).bits_per_raw_sample),
+                    refused: video_refusal(
+                        &name,
+                        av1_profile(cp).unwrap_or((*cp).profile),
+                        (*cp).bits_per_raw_sample,
+                    ),
                 });
             }
             AVMEDIA_TYPE_AUDIO => {
@@ -522,6 +599,9 @@ unsafe fn read_info(f: &Fns, fmt: *mut AVFormatContext) -> Info {
                         ass: matches!(name.as_str(), "ass" | "ssa") && ass::available(),
                         lang: stream_tag(f, s, c"language").unwrap_or_default(),
                         forced: stream_forced(s),
+                        sdh: stream_sdh(s),
+                        title: stream_tag(f, s, c"title").unwrap_or_default(),
+                        format: crate::film::sub_format(&name),
                     });
                 }
             }
@@ -622,7 +702,19 @@ fn thread_main(url: String, stop: Arc<Stop>, cmds: Receiver<Cmd>, ready: Sender<
         Ok(o) => o,
         Err(e) => return drop(ready.send(Err(e))),
     };
-    let info = unsafe { read_info(f, open.fmt) };
+    let mut info = unsafe { read_info(f, open.fmt) };
+    let mut first = true;
+    if let Some(v) = info
+        .video
+        .as_mut()
+        .filter(|v| v.codec == Codec::Vp9 && v.refused.is_none())
+    {
+        // The packets read here are gone: the first run seeks back to the start.
+        first = false;
+        if let Some(p) = unsafe { vp9_profile(f, open.fmt) }.filter(|p| *p != 0) {
+            v.refused = Some(format!("the TV decodes 8-bit VP9 (profile 0) only, not profile {p}"));
+        }
+    }
     log(&format!(
         "ff: opened, {} s, {} bytes read, video {:?}, audio {:?}, subtitles {:?}",
         info.duration_ns / 1_000_000_000,
@@ -635,7 +727,6 @@ fn thread_main(url: String, stop: Arc<Stop>, cmds: Receiver<Cmd>, ready: Sender<
             .collect::<Vec<_>>()
     ));
     let _ = ready.send(Ok(info.clone()));
-    let mut first = true;
     while let Ok(c) = cmds.recv() {
         let Cmd::Start {
             at_ns,
@@ -1115,6 +1206,11 @@ unsafe fn run(
         std::slice::from_raw_parts((*vcp).extradata, (*vcp).extradata_size as usize)
     };
     let (param, nls) = parse_extradata(ed, hevc);
+    let av1_cfg = if video.codec == Codec::Av1 {
+        super::av1::config(ed)
+    } else {
+        vec![]
+    };
     let dv7 = match &video.dv {
         Some(d) if hevc && d.profile == 7 && d.el && d.compat == 6 && dolby::tv_shows_dv() => Dv7::Convert,
         Some(d) if hevc && d.profile == 7 => Dv7::Drop,
@@ -1237,15 +1333,19 @@ unsafe fn run(
         let mut alive = true;
         if si == vstream {
             if let Some(pts) = pts {
-                let key = annexb(
-                    data,
-                    nls,
-                    hevc,
-                    (*pkt).flags & AV_PKT_FLAG_KEY != 0,
-                    dv7,
-                    &param,
-                    &mut au_buf,
-                );
+                let container_key = (*pkt).flags & AV_PKT_FLAG_KEY != 0;
+                let key = match video.codec {
+                    Codec::Av1 => {
+                        super::av1::temporal_unit(data, container_key, &av1_cfg, &mut au_buf);
+                        container_key
+                    }
+                    Codec::Vp9 => {
+                        au_buf.clear();
+                        au_buf.extend_from_slice(data);
+                        container_key
+                    }
+                    _ => annexb(data, nls, hevc, container_key, dv7, &param, &mut au_buf),
+                };
                 if base.is_none() && key {
                     base = Some(pts);
                     alive = q.push(Feed::Base(pts));
@@ -1593,7 +1693,21 @@ mod tests {
         assert!(video_refusal("h264", 110, 10).is_some());
         assert!(video_refusal("h264", 100, 10).is_some());
         assert_eq!(video_refusal("hevc", 2, 10), None);
-        assert!(video_refusal("vp9", 0, 8).is_some());
+        let none = |_: &str| false;
+        let all = |_: &str| true;
+        assert!(
+            video_refusal_on("vp9", 0, 8, none).is_some(),
+            "no decoder in the TV's table"
+        );
+        assert_eq!(video_refusal_on("vp9", 0, 8, all), None);
+        assert!(video_refusal_on("vp9", 2, 10, all).is_some());
+        assert_eq!(video_refusal_on("av1", 0, 10, all), None);
+        assert!(video_refusal_on("av1", 1, 8, all).is_some());
+        assert!(video_refusal_on("vc1", 0, 8, all).is_some());
+        assert_eq!(vp9_frame_profile(0x82), Some(0));
+        assert_eq!(vp9_frame_profile(0xA2), Some(1));
+        assert_eq!(vp9_frame_profile(0x92), Some(2));
+        assert_eq!(vp9_frame_profile(0x12), None, "no frame marker");
     }
 
     #[test]
