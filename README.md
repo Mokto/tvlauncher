@@ -28,8 +28,8 @@ Rust, with `serde_json`, `libc` and `minreq` as the only dependencies. [src/sdl.
 It shows a hero area with the focused card's name, description and background image, and up to six rows:
 
 - **Pinned apps**: the apps you pinned (hold OK on an app, *Pin to Home*), in the order you give them. A pinned app is shown here instead of in Apps. The row is absent until something is pinned.
-- **Continue watching**: Jellyfin's resume and next-up items, with a picture and a progress bar. See [Jellyfin](#jellyfin).
-- **Continue watching on Plex**: the Continue Watching hub of your Plex servers. See [Plex](#plex).
+- **Continue watching**: Jellyfin's resume and next-up items, with a picture and a progress bar; an episode's label under the focused card says its season and episode (*The Bridge · S2 · E1*). See [Jellyfin](#jellyfin).
+- **Continue watching on Plex**: the Continue Watching hub of your Plex servers, with the same season and episode label. See [Plex](#plex).
 - **Recommended on YouTube**: see [YouTube](#youtube-recommendations).
 - **Apps**, from `listLaunchPoints`. All the other apps. Hold OK on one to pin, hide or reorder it. See [Hiding and moving apps](#hiding-and-moving-apps).
 - **Inputs**, from `getAllInputStatus`.
