@@ -3347,8 +3347,10 @@ impl App {
                     self.open_menu();
                 } else if ok {
                     match self.focused() {
-                        // An app waits for OK to be released: a tap launches it, a hold opens its options.
-                        Some((r, c)) if self.rows[r].items[c].kind == Kind::App => {
+                        Some((r, c))
+                            if self.rows[r].items[c].kind == Kind::App
+                                || (matches!(r, WATCH | PLEX) && self.manager()) =>
+                        {
                             self.ok_down = self.ok_down.or(Some(unsafe { SDL_GetTicks() }));
                         }
                         Some((r, c)) => self.activate(r, c),

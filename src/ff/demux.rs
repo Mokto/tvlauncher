@@ -159,7 +159,7 @@ pub enum Feed {
         dv: Option<Dv>,
     },
     Au(Au),
-    Sub(SubEv),
+    Sub(usize, SubEv),
     /// An ASS track starts: its header, the file's fonts and the picture's size. Then `AssChunk`s follow.
     AssTrack {
         header: Vec<u8>,
@@ -193,7 +193,7 @@ struct QState {
 fn weight(f: &Feed) -> usize {
     match f {
         Feed::Au(a) => a.data.len() + 64,
-        Feed::Sub(_) => 4096,
+        Feed::Sub(..) => 4096,
         Feed::AssChunk { data, .. } => data.len() + 256,
         _ => 0,
     }
@@ -285,7 +285,7 @@ enum Cmd {
     Start {
         at_ns: i64,
         audio: i32,
-        sub: Option<i32>,
+        sub: [Option<i32>; 2],
         lossless: Mode,
         q: Arc<Queue>,
     },
@@ -329,7 +329,7 @@ impl Demux {
     }
 
     /// Starts reading at `at_ns` (the keyframe at or before it). Ends the run before this one.
-    pub fn start(&self, at_ns: i64, audio: i32, sub: Option<i32>, lossless: Mode) -> Run {
+    pub fn start(&self, at_ns: i64, audio: i32, sub: [Option<i32>; 2], lossless: Mode) -> Run {
         let q = Queue::new(QUEUE_BYTES);
         let _ = self.cmd.send(Cmd::Start {
             at_ns,
@@ -1182,7 +1182,7 @@ unsafe fn run(
     info: &Info,
     at_ns: i64,
     audio: i32,
-    sub: Option<i32>,
+    sub: [Option<i32>; 2],
     lossless: Mode,
     q: &Arc<Queue>,
     no_seek: bool,
@@ -1239,8 +1239,8 @@ unsafe fn run(
     if let Some(c) = &conv {
         log(&format!("ff: audio {}", c.desc));
     }
-    let sub_info = sub.and_then(|s| info.subs.iter().find(|t| t.stream == s));
-    let ass_header = sub_info.filter(|t| t.ass).map(|t| {
+    let sub_info = sub.map(|s| s.and_then(|s| info.subs.iter().find(|t| t.stream == s)));
+    let ass_header = sub_info[0].filter(|t| t.ass).map(|t| {
         let cp = stream_codecpar(streams[t.stream as usize]);
         let (d, n) = ((*cp).extradata, (*cp).extradata_size);
         if d.is_null() || n <= 0 {
@@ -1249,14 +1249,6 @@ unsafe fn run(
             std::slice::from_raw_parts(d, n as usize).to_vec()
         }
     });
-    let (sub_dec, sub_name) = match sub_info.filter(|t| !t.ass) {
-        Some(t) => {
-            let cp = stream_codecpar(streams[t.stream as usize]);
-            (open_sub_decoder(f, cp), codec_name(f, (*cp).codec_id))
-        }
-        None => (std::ptr::null_mut(), String::new()),
-    };
-
     if !no_seek {
         let r = (f.av_seek_frame)(fmt, -1, at_ns / 1000, AVSEEK_FLAG_BACKWARD);
         if r < 0 {
@@ -1301,7 +1293,13 @@ unsafe fn run(
             return Ok(());
         }
     }
-    let ass_stream = sub_info.filter(|t| t.ass).map(|t| t.stream);
+    let ass_stream = sub_info[0].filter(|t| t.ass).map(|t| t.stream);
+    let mut decoders = sub_info.map(|track| {
+        track.filter(|t| !t.ass).map(|t| {
+            let cp = stream_codecpar(streams[t.stream as usize]);
+            (t.stream, open_sub_decoder(f, cp), codec_name(f, (*cp).codec_id))
+        })
+    });
     let mut base: Option<i64> = None;
     let mut au_buf: Vec<u8> = Vec::new();
     let mut converted: Vec<(i64, Vec<u8>)> = vec![];
@@ -1455,16 +1453,23 @@ unsafe fn run(
                         dur_ms: dur / 1_000_000,
                     });
                 }
-            } else if Some(si as i32) == sub && !sub_dec.is_null() {
-                if let Some(pts) = pts {
+            } else if let Some(pts) = pts {
+                for (slot, decoder) in decoders.iter().enumerate() {
+                    let Some((_, dec, name)) = decoder
+                        .as_ref()
+                        .filter(|(stream, dec, _)| *stream == si as i32 && !dec.is_null())
+                    else {
+                        continue;
+                    };
                     let dur = if (*pkt).duration > 0 {
                         (f.av_rescale_q)((*pkt).duration, stream_time_base(st), NS_TB)
                     } else {
                         0
                     };
-                    if let Some(ev) = decode_sub(f, sub_dec, &sub_name, pkt, pts, dur) {
+                    if let Some(ev) = decode_sub(f, *dec, name, pkt, pts, dur) {
                         subs_n += 1;
-                        alive = q.push(Feed::Sub(ev));
+                        alive = q.push(Feed::Sub(slot, ev));
+                        break;
                     }
                 }
             }
@@ -1484,9 +1489,8 @@ unsafe fn run(
     ));
     let mut p = pkt;
     (f.av_packet_free)(&mut p);
-    if !sub_dec.is_null() {
-        let mut d = sub_dec;
-        (f.avcodec_free_context)(&mut d);
+    for (_, dec, _) in decoders.iter_mut().flatten() {
+        (f.avcodec_free_context)(dec);
     }
     result
 }
@@ -1515,12 +1519,12 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
     };
     if std::env::var_os("FF_INTERRUPT").is_some() {
         // A run cut off in the middle (a seek while reading), then another from somewhere else.
-        let first = d.start(0, a, None, Mode::Off);
+        let first = d.start(0, a, [None; 2], Mode::Off);
         std::thread::sleep(Duration::from_millis(300));
         drop(first);
         println!("first run cut");
     }
-    let run = d.start(at_s * 1_000_000_000, a, sub.map(|s| s as i32), Mode::Off);
+    let run = d.start(at_s * 1_000_000_000, a, [sub.map(|s| s as i32), None], Mode::Off);
     let t = std::time::Instant::now();
     let (mut v, mut au, mut keys, mut subs, mut last_v, mut last_a) = (0, 0, 0, 0, 0i64, 0i64);
     let mut base = None;
@@ -1539,7 +1543,7 @@ pub fn probe_cli(url: &str, at_s: i64, audio: Option<i64>, sub: Option<i64>) {
                 println!("ass track: {} header bytes, {:?}", header.len(), fonts)
             }
             Some(Feed::AssChunk { .. }) => subs += 1,
-            Some(Feed::Sub(e)) => {
+            Some(Feed::Sub(_, e)) => {
                 subs += 1;
                 if subs <= 3 {
                     match e.what {

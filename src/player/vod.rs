@@ -152,7 +152,7 @@ impl Player {
             ..Choice::default()
         };
         set_sub_size(SIZES[choice.look.sub_size].1);
-        let mut events = Events::default();
+        let mut events = [Events::default(), Events::default()];
         let mut thumbs = Thumbs::new(it.trick.clone());
         let mut at = it.resume;
         let mut up = Up {
@@ -182,7 +182,7 @@ impl Player {
                 Vod::Server(t, reason, why) => {
                     log(&format!("film: the server converts it from here: {why}"));
                     src = Source::Server(reason);
-                    events.clear();
+                    events[0].clear();
                     (choice.sub, at, fresh) = (choice.sub.filter(|s| s.server), t, true);
                 }
                 Vod::Exit(pos, true) => break (pos, After::Finished),
@@ -327,7 +327,7 @@ impl Player {
         run_of: Start,
         osd: &mut Osd,
         choice: &mut Choice,
-        events: &mut Events,
+        [events, second_events]: &mut [Events; 2],
         thumbs: &mut Thumbs,
         up: &mut Up,
     ) -> Vod {
@@ -352,7 +352,7 @@ impl Player {
         }
         btns.extend([Btn::Options, Btn::Info]);
         osd.set_buttons(g, &btns);
-        let mut shown = Shown::default();
+        let (mut shown, mut second_shown) = (Shown::default(), Shown::default());
         // The first run picks the tracks the viewer's language settings and the server's choice lead to.
         if !choice.init {
             choice.init = true;
@@ -434,6 +434,16 @@ impl Player {
             events.clear();
         }
 
+        if choice.second.is_some_and(|s| !tracks.allows_second(choice.sub, s)) {
+            choice.second = None;
+        }
+        if !choice.second.is_some_and(|s| s.server) {
+            second_events.clear();
+        }
+        let mut loading_second = choice
+            .second
+            .filter(|s| s.server && second_events.is_empty())
+            .map(&fetch);
         let start_s = start / TICKS;
         // Before the pipeline loads: the receiver link is set up as it connects.
         let (lossless_mode, _armed) = match src {
@@ -451,7 +461,7 @@ impl Player {
         let run = match src {
             Source::File(d) => {
                 let audio = choice.audio.map_or(-1, |a| a as i32);
-                let sub = choice.sub.filter(|s| !s.server).map(|s| s.index as i32);
+                let sub = [choice.sub, choice.second].map(|sel| sel.filter(|s| !s.server).map(|s| s.index as i32));
                 d.start(start * 100, audio, sub, lossless_mode)
             }
             Source::Server(_) => {
@@ -685,6 +695,8 @@ impl Player {
                 if seek.is_some() {
                     (seek, scrub, level) = (None, None, 0);
                     osd.show();
+                } else if menu.as_ref().is_some_and(|m| m.second) {
+                    menu = Some(Menu::subs(g, &tracks, choice, &lead, Some(0)));
                 } else if menu.take().is_some() {
                     osd.show();
                 } else if osd.controls_visible(paused) {
@@ -746,21 +758,40 @@ impl Player {
                         if o == Opt::Size {
                             set_sub_size(SIZES[choice.look.sub_size].1);
                             shown.reset();
+                            second_shown.reset();
                         }
                         if o != Opt::Delay && std::env::var_os("TVLAUNCHER_READ_ONLY").is_none() {
                             crate::data::Prefs::save_look(&media_root(), choice.look);
                         }
                         *m = Menu::options(g, &choice.look, choice.delay_ms, m.sel);
                     }
+                    (Some(Fk::Step(-1)), _) if m.second => menu = Some(Menu::subs(g, &tracks, choice, &lead, Some(0))),
                     (Some(Fk::Step(-1)), _) => menu = None,
                     (Some(Fk::Up), _) => m.step(-1),
                     (Some(Fk::Down), _) => m.step(1),
                     (Some(Fk::Toggle), _) => {
                         let pick = menu.take().and_then(|m| m.rows.into_iter().nth(m.sel?)).map(|r| r.pick);
                         match pick {
+                            Some(Pick::SecondMenu) => menu = Some(Menu::second_subs(g, &tracks, choice, &lead)),
+                            Some(Pick::SecondSub(sel))
+                                if sel != choice.second && sel.is_none_or(|s| tracks.allows_second(choice.sub, s)) =>
+                            {
+                                log(&format!("film: second subtitle {sel:?}"));
+                                choice.second = sel;
+                                second_events.clear();
+                                second_shown.reset();
+                                loading_second = sel.filter(|s| s.server).map(&fetch);
+                                if loading_second.is_some() {
+                                    osd.note(g, "Loading second subtitles...");
+                                } else if sel.is_some() {
+                                    smp.retire();
+                                    return Vod::Seek(pos);
+                                }
+                            }
                             Some(Pick::Sub(None)) => {
                                 let embedded = choice.sub.is_some_and(|s| !s.server);
                                 choice.sub = None;
+                                loading = None;
                                 events.clear();
                                 shown.reset();
                                 if embedded {
@@ -768,6 +799,7 @@ impl Player {
                                     return Vod::Seek(pos);
                                 }
                             }
+                            Some(Pick::Sub(Some(sel))) if Some(sel) == choice.sub => loading = None,
                             Some(Pick::Sub(Some(sel))) if sel.server => {
                                 osd.note(g, "Loading subtitles...");
                                 loading = Some(fetch(sel));
@@ -835,7 +867,7 @@ impl Player {
                         info_at = Instant::now();
                         let ahead = (last[1] - clock.now().as_nanos() as i64) as f64 / 1e9;
                         menu = match osd.button() {
-                            Some(Btn::Subs) => Some(Menu::subs(g, &tracks, choice, &lead)),
+                            Some(Btn::Subs) => Some(Menu::subs(g, &tracks, choice, &lead, None)),
                             Some(Btn::Audio) => Some(Menu::audio(g, &tracks, choice)),
                             Some(Btn::Chapters) => Some(Menu::chapters(g, &it.chapters, pos)),
                             Some(Btn::Options) => Some(Menu::options(g, &choice.look, choice.delay_ms, None)),
@@ -956,10 +988,32 @@ impl Player {
                         *events = Events::from_cues(c);
                         choice.sub = Some(sel);
                         shown.reset();
+                        ass = None;
+                        ass_layer.clear();
                         osd.say(g, None);
                     }
                     Ok(_) => osd.note(g, "These subtitles are empty"),
                     Err(e) => osd.note(g, &format!("Subtitles: {e}")),
+                }
+            }
+            if choice.second.is_some_and(|s| !tracks.allows_second(choice.sub, s)) {
+                choice.second = None;
+                loading_second = None;
+                second_events.clear();
+                second_shown.reset();
+            }
+            if let Some((_, got)) = loading_second.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                loading_second = None;
+                match got {
+                    Ok(c) if !c.is_empty() => {
+                        *second_events = Events::from_cues(c);
+                        osd.say(g, None);
+                    }
+                    result => {
+                        choice.second = None;
+                        let why = result.err().unwrap_or_else(|| "the track is empty".into());
+                        osd.note(g, &format!("Second subtitles: {why}"));
+                    }
                 }
             }
             loop {
@@ -987,9 +1041,11 @@ impl Player {
                             }
                             continue;
                         }
-                        Some(Feed::Sub(ev)) => {
-                            if choice.sub.is_some_and(|s| !s.server) {
+                        Some(Feed::Sub(slot, ev)) => {
+                            if slot == 0 && choice.sub.is_some_and(|s| !s.server) {
                                 events.insert(ev);
+                            } else if slot == 1 && choice.second.is_some_and(|s| !s.server) {
+                                second_events.insert(ev);
                             }
                             continue;
                         }
@@ -1034,6 +1090,7 @@ impl Player {
                 clock.run();
                 let ok = unsafe { (smp.play)(smp.obj) } & 0xff;
                 log(&format!("film: Play {ok}"));
+                osd.finish_opening();
                 osd.say(g, None);
                 film::report(it, Note::Progress, pos, false, direct, false);
             }
@@ -1063,6 +1120,12 @@ impl Player {
             if choice.sub.is_some() {
                 shown.update(g, events, ms);
             }
+            if let Some(s) = choice.second {
+                if !s.server {
+                    second_events.prune(ms);
+                }
+                second_shown.update(g, second_events, ms);
+            }
             if let Some(a) = ass.as_mut() {
                 // A script's own timing: look at most every 33 ms.
                 if last_ass.elapsed() >= Duration::from_millis(33) {
@@ -1078,6 +1141,7 @@ impl Player {
             let thumb = seek.and_then(|s| thumbs.at(g, s.0 * 1000));
             let over = Over {
                 shown: choice.sub.map(|_| &shown),
+                second: choice.second.map(|_| &second_shown),
                 menu: menu.as_ref(),
                 skip: skip.map(|s| s.kind).filter(|_| seek.is_none()),
                 thumb,
@@ -1309,7 +1373,7 @@ fn info_lines(
     };
     let sub = choice
         .sub
-        .and_then(|s| tracks.subs.iter().find(|t| t.index == s.index))
+        .and_then(|s| tracks.subtitle(s))
         .map_or("Off".to_string(), SubRow::describe);
     let timing = match choice.delay_ms {
         0 => String::new(),

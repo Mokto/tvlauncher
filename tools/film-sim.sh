@@ -10,11 +10,14 @@ set -eu
 cd "$(dirname "$0")/.."
 D=build/film-sim
 mkdir -p "$D/root" build/fake-sf
-[ -f "$D/film.mkv" ] || {
-  printf '1\n00:00:02,000 --> 00:00:05,000\n<i>Bonjour</i> le monde\n\n2\n00:00:10,000 --> 00:00:12,500\n{\\an8}En haut\n' > "$D/s.srt"
+[ -f "$D/film.mkv" ] && [ -f "$D/english.srt" ] || {
+  printf '1\n00:00:02,000 --> 00:00:05,000\n<i>Goddag</i>\n\n2\n00:00:10,000 --> 00:00:12,500\n{\\an8}Det er sent\n' > "$D/s.srt"
+  printf '1\n00:00:09,000 --> 00:00:16,000\nIt is late\n' > "$D/english.tmp.srt"
   ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 \
-    -f lavfi -i sine=frequency=880:sample_rate=48000 -i "$D/s.srt" -t 30 -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 48 \
-    -c:a:0 ac3 -c:a:1 flac -ac:a:1 2 -map 0:v -map 1:a -map 2:a -map 3 -c:s srt -metadata:s:a:0 language=eng -metadata:s:a:1 language=fre -metadata:s:s:0 language=fre "$D/film.mkv"
+    -f lavfi -i sine=frequency=880:sample_rate=48000 -i "$D/s.srt" -i "$D/english.tmp.srt" -t 30 -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 48 \
+    -c:a:0 ac3 -c:a:1 flac -ac:a:1 2 -map 0:v -map 1:a -map 2:a -map 3 -map 4 -c:s srt -metadata:s:a:0 language=eng -metadata:s:a:1 language=fre \
+    -metadata:s:s:0 language=dan -metadata:s:s:1 language=eng "$D/film.mkv"
+  mv "$D/english.tmp.srt" "$D/english.srt"
 }
 [ -f "$D/tile.jpg" ] || ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=320x180:rate=1 -t 30 -vf tile=10x3 -frames:v 1 "$D/tile.jpg"
 clang -dynamiclib -o build/fake-sf/libplayerAPIs.so.1 tools/fake-starfish.c
@@ -25,7 +28,7 @@ printf '{"server":"http://127.0.0.1:8780","serverId":"s1","userId":"u1","user":"
 # lossless audio on; it only does anything with FILM_RECEIVER=1, which stands in for an ARC receiver
 STATE=${FILM_STATE:-'{"lossless":true}'}
 printf '%s' "$STATE" > "$R/media/developer/tvlauncher/state.json"
-node tools/fake-media.js "$D" 8780 > "$D/server.log" 2>&1 &
+FILM_SIM=1 node tools/fake-media.js "$D" 8780 > "$D/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER' EXIT
 sleep 1
