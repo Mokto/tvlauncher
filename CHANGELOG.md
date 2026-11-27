@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/Mokto/tvlauncher/compare/v0.3.0...v0.4.0) (2026-11-27)
+
+
+### Features
+
+* configurable Home tab and redesigned profile picker with 38 avatars ([#13](https://github.com/Mokto/tvlauncher/issues/13)) ([4373e04](https://github.com/Mokto/tvlauncher/commit/4373e04f4da9857f9c1c5054a7a6f78f8481fb22))
+* redesign film player controls, layered Back and accelerating seek taps ([#18](https://github.com/Mokto/tvlauncher/issues/18)) ([ee10783](https://github.com/Mokto/tvlauncher/commit/ee10783ba1021c12e544e40c97bf2a03282ec116))
+* redesign Settings with separate Profiles and This TV areas ([#15](https://github.com/Mokto/tvlauncher/issues/15)) ([be236ce](https://github.com/Mokto/tvlauncher/commit/be236ce01cb0370024bec5af9935068153baa2f1))
+
+
+### Bug Fixes
+
+* show episode on Continue watching cards and let them be removed ([#16](https://github.com/Mokto/tvlauncher/issues/16)) ([aefff65](https://github.com/Mokto/tvlauncher/commit/aefff65de75d6a622573ca2c93129cd0f12328e3))
+
 ## [0.3.0](https://github.com/Mokto/tvlauncher/compare/v0.2.0...v0.3.0) (2026-11-26)
 
 
