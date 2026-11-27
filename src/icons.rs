@@ -21,9 +21,11 @@ pub enum Icon {
     Lock,
     Power,
     Person,
+    Left,
+    Right,
 }
 
-pub const ALL: [Icon; 18] = [
+pub const ALL: [Icon; 20] = [
     Icon::Play,
     Icon::Pause,
     Icon::Subtitles,
@@ -42,6 +44,8 @@ pub const ALL: [Icon; 18] = [
     Icon::Lock,
     Icon::Power,
     Icon::Person,
+    Icon::Left,
+    Icon::Right,
 ];
 
 /// The size the icons are made at, in pixels; they are drawn at this size or a little smaller.
@@ -139,6 +143,10 @@ fn shape(icon: Icon, p: P) -> f32 {
                 .min(sq((0.38, -0.38)))
                 .min(sq((-0.38, 0.38)))
                 .min(sq((0.38, 0.38)))
+        }
+        Icon::Left | Icon::Right => {
+            let p = (if icon == Icon::Left { -x } else { x }, y);
+            seg(p, (-0.26, -0.58), (0.34, 0.0), T * 1.3).min(seg(p, (0.34, 0.0), (-0.26, 0.58), T * 1.3))
         }
         Icon::Check => seg(p, (-0.62, 0.02), (-0.18, 0.46), T * 1.3).min(seg(p, (-0.18, 0.46), (0.66, -0.44), T * 1.3)),
         Icon::Tabs => {
