@@ -42,7 +42,7 @@ Browse posters while the focused film’s backdrop and synopsis stay in view.
 
 ### Built-in player
 
-Scrub with a preview thumbnail or open subtitles, audio, chapters and playback options from the same bar. This simulator capture uses generated artwork in place of video.
+Scrub with a preview thumbnail or open subtitles, audio, chapters and playback options from the same bar. Show a second text subtitle track at the top for a translation. This simulator capture uses generated artwork in place of video.
 
 ![The Martian player controls with a seek thumbnail, timeline and audio and subtitle buttons](docs/player.png)
 

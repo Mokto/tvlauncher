@@ -146,11 +146,11 @@ fn main() -> ExitCode {
             None => "seek",
         };
         let backdrop = if let Some(path) = args.get(4) {
-            let Some(tex) = Surf::load(path).and_then(|s| Tex::new(ren, &s)) else {
+            let Some(surface) = Surf::load(path) else {
                 log(&format!("film-shot: could not load {path}: {}", error()));
                 return ExitCode::FAILURE;
             };
-            Some(tex)
+            Some(surface)
         } else {
             None
         };

@@ -20,9 +20,9 @@ const item = (id, name) => ({
     { Type: 'Video', Index: 0 },
     { Type: 'Audio', Index: 1, DisplayTitle: 'English - AC3' },
     { Type: 'Audio', Index: 2, DisplayTitle: 'French - FLAC' },
-    { Type: 'Subtitle', Index: 3, DisplayTitle: 'French - SUBRIP', IsTextSubtitleStream: true },
-    { Type: 'Subtitle', Index: 4, DisplayTitle: 'English - ASS', IsTextSubtitleStream: true },
-    { Type: 'Subtitle', Index: 5, DisplayTitle: 'English - Sidecar', IsTextSubtitleStream: true, IsExternal: true },
+    { Type: 'Subtitle', Index: 3, DisplayTitle: 'Danish - SRT', Language: 'dan', Codec: 'srt', IsTextSubtitleStream: true },
+    { Type: 'Subtitle', Index: 4, DisplayTitle: 'English - embedded', Language: 'eng', Codec: process.env.FILM_SIM ? 'srt' : 'ass', IsTextSubtitleStream: true },
+    { Type: 'Subtitle', Index: 5, DisplayTitle: 'English - Sidecar', Language: 'eng', Codec: 'srt', IsHearingImpaired: true, IsTextSubtitleStream: true, IsExternal: true },
   ] }],
 });
 http.createServer((req, res) => {
@@ -41,7 +41,7 @@ http.createServer((req, res) => {
     let b = ''; req.on('data', (c) => b += c); req.on('end', () => { console.log('REPORT', u, b); res.writeHead(204); res.end(); }); return;
   }
   if (u.includes('/Subtitles/5/')) {
-    const b = '1\n00:00:08,000 --> 00:00:12,000\nSidecar subtitle\n';
+    const b = '1\n00:00:08,000 --> 00:00:12,000\nSidecar subtitle\n\n2\n00:00:20,000 --> 00:00:24,000\nA later subtitle\n';
     res.writeHead(200, { 'Content-Length': b.length }); return res.end(b);
   }
   if ((m = /^\/Videos\/([\w-]+)\/stream$/.exec(u)) && fs.existsSync(fileOf(m[1]))) {
