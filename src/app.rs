@@ -1,5 +1,6 @@
 //! The launcher's state: rows of cards, focus, the options menu, and one frame of drawing.
 mod accounts;
+mod search;
 use crate::avatars;
 use crate::data::{self, apply_debloat, boot_on, set_boot, Item, Kind, Luna, Prefs, Row, DEBLOAT};
 use crate::gfx::*;
@@ -117,11 +118,14 @@ enum Opt {
     ProfilePin(usize),
     RemovePin(usize),
     ClearPin(usize),
+    SearchEdit,
+    SearchHit(String, String),
     Close,
 }
 
 /// What a text prompt is asking for; the Xtream login takes three in a row.
 enum Ask {
+    Search,
     M3u,
     XtServer,
     XtUser(String),
@@ -143,6 +147,7 @@ struct Menu {
 
 enum Mode {
     Browse,
+    Search,
     Menu(Menu),
     Picker(Box<accounts::Picker>),
     /// Moving an app within its row; holds the order from before, for Back.
@@ -278,6 +283,8 @@ pub struct App {
     hbr_rx: Option<Receiver<String>>,
     /// First paint on the TV: apps and inputs are fetched on a thread.
     luna_rx: Option<Receiver<(Vec<u8>, Vec<u8>)>>,
+    tv_info: Option<[String; 2]>,
+    tv_info_rx: Option<Receiver<[String; 2]>>,
     bgl: Background,
     jf: Option<Jelly>,
     yt: Option<Yt>,
@@ -295,6 +302,8 @@ pub struct App {
     _prefetch_live: Arc<()>,
     /// The focus is on the tabs at the top.
     tabs_f: bool,
+    search_f: bool,
+    search: Option<search::Search>,
     tab_tex: HashMap<String, Option<Tex>>,
     /// Made when the first channel is played, and kept (see `player::Player`).
     player: Option<crate::player::Player>,
@@ -401,6 +410,8 @@ impl App {
             hbr: None,
             hbr_rx: None,
             luna_rx: None,
+            tv_info: None,
+            tv_info_rx: None,
             bgl: Background::new(wake),
             jf,
             yt: None,
@@ -410,6 +421,8 @@ impl App {
             libs: vec![],
             tab: String::new(),
             tabs_f: false,
+            search_f: false,
+            search: None,
             tab_tex: HashMap::new(),
             player: None,
             tv_note: None,
@@ -644,6 +657,7 @@ impl App {
             || self.px_pending
             || self.tv_pending
             || self.rm_rx.is_some()
+            || self.tv_info_rx.is_some()
             || matches!(&self.mode, Mode::Login(l) if l.busy())
     }
 
@@ -704,6 +718,11 @@ impl App {
                 "Receiver setup",
                 Icon::Audio,
                 "Configure the TV’s eARC support for lossless audio.",
+            ),
+            (
+                "Diagnostics",
+                Icon::Info,
+                "TV and launcher versions, and when libraries last refreshed.",
             ),
         ];
         if self.editing.is_none() && self.device_settings.is_none() {
@@ -936,9 +955,54 @@ impl App {
             })
             .collect::<Vec<_>>();
         let Some(i) = self.editing else {
+            let info = |i: usize| self.tv_info.as_ref().map_or("Reading…", |info| info[i].as_str());
+            let refresh = |signed_in: bool, source| {
+                if !signed_in {
+                    text("Not signed in")
+                } else {
+                    Value::Text(
+                        library::last_refresh(&self.profile_root, source)
+                            .and_then(local_date)
+                            .unwrap_or_else(|| "Not yet recorded".into()),
+                    )
+                }
+            };
+            let diagnostics = vec![
+                entry(
+                    Act::None,
+                    "Launcher",
+                    "Installed version of tvlauncher.",
+                    text(env!("CARGO_PKG_VERSION")),
+                ),
+                entry(Act::None, "TV model", "Model reported by webOS.", text(info(0))),
+                entry(
+                    Act::None,
+                    "Firmware",
+                    "Software version reported by the TV.",
+                    text(info(1)),
+                ),
+                entry(
+                    Act::None,
+                    "Jellyfin libraries",
+                    "Last completed refresh for this profile (TV local time).",
+                    refresh(self.jf.is_some(), library::JELLYFIN),
+                ),
+                entry(
+                    Act::None,
+                    "Plex libraries",
+                    "Last completed refresh for this profile (TV local time).",
+                    refresh(self.px.is_some(), library::PLEX),
+                ),
+            ];
             return device_sections
                 .into_iter()
-                .zip([youtube.into_iter().chain(tv).collect(), startup, privacy, receiver])
+                .zip([
+                    youtube.into_iter().chain(tv).collect(),
+                    startup,
+                    privacy,
+                    receiver,
+                    diagnostics,
+                ])
                 .map(|((name, icon, _), rows)| category(name, icon, rows))
                 .collect();
         };
@@ -1204,10 +1268,23 @@ impl App {
             return;
         }
         let tabs = self.tabs();
+        let origin = self.libs.iter().find_map(|l| {
+            l.views
+                .iter()
+                .find(|v| v.id == self.tab)
+                .map(|v| (l.plex, v.server.clone()))
+        });
         let tab = self.libs.iter_mut().find_map(|l| {
-            l.pages
-                .iter_mut()
-                .find_map(|(tab, p)| (tabs.iter().any(|(key, _)| key == tab) && p.focus_id(id)).then(|| tab.clone()))
+            l.views.iter().find_map(|v| {
+                if !tabs.iter().any(|(key, _)| *key == v.id)
+                    || origin
+                        .as_ref()
+                        .is_some_and(|(plex, server)| *plex != l.plex || *server != v.server)
+                {
+                    return None;
+                }
+                l.pages.get_mut(&v.id)?.focus_id(id).then(|| v.id.clone())
+            })
         });
         let Some(tab) = tab else {
             return log(&format!("player: no library tab has {id}"));
@@ -1675,6 +1752,13 @@ impl App {
             self.rm_rx = None;
             self.load();
         }
+        if let Some(Ok(info)) = self.tv_info_rx.as_ref().map(Receiver::try_recv) {
+            self.tv_info = Some(info);
+            self.tv_info_rx = None;
+            if self.device_settings.is_some() && matches!(self.mode, Mode::Settings(_)) {
+                self.show_settings();
+            }
+        }
         if let Some(rx) = &self.luna_rx {
             if let Ok(bytes) = rx.try_recv() {
                 self.luna_rx = None;
@@ -1723,19 +1807,22 @@ impl App {
             let Ok(path) = tv.logo_res.try_recv() else { break };
             tv.page.logo_saved(&path);
         }
-        let mut new_tabs = false;
+        let mut settings_changed = false;
         for i in 0..self.libs.len() {
             while let Ok(got) = self.libs[i].res.try_recv() {
                 match got {
                     library::Got::Views(views) => {
                         let lib = &mut self.libs[i];
-                        new_tabs |= lib
+                        settings_changed |= lib
                             .views
                             .iter()
                             .map(|v| (&v.id, &v.name))
                             .ne(views.iter().map(|v| (&v.id, &v.name)));
                         lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
                         lib.views = views;
+                    }
+                    library::Got::Refreshed => {
+                        settings_changed |= self.device_settings.is_some();
                     }
                     library::Got::Titles(view, titles, src) => {
                         // The server has just answered: a good time to save its title pages ahead of time.
@@ -1755,17 +1842,20 @@ impl App {
                 }
             }
         }
-        if new_tabs && matches!(self.mode, Mode::Settings(_)) {
+        if settings_changed && matches!(self.mode, Mode::Settings(_)) {
             self.show_settings();
         }
         let tabs = self.tabs();
-        if self.tabs_f && tabs.len() < 2 {
+        if (self.tabs_f && tabs.len() < 2) || (self.search_f && !self.can_search()) {
             self.tabs_f = false;
+            self.search_f = false;
             self.focus_top();
         }
         if !tabs.iter().any(|(k, _)| *k == self.tab) {
             self.tab = self.landing_tab();
-            self.detail = None;
+            if self.detail.take().is_some() {
+                self.return_to_search();
+            }
             self.detail_back.clear();
         }
         match self.detail.as_mut().and_then(|d| d.poll(&self.g)) {
@@ -1773,6 +1863,9 @@ impl App {
                 self.detail = None;
                 self.detail_back.clear();
                 self.open_in_app();
+                if self.detail.is_none() {
+                    self.return_to_search();
+                }
             }
             Some(false) => {
                 let libs = &self.libs;
@@ -2144,13 +2237,7 @@ impl App {
                 }
             }
         }
-        match &self.mode {
-            Mode::Menu(m) => draw_menu(g, m),
-            Mode::Login(l) => l.draw(g),
-            Mode::Settings(p) => p.draw(g),
-            Mode::Prompt(p, _) => p.draw(g),
-            _ => {}
-        }
+        self.draw_dialog();
     }
 
     /// The clock, the cog and, once live TV is set up, the Home and TV tabs.
@@ -2221,6 +2308,21 @@ impl App {
                 },
             );
         }
+        let search = self.can_search();
+        let sx = if self.manager() { cx - 84.0 } else { cx };
+        if search {
+            if self.search_f {
+                g.rounded(sx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, 1.0);
+            }
+            g.icon(
+                crate::icons::Icon::Search,
+                sx - 22.0,
+                cy - 22.0,
+                44.0,
+                if self.search_f { BLACK } else { DIM },
+                1.0,
+            );
+        }
         if tabs.len() < 2 {
             return;
         }
@@ -2233,7 +2335,7 @@ impl App {
         let texs: Vec<Option<&Tex>> = tabs.iter().map(|(_, n)| self.tab_tex[n].as_ref()).collect();
         let widths: Vec<f32> = texs.iter().map(|t| t.map_or(0.0, |t| t.w as f32) + 64.0).collect();
         let left = MARGIN + profile_width + 24.0;
-        let right = cx - 56.0;
+        let right = if search { sx } else { cx } - 56.0;
         let total = widths.iter().sum::<f32>() + 16.0 * (widths.len() - 1) as f32;
         let selected = tabs.iter().position(|(key, _)| *key == self.tab).unwrap_or(0);
         let before = widths[..selected].iter().map(|w| w + 16.0).sum::<f32>();
@@ -2278,6 +2380,11 @@ impl App {
         match &self.mode {
             Mode::Picker(p) => p.draw(g),
             Mode::Menu(m) => draw_menu(g, m),
+            Mode::Search => {
+                if let Some(s) = &self.search {
+                    draw_menu(g, &s.menu);
+                }
+            }
             Mode::Settings(p) => p.draw(g),
             Mode::Prompt(p, _) => p.draw(g),
             Mode::Login(l) => l.draw(g),
@@ -2311,12 +2418,14 @@ impl App {
 
     /// The focus is on the bar at the top: the tabs or the cog.
     fn top(&self) -> bool {
-        self.cog || self.tabs_f || self.profile_f
+        self.cog || self.tabs_f || self.profile_f || self.search_f
     }
 
     fn focus_top(&mut self) {
         if self.tabs().len() > 1 {
             self.tabs_f = true;
+        } else if self.can_search() {
+            self.search_f = true;
         } else if self.manager() {
             self.cog = true;
         } else if self.profiles.len() > 1 {
@@ -2337,6 +2446,23 @@ impl App {
             }
             return;
         }
+        if self.search_f {
+            if ok {
+                self.ask_search();
+            } else if dy > 0 {
+                self.search_f = false;
+            } else if dx > 0 && self.manager() {
+                self.search_f = false;
+                self.cog = true;
+            } else if dx < 0 && self.tabs().len() > 1 {
+                self.search_f = false;
+                self.tabs_f = true;
+            } else if dx < 0 && self.profiles.len() > 1 {
+                self.search_f = false;
+                self.profile_f = true;
+            }
+            return;
+        }
         if self.cog {
             if ok {
                 self.open_settings();
@@ -2344,7 +2470,9 @@ impl App {
                 self.cog = false;
             } else if dx < 0 {
                 self.cog = false;
-                if self.tabs().len() > 1 {
+                if self.can_search() {
+                    self.search_f = true;
+                } else if self.tabs().len() > 1 {
                     self.tabs_f = true;
                 } else if self.profiles.len() > 1 {
                     self.profile_f = true;
@@ -2361,7 +2489,10 @@ impl App {
         let tabs = self.tabs();
         let to = tabs.iter().position(|(k, _)| *k == self.tab).unwrap_or(0) as i32 + dx;
         if to >= tabs.len() as i32 {
-            if self.manager() {
+            if self.can_search() {
+                self.tabs_f = false;
+                self.search_f = true;
+            } else if self.manager() {
                 self.tabs_f = false;
                 self.cog = true;
             }
@@ -2488,6 +2619,15 @@ impl App {
             Act::ThisTv(section) => {
                 self.device_settings = Some(section);
                 self.load_hbr();
+                if self.tv_info.is_none() && self.tv_info_rx.is_none() {
+                    let (tx, rx) = channel();
+                    self.tv_info_rx = Some(rx);
+                    let (luna, wake) = (self.luna.clone(), self.wake);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(luna.tv_info());
+                        unsafe { SDL_PushEvent(&mut Event::new(wake)) };
+                    });
+                }
                 self.last_settings = (section, 0, false);
                 self.mode = Mode::Browse;
                 return self.show_settings();
@@ -2981,6 +3121,7 @@ impl App {
             }
         };
         match ask {
+            Ask::Search => return self.search_results(text),
             Ask::NewProfile(_) | Ask::ProfileName(_) | Ask::ProfilePin(_) | Ask::ConfirmPin(..) | Ask::Unlock(_) => {
                 return self.answer_account(ask, text)
             }
@@ -3121,12 +3262,13 @@ impl App {
         if !enter {
             self.ok_down = None;
         }
+        let top = self.top();
         match &mut self.mode {
             // The tabs or the cog over a title's page: Down or Back returns to the page, another tab closes it.
-            Mode::Browse if self.detail.is_some() && (self.tabs_f || self.cog || self.profile_f) => {
+            Mode::Browse if self.detail.is_some() && top => {
                 let tab = self.tab.clone();
                 if back {
-                    (self.tabs_f, self.cog, self.profile_f) = (false, false, false);
+                    (self.tabs_f, self.cog, self.profile_f, self.search_f) = (false, false, false, false);
                 } else {
                     self.top_key(dx, dy, ok);
                 }
@@ -3139,11 +3281,16 @@ impl App {
             }
             Mode::Browse if self.detail.is_some() => {
                 if dy < 0 && self.detail.as_ref().is_some_and(|d| d.at_top()) {
-                    self.focus_top();
+                    if self.search.is_none() {
+                        self.focus_top();
+                    }
                 } else if back {
                     match self.detail_back.pop() {
                         Some(prev) => self.go_to_page(&prev),
-                        None => self.detail = None,
+                        None => {
+                            self.detail = None;
+                            self.return_to_search();
+                        }
                     }
                     self.animating = true;
                 } else if ok {
@@ -3179,7 +3326,7 @@ impl App {
                     }
                 }
                 if back && self.top() {
-                    (self.tabs_f, self.cog, self.profile_f) = (false, false, false);
+                    (self.tabs_f, self.cog, self.profile_f, self.search_f) = (false, false, false, false);
                     return true;
                 }
                 if back {
@@ -3211,6 +3358,7 @@ impl App {
                     self.nav(dx, dy);
                 }
             }
+            Mode::Search => self.search_key(dy, ok, back),
             Mode::Picker(_) => self.picker_key(dx, dy, ok, back),
             Mode::Menu(m) => {
                 if back || options {
@@ -3237,6 +3385,8 @@ impl App {
                 Typed::Cancel => {
                     if let Ask::Unlock(i) = *ask {
                         self.choose_profile(i, "");
+                    } else if matches!(ask, Ask::Search) && self.search.is_some() {
+                        self.return_to_search();
                     } else {
                         self.close_dialog();
                     }
@@ -3446,6 +3596,8 @@ impl App {
         self.detail_back.clear();
         self.cog = false;
         self.tabs_f = false;
+        self.search_f = false;
+        self.search = None;
         self.tab = self.landing_tab();
         self.refresh_tv(false);
         self.load();
@@ -3529,6 +3681,24 @@ fn draw_menu(g: &Gfx, m: &Menu) {
             1.0,
         );
     }
+}
+
+fn local_date(time: std::time::SystemTime) -> Option<String> {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .try_into()
+        .ok()?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        return None;
+    }
+    let (year, month) = (tm.tm_year + 1900, tm.tm_mon + 1);
+    Some(format!(
+        "{year:04}-{month:02}-{:02} {:02}:{:02}",
+        tm.tm_mday, tm.tm_hour, tm.tm_min
+    ))
 }
 
 fn local_time() -> (i32, i32) {

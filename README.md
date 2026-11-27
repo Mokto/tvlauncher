@@ -13,12 +13,12 @@ Press Home to pick up where you left off on Jellyfin or Plex, see what’s on li
 ## What you can do
 
 - **Make Home yours.** Pin, reorder or hide apps, switch HDMI inputs, and choose which tabs appear, in what order, for each profile. Use the D-pad to move around and hold OK for an item’s menu. The Magic Remote’s pointer stays off; a click acts as OK.
-- **Browse Jellyfin and Plex without opening another app.** Resume from Home, where the focused episode shows its season and episode number. Browse poster libraries to explore seasons, episodes, cast and related titles. Cached rows stay visible when your server is asleep; tvlauncher doesn’t wake it.
+- **Browse Jellyfin and Plex without opening another app.** Resume from Home, where the focused episode shows its season and episode number. Use Search beside Settings to find titles across your visible libraries, even when the servers are offline. Browse poster libraries to explore seasons, episodes, cast and related titles. Cached rows stay visible when your server is asleep; tvlauncher doesn’t wake it.
 - **Play films and episodes in the launcher.** Get chapters, seek thumbnails, subtitle and audio controls, and skip or next-episode prompts when the server provides the relevant metadata. You can also open titles in an external app, such as Native Jelly or PlxNative.
 - **Send surround audio to your receiver.** The player supports AAC, Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3, including Atmos). Optional [passthrough](#dts-truehd-and-earc) sends DTS, DTS-HD Master Audio, DTS:X and Dolby TrueHD (including Atmos) to a compatible receiver. DTS:X, TrueHD and high-bitrate DTS-HD MA require the optional high-bitrate eARC module.
 - **Watch live TV from your own source.** Bring an M3U playlist or Xtream Codes login and an XMLTV guide. Browse what’s on now and next, favourite channels and watch in the built-in player. No channels are bundled.
 - **Give each viewer a profile.** Managers, Adults and Kids can have separate media sign-ins, tabs and playback preferences, with illustrated avatars and optional PINs. Managers can choose which apps Kids see.
-- **Keep shared settings separate.** Use **This TV** to manage startup, receiver setup, live sources, opt-in unofficial YouTube recommendations and optional blocking of LG ads and telemetry.
+- **Keep shared settings separate.** Use **This TV** to manage startup, receiver setup, live sources, opt-in unofficial YouTube recommendations and optional blocking of LG ads and telemetry. **Diagnostics** shows the TV model, firmware, launcher version and last completed library refreshes.
 
 ## Install on your TV
 
@@ -77,7 +77,7 @@ Edit profiles without switching viewers, or open **This TV** for settings shared
 
 ## Playing films
 
-The built-in player uses LG’s hardware decoder when the TV supports the stream. It can fall back to a server transcode rather than re-encoding the video on the TV. Direct Play supports compatible H.264, H.265, AV1 and VP9 streams, with HDR10 and supported Dolby Vision profiles. Subtitles include plain text, styled ASS/SSA and image-based tracks such as PGS on Direct Play. The film player runs in a separate process so a player crash doesn’t take down Home. See the [playback guide](docs/guide.md#playing-films) for format limits and controls.
+The built-in player uses LG’s hardware decoder when the TV supports the stream. It can fall back to a server transcode rather than re-encoding the video on the TV. Direct Play supports compatible H.264, H.265, AV1 and VP9 streams, with HDR10 and supported Dolby Vision profiles. Subtitles include plain text, styled ASS/SSA and image-based tracks such as PGS on Direct Play. The film player runs in a separate process so a player crash doesn’t take down Home. The player’s **Info** panel explains why the server is converting a title. See the [playback guide](docs/guide.md#playing-films) for format limits and controls.
 
 ### DTS, TrueHD and eARC
 
@@ -87,6 +87,6 @@ Enable **Profiles → [profile] → Playback → Lossless audio to a receiver** 
 
 ## Build and contribute
 
-See the [build and simulator guide](docs/guide.md#build-try-and-undo), [screenshot recipe](docs/guide.md#render-the-readme-screenshots), and [changelog](CHANGELOG.md). If you test on hardware, include the TV model and firmware; for eARC, include what your receiver reports as the input format.
+See the [build and simulator guide](docs/guide.md#build-try-and-undo), [screenshot recipe](docs/guide.md#render-the-readme-screenshots), [compatibility and hardware checklist](docs/compatibility.md), and [changelog](CHANGELOG.md). If you test on hardware, include the TV model and firmware; for eARC, include what your receiver reports as the input format.
 
 [GPL-3.0-or-later](LICENSE) · [Third-party notices](THIRD-PARTY-NOTICES.md)

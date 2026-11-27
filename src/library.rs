@@ -28,6 +28,7 @@ pub struct View {
     pub name: String,
     /// The Plex server's `machineIdentifier`, which PlxNative needs; empty for Jellyfin.
     pub server: String,
+    pub server_name: String,
     /// Where a Plex library's pictures come from (saved with the list, which is why that file is private); None
     /// for Jellyfin, whose address is in its login.
     pub src: Source,
@@ -133,6 +134,7 @@ pub struct Title {
 pub enum Got {
     Views(Vec<View>),
     Titles(String, Vec<Title>, Source),
+    Refreshed,
 }
 
 /// What a library holds, by its `CollectionType`; None for libraries that are not films or series (music,
@@ -277,6 +279,7 @@ pub fn cached_views(root: &str, pre: &str) -> Vec<View> {
                 id: v["id"].as_str()?.into(),
                 name: v["name"].as_str()?.into(),
                 server: v["server"].as_str().unwrap_or_default().into(),
+                server_name: v["serverName"].as_str().unwrap_or_default().into(),
                 src: match (v["base"].as_str(), v["token"].as_str()) {
                     (Some(base), Some(token)) => Source::Plex {
                         base: base.into(),
@@ -326,7 +329,7 @@ pub(crate) fn save_views(root: &str, pre: &str, views: &[View]) -> Result<(), St
         .iter()
         .map(|v| match &v.src {
             Source::Plex { base, token } => {
-                json!({ "id": v.id, "name": v.name, "server": v.server, "base": base, "token": token })
+                json!({ "id": v.id, "name": v.name, "server": v.server, "serverName": v.server_name, "base": base, "token": token })
             }
             _ => json!({ "id": v.id, "name": v.name, "server": v.server }),
         })
@@ -335,7 +338,7 @@ pub(crate) fn save_views(root: &str, pre: &str, views: &[View]) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
-pub(crate) fn save_titles(root: &str, pre: &str, view: &str, list: &[Title]) {
+pub(crate) fn save_titles(root: &str, pre: &str, view: &str, list: &[Title]) -> Result<(), String> {
     crate::sdl::log(&format!("library {pre}-{view}: {} titles", list.len()));
     // A shared name does not change with the picture: one the server changed is deleted, to be fetched again.
     let old = cached_titles(root, pre, view);
@@ -357,7 +360,16 @@ pub(crate) fn save_titles(root: &str, pre: &str, view: &str, list: &[Title]) {
                 "genres": t.genres, "poster": t.poster, "backdrop": t.backdrop, "key": t.key })
         })
         .collect();
-    let _ = std::fs::write(cache(root, pre, view), Value::from(v).to_string());
+    crate::data::write_private(&cache(root, pre, view), Value::from(v).to_string().as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn mark_refreshed(root: &str, pre: &str) -> Result<(), String> {
+    std::fs::write(cache(root, pre, "refreshed"), []).map_err(|e| e.to_string())
+}
+
+pub fn last_refresh(root: &str, pre: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(cache(root, pre, "refreshed")).ok()?.modified().ok()
 }
 
 /// True when the saved lists are young enough not to ask again.
@@ -384,10 +396,15 @@ pub(crate) fn prune(root: &str, pre: &str, keep: &HashSet<String>) {
         let id = rest
             .strip_suffix(".json")
             .or_else(|| rest.get(2..).and_then(|r| r.split('-').next()));
-        if id.is_some_and(|id| id != "views" && !keep.contains(id)) {
+        if id.is_some_and(|id| !matches!(id, "views" | "refreshed") && !keep.contains(id)) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+pub(crate) fn plex_cache_id(server: &str, id: &str) -> String {
+    let server: String = server.chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("{server}_{id}")
 }
 
 /// A film's or series' TMDB id as `tmdbm603` or `tmdbtv1668`, from a Jellyfin item (its `ProviderIds`) or Plex
@@ -438,13 +455,14 @@ pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool
     let v = parse(cfg.get(&format!("/Users/{}/Views", cfg.user_id))?)?;
     let views: Vec<(View, &str)> = v["Items"]
         .as_array()
-        .into_iter()
-        .flatten()
+        .ok_or("Jellyfin returned no library list")?
+        .iter()
         .filter_map(|o| {
             let view = View {
                 id: o["Id"].as_str()?.into(),
                 name: o["Name"].as_str()?.into(),
                 server: String::new(),
+                server_name: String::new(),
                 src: Source::None,
             };
             Some((view, types(o["CollectionType"].as_str())?))
@@ -465,11 +483,11 @@ pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool
         );
         let list: Vec<Title> = parse(cfg.get_within(&q, 60)?)?["Items"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .ok_or("Jellyfin returned no title list")?
+            .iter()
             .filter_map(title)
             .collect();
-        save_titles(root, JELLYFIN, &view.id, &list);
+        save_titles(root, JELLYFIN, &view.id, &list)?;
         keep.extend(list.iter().map(|t| t.id.clone()));
         keep.insert(view.id.clone());
         if !send(Got::Titles(view.id.clone(), list, Source::Jellyfin(cfg.server.clone()))) {
@@ -478,6 +496,8 @@ pub fn refresh(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bool
     }
     prune(root, JELLYFIN, &keep);
     crate::detail::prune_pictures(root);
+    mark_refreshed(root, JELLYFIN)?;
+    send(Got::Refreshed);
     Ok(())
 }
 
@@ -674,6 +694,10 @@ impl Page {
 
     pub fn source(&self) -> Source {
         self.src.clone()
+    }
+
+    pub fn titles(&self) -> &[Title] {
+        &self.titles
     }
 
     /// Puts the focus on the title `id` (in the grid, where every title is). Gives whether the page has it.
@@ -950,17 +974,36 @@ mod tests {
             "ImageTags": { "Primary": "old" }, "BackdropImageTags": ["bd"] }),
         )
         .unwrap();
-        save_titles(root, JELLYFIN, "v", std::slice::from_ref(&f));
+        save_titles(root, JELLYFIN, "v", std::slice::from_ref(&f)).unwrap();
         for k in ['p', 'b'] {
             std::fs::write(format!("{root}{DIR}/cache/t-{k}-tmdbm603.img"), "x").unwrap();
         }
         f.poster = Some("new".into());
-        save_titles(root, JELLYFIN, "v", &[f]);
+        save_titles(root, JELLYFIN, "v", &[f]).unwrap();
         let there = |k| std::path::Path::new(&format!("{root}{DIR}/cache/t-{k}-tmdbm603.img")).exists();
         assert_eq!((there('p'), there('b')), (false, true));
         let _ = std::fs::remove_dir_all(root);
         assert_eq!(types(Some("music")), None);
         assert_eq!(types(None), Some("Movie,Series"));
+    }
+
+    #[test]
+    fn completed_refresh_is_separate_from_the_cached_library_lists() {
+        let dir = std::env::temp_dir().join(format!("tvl-refresh-{}", std::process::id()));
+        let root = dir.to_str().unwrap();
+        save_views(root, JELLYFIN, &[]).unwrap();
+        assert!(last_refresh(root, JELLYFIN).is_none());
+        mark_refreshed(root, JELLYFIN).unwrap();
+        prune(root, JELLYFIN, &HashSet::new());
+        assert!(last_refresh(root, JELLYFIN).is_some());
+        assert!(last_refresh(root, PLEX).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plex_detail_keys_are_scoped_to_the_server() {
+        assert_ne!(plex_cache_id("first", "7"), plex_cache_id("second", "7"));
+        assert_eq!(plex_cache_id("../server", "7"), "server_7");
     }
 
     fn t(i: usize, genres: &[&str], played: bool) -> Title {

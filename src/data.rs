@@ -208,9 +208,29 @@ const INPUTS_URI: &str = "luna://com.webos.service.eim/getAllInputStatus";
 impl Luna {
     /// Raw reply from a luna call, or a fixture file in the simulator.
     pub fn fetch(&self, uri: &str) -> Vec<u8> {
+        self.fetch_with(uri, "{}")
+    }
+
+    pub fn tv_info(&self) -> [String; 2] {
+        let body = self.fetch_with(
+            "luna://com.webos.service.tv.systemproperty/getSystemInfo",
+            r#"{"keys":["modelName","firmwareVersion"]}"#,
+        );
+        let info: Value = serde_json::from_slice(&body).unwrap_or_default();
+        ["modelName", "firmwareVersion"].map(|key| {
+            info[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Unavailable")
+                .to_string()
+        })
+    }
+
+    fn fetch_with(&self, uri: &str, body: &str) -> Vec<u8> {
         if self.root.is_empty() {
             Command::new("/usr/bin/luna-send")
-                .args(["-n", "1", "-w", "5000", uri, "{}"])
+                .args(["-n", "1", "-w", "5000", uri, body])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
