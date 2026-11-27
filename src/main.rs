@@ -64,6 +64,9 @@ pub(crate) fn font(root: &str, name: &str, size: c_int) -> *mut Opaque {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let shot = (args.len() > 2 && args[1] == "--shot").then(|| args[2].clone());
+    let film_shot = args
+        .get(1)
+        .is_some_and(|a| matches!(a.as_str(), "--film-shot" | "--film-menu-shot"));
     let root = std::env::var("LAUNCHER_ROOT").unwrap_or_default();
     let on_tv = root.is_empty();
     if !on_tv && args.len() > 2 && args[1] == "--play" {
@@ -118,7 +121,7 @@ fn main() -> ExitCode {
             std::thread::park();
         }
     }
-    let started = start(&root, shot.is_some());
+    let started = start(&root, shot.is_some() || film_shot);
     let Some((win, ren)) = started else {
         if on_tv {
             lifecycle::note_failed_start();
@@ -136,16 +139,22 @@ fn main() -> ExitCode {
     if on_tv && std::path::Path::new(&format!("{DIR}/register")).exists() {
         lifecycle::register(wake);
     }
-    if args
-        .get(1)
-        .is_some_and(|a| a == "--film-shot" || a == "--film-menu-shot")
-    {
+    if film_shot {
         let what = match args.get(3) {
             Some(w) => w.as_str(),
             None if args[1] == "--film-menu-shot" => "options",
             None => "seek",
         };
-        player::film_shot(&g, what);
+        let backdrop = if let Some(path) = args.get(4) {
+            let Some(tex) = Surf::load(path).and_then(|s| Tex::new(ren, &s)) else {
+                log(&format!("film-shot: could not load {path}: {}", error()));
+                return ExitCode::FAILURE;
+            };
+            Some(tex)
+        } else {
+            None
+        };
+        player::film_shot(&g, what, backdrop.as_ref());
         return save_bmp(ren, args.get(2).map_or("build/film.bmp", String::as_str));
     }
     let list = match profiles::load(&root) {

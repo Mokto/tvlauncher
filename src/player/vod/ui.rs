@@ -1612,9 +1612,9 @@ pub fn up_frame(g: &Gfx, card: &mut UpCard, left: f32, of: f32) {
     unsafe { SDL_RenderPresent(g.ren) };
 }
 
-/// `--film-shot out.bmp [what]` on a desktop: the controls over a stand-in picture (no player). `what` is `seek` (a
-/// held seek), `seek-no-thumb`, `buttons`, `options`, `subs`, `info`, `next`, `load`, or `bitmap` / `bitmap-hidden`.
-pub fn shot(g: &Gfx, what: &str) {
+/// `--film-shot out.bmp [what] [backdrop]` draws the controls over a stand-in picture (no player).
+/// Modes: `seek`, `seek-no-thumb`, `buttons`, `options`, `subs`, `info`, `next`, `load`, `bitmap`, `bitmap-hidden`.
+pub fn shot(g: &Gfx, what: &str, backdrop: Option<&Tex>) {
     let it = Item {
         backend: film::Backend::Jellyfin(crate::jellyfin::Config::default()),
         audio: vec![],
@@ -1639,9 +1639,9 @@ pub fn shot(g: &Gfx, what: &str) {
         series: None,
         source: "s".into(),
         direct: String::new(),
-        name: "The Silent Harbour".into(),
-        sub: "Harbour Lights   S2 E5".into(),
-        total: 5400 * TICKS,
+        name: "The Martian".into(),
+        sub: String::new(),
+        total: 8640 * TICKS,
         resume: 0,
         session: String::new(),
     };
@@ -1716,16 +1716,23 @@ pub fn shot(g: &Gfx, what: &str) {
     let demo = |i| {
         Surf::load(&format!("{}{}/cache/bg-demo{i}.img", g.root, crate::data::DIR)).and_then(|s| Tex::new(g.ren, &s))
     };
-    if let Some(t) = demo(1) {
-        g.copy(&t, None, SCREEN);
+    let demo_bg = backdrop.is_none().then(|| demo(1)).flatten();
+    if let Some(t) = backdrop.or(demo_bg.as_ref()) {
+        g.copy(t, None, SCREEN);
     } else {
         g.fill(rgb(54, 78, 112), 1.0, SCREEN);
     }
-    let (w, h) = (320, 180);
-    let px: Vec<u8> = (0..w * h)
-        .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
-        .collect();
-    let thumb = demo(2).or_else(|| Tex::rgba(g.ren, w, h, &px));
+    let demo_thumb = (what == "seek" && backdrop.is_none())
+        .then(|| {
+            demo(2).or_else(|| {
+                let (w, h) = (320, 180);
+                let px: Vec<u8> = (0..w * h)
+                    .flat_map(|i| [(i % w * 255 / w) as u8, (i / w * 255 / h) as u8, 120, 255])
+                    .collect();
+                Tex::rgba(g.ren, w, h, &px)
+            })
+        })
+        .flatten();
     let seeking = matches!(what, "seek" | "seek-no-thumb").then_some(Seeking {
         to: 2410,
         from: 1234,
@@ -1775,7 +1782,7 @@ pub fn shot(g: &Gfx, what: &str) {
         shown: Some(&shown),
         menu: menu.as_ref(),
         skip: None,
-        thumb: thumb.as_ref().filter(|_| what == "seek"),
+        thumb: backdrop.or(demo_thumb.as_ref()).filter(|_| what == "seek"),
         ass: None,
         look,
         loading: (what == "load").then_some(Loading {
