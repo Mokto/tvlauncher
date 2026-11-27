@@ -29,6 +29,13 @@ impl Backend {
         matches!(self, Backend::Jellyfin(_))
     }
 
+    fn cache_id<'a>(&self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        match self {
+            Backend::Jellyfin(_) => id.into(),
+            Backend::Plex(_, server) => crate::library::plex_cache_id(server, id).into(),
+        }
+    }
+
     /// What the film player takes (`film::resolve`): a Jellyfin item id or `plex:<server>:<rating key>`, and
     /// `@0` to start at the beginning instead of the resume point.
     fn spec(&self, id: &str, from_start: bool) -> String {
@@ -169,7 +176,8 @@ pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, 
             let _ = tx.send(g);
             unsafe { SDL_PushEvent(&mut Event::new(wake)) };
         };
-        let file = page_file(&root, pre, &id);
+        let cache_id = b.cache_id(&id);
+        let file = page_file(&root, pre, &cache_id);
         let old = saved
             .then(|| std::fs::read(&file).ok())
             .flatten()
@@ -190,7 +198,7 @@ pub fn load(b: Backend, root: String, pre: &'static str, id: String, wake: u32, 
                 } else {
                     log(&format!("detail: {id} in {ms} ms"));
                     if let Some(old) = &old {
-                        drop_changed(&root, pre, &id, old, &got);
+                        drop_changed(&root, pre, &cache_id, old, &got);
                     }
                     let _ = std::fs::write(&file, v.to_string());
                     send(got);
@@ -223,7 +231,8 @@ pub fn prefetch(root: String, live: std::sync::Weak<()>) -> Sender<(Backend, &'s
                     break;
                 }
                 let cast = !free_mb(&root).is_some_and(|f| f < ARTWORK_ONLY_MB);
-                let file = page_file(&root, pre, id);
+                let cache_id = b.cache_id(id);
+                let file = page_file(&root, pre, &cache_id);
                 let age = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
                 let fresh = age.and_then(|t| t.elapsed().ok()).is_some_and(|a| a < DAY);
                 // A fresh page still gets the pictures it misses (a run cut short by a reboot leaves some).
@@ -238,7 +247,7 @@ pub fn prefetch(root: String, live: std::sync::Weak<()>) -> Sender<(Backend, &'s
                                 return;
                             }
                             if let Some(old) = &saved {
-                                drop_changed(&root, pre, id, &parse(b.jf(), old), &parse(b.jf(), &v));
+                                drop_changed(&root, pre, &cache_id, &parse(b.jf(), old), &parse(b.jf(), &v));
                             }
                             let _ = std::fs::write(&file, v.to_string());
                             pages += 1;
@@ -253,7 +262,7 @@ pub fn prefetch(root: String, live: std::sync::Weak<()>) -> Sender<(Backend, &'s
                 let Got::Loaded(info, seasons, next) = parse(b.jf(), &v) else {
                     continue;
                 };
-                for (url, path) in ahead(pre, id, &src, &info, seasons.get(next.0), &ids, cast) {
+                for (url, path) in ahead(pre, (id, &cache_id), &src, &info, seasons.get(next.0), &ids, cast) {
                     if live.strong_count() == 0 {
                         return;
                     }
@@ -354,14 +363,14 @@ fn make_room(root: &str) -> bool {
 /// row shows no others).
 fn ahead(
     pre: &str,
-    id: &str,
+    (id, cache_id): (&str, &str),
     src: &Source,
     info: &Info,
     season: Option<&Season>,
     library: &HashSet<String>,
     cast: bool,
 ) -> Vec<(String, String)> {
-    let file = |p: Pic| pic_file(pre, id, info, p);
+    let file = |p: Pic| pic_file(pre, cache_id, info, p);
     let mut out = vec![];
     if let Some(tag) = &info.logo {
         out.extend(src.logo(id, tag).zip(file(Pic::Logo)));
@@ -1978,7 +1987,7 @@ impl Page {
     /// Shows a change of watched state at once; the server is told by [`mark`].
     pub fn marked(&mut self, id: &str, played: bool) {
         // The saved copy is out of date now: the next visit waits for the server rather than show it.
-        let _ = std::fs::remove_file(page_file(&self.root, self.pre, &self.id));
+        let _ = std::fs::remove_file(page_file(&self.root, self.pre, &self.backend.cache_id(&self.id)));
         let whole = id == self.id;
         if whole {
             if let Some(i) = &mut self.info {
@@ -1997,7 +2006,7 @@ impl Page {
     }
 
     fn file(&self, pic: Pic) -> Option<String> {
-        pic_file(self.pre, &self.id, self.info.as_ref()?, pic)
+        pic_file(self.pre, &self.backend.cache_id(&self.id), self.info.as_ref()?, pic)
     }
 
     fn still_path(&self, e: &Ep) -> Option<String> {

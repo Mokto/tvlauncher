@@ -312,6 +312,7 @@ pub fn spawn(root: String, cfg: Config, wake: u32) -> (Sender<()>, Receiver<Opti
 
 struct Server {
     id: String,
+    name: String,
     token: String,
     urls: Vec<String>,
     owned: bool,
@@ -354,8 +355,8 @@ fn servers(cfg: &Config) -> Result<Vec<Server>, String> {
     )?;
     let mut all: Vec<&Value> = v
         .as_array()
-        .into_iter()
-        .flatten()
+        .ok_or("Plex returned no server list")?
+        .iter()
         .filter(|r| {
             r["provides"]
                 .as_str()
@@ -368,6 +369,7 @@ fn servers(cfg: &Config) -> Result<Vec<Server>, String> {
         .filter_map(|r| {
             Some(Server {
                 id: r["clientIdentifier"].as_str()?.into(),
+                name: r["name"].as_str().unwrap_or_default().into(),
                 token: r["accessToken"].as_str().unwrap_or(&cfg.token).into(),
                 urls: urls(r),
                 owned: r["owned"] == true,
@@ -573,6 +575,7 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
         let hit = server.urls.iter().find_map(|base| {
             get_json(&format!("{base}/library/sections"), &h(&server.token), TRY_SECS)
                 .ok()
+                .filter(|v| v["MediaContainer"]["Directory"].is_array() || v["MediaContainer"]["size"] == 0)
                 .map(|v| (base.clone(), v))
         });
         let Some((base, v)) = hit else {
@@ -590,6 +593,7 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
                 id,
                 name: name.into(),
                 server: server.id.clone(),
+                server_name: server.name.clone(),
                 src: library::Source::Plex {
                     base: base.clone(),
                     token: server.token.clone(),
@@ -615,14 +619,17 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
             &h(&token),
             60,
         )?;
-        let list: Vec<library::Title> = body["MediaContainer"]["Metadata"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(library::plex_title)
-            .collect();
-        library::save_titles(root, PLEX, &view.id, &list);
-        keep.extend(list.iter().map(|t| t.id.clone()));
+        let container = &body["MediaContainer"];
+        let list: Vec<library::Title> = match container["Metadata"].as_array() {
+            Some(items) => items.iter().filter_map(library::plex_title).collect(),
+            None if container["size"] == 0 => vec![],
+            None => return Err("Plex returned no title list".into()),
+        };
+        library::save_titles(root, PLEX, &view.id, &list)?;
+        keep.extend(
+            list.iter()
+                .flat_map(|t| [t.id.clone(), library::plex_cache_id(&view.server, &t.id)]),
+        );
         keep.insert(view.id.clone());
         if !send(Got::Titles(view.id, list, library::Source::Plex { base, token })) {
             return Ok(());
@@ -631,6 +638,8 @@ pub fn libraries(root: &str, cfg: &Config, force: bool, send: &dyn Fn(Got) -> bo
     if all {
         library::prune(root, PLEX, &keep);
         crate::detail::prune_pictures(root);
+        library::mark_refreshed(root, PLEX)?;
+        send(Got::Refreshed);
     }
     Ok(())
 }

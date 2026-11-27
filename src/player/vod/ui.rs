@@ -1687,6 +1687,19 @@ pub fn shot(g: &Gfx, what: &str, backdrop: Option<&Tex>) {
             focus(&mut osd, 0);
             Some(Menu::subs(g, &tracks, &choice, "eng"))
         }
+        "info-fallback" => {
+            focus(&mut osd, 4);
+            let lines = super::info_lines(
+                &super::Source::Server("No compatible audio track"),
+                &tracks,
+                &choice,
+                crate::ts::Codec::H265,
+                None,
+                crate::ff::lossless::Mode::Off,
+                1.5,
+            );
+            Some(Menu::info(g, "Go to series", lines, None))
+        }
         "info" => {
             focus(&mut osd, 4);
             let facts = [

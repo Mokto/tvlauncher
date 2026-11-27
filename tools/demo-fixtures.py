@@ -176,7 +176,7 @@ def main():
         root = Path(tmp)
         data = populate(root, args.regular.resolve(), args.bold.resolve())
         shots = {'home': '', 'movies': 'URD', 'shows': 'URRDRRRR', 'title': 'URDRRRRRO',
-                 'live-tv': 'URRRD', 'settings': 'URRRROLD'}
+                 'live-tv': 'URRRD', 'settings': 'URRRRROLD'}
         for name, keys in shots.items():
             render(root, binary, name, keys)
         render(root, binary, 'player', 'seek', data / 'cache/lib-b-movies5-demo.img', mode='--film-shot')

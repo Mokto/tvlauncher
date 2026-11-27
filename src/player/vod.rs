@@ -31,7 +31,7 @@ enum Vod {
     /// Start again at this place: a seek, or another track.
     Seek(i64),
     /// Carry on at this place with the server converting the film (the file cannot be played as it is).
-    Server(i64, String),
+    Server(i64, &'static str, String),
     /// The viewer took the next episode during the credits.
     Next,
     /// The viewer asked for the title's page (Info): stopped at this place.
@@ -78,7 +78,7 @@ const UP_SECS: i64 = 10;
 enum Source {
     /// The file, read in place; `audio` is the stream the player starts with.
     File(Demux),
-    Server,
+    Server(&'static str),
 }
 
 /// The media server only connects the decoder to the screen for an app it believes is in front.
@@ -129,21 +129,21 @@ impl Player {
         let mode = film::direct_mode();
         let forced = |why: &str| format!("Direct Play is forced, and this file cannot be played as it is: {why}");
         let mut src = if mode == 1 {
-            Source::Server
+            Source::Server("Direct Play is off in this profile")
         } else {
             match self.open_file(g, it, &mut osd) {
                 Ok(Some(d)) => Source::File(d),
                 Ok(None) => return (it.resume, After::Stopped),
-                Err(why) if mode == 2 => {
+                Err((_, why)) if mode == 2 => {
                     let p = match self.vod_fail(g, &mut osd, &forced(&why), it.resume) {
                         Vod::Exit(p, _) => p,
                         _ => it.resume,
                     };
                     return (p, After::Stopped);
                 }
-                Err(why) => {
+                Err((reason, why)) => {
                     log(&format!("film: the server will convert it: {why}"));
-                    Source::Server
+                    Source::Server(reason)
                 }
             }
         };
@@ -173,15 +173,15 @@ impl Player {
             fresh = false;
             match out {
                 Vod::Seek(t) => at = t,
-                Vod::Server(t, why) if mode == 2 => {
+                Vod::Server(t, _, why) if mode == 2 => {
                     break match self.vod_fail(g, &mut osd, &forced(&why), t) {
                         Vod::Exit(p, _) => (p, After::Stopped),
                         _ => (t, After::Stopped),
                     };
                 }
-                Vod::Server(t, why) => {
+                Vod::Server(t, reason, why) => {
                     log(&format!("film: the server converts it from here: {why}"));
-                    src = Source::Server;
+                    src = Source::Server(reason);
                     events.clear();
                     (choice.sub, at, fresh) = (choice.sub.filter(|s| s.server), t, true);
                 }
@@ -206,9 +206,8 @@ impl Player {
         (pos, after)
     }
 
-    /// Opens the file while the viewer waits. Ok(None) when Back was pressed meanwhile, Err(why) when the file
-    /// cannot be played as it is.
-    fn open_file(&mut self, g: &Gfx, it: &Item, osd: &mut Osd) -> Result<Option<Demux>, String> {
+    fn open_file(&mut self, g: &Gfx, it: &Item, osd: &mut Osd) -> Result<Option<Demux>, (&'static str, String)> {
+        const CANNOT_OPEN: &str = "Direct Play could not open the file";
         let url = it.direct.clone();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -220,12 +219,15 @@ impl Player {
                 return Ok(None);
             }
             match rx.try_recv() {
-                Ok(r) => break r?,
+                Ok(r) => break r.map_err(|e| (CANNOT_OPEN, e))?,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(_) => return Err("the demuxer stopped".into()),
+                Err(_) => return Err((CANNOT_OPEN, "the demuxer stopped".into())),
             }
             if t.elapsed() > Duration::from_secs(45) {
-                return Err("the server did not answer in time".into());
+                return Err((
+                    "The server took too long to send the file",
+                    "the server did not answer in time".into(),
+                ));
             }
             let loading = Some(Loading {
                 stage: "Opening the file",
@@ -243,14 +245,21 @@ impl Player {
                 },
             );
         };
-        d.info.plan(it.default_audio)?;
+        d.info.plan(it.default_audio).map_err(|e| {
+            let reason = if d.info.video.as_ref().is_none_or(|v| v.refused.is_some()) {
+                "No compatible video track"
+            } else {
+                "No compatible audio track"
+            };
+            (reason, e)
+        })?;
         Ok(Some(d))
     }
 
     /// A failure of the file played as it is hands the film to the server; a failure of that ends the viewing.
     fn or_server(&self, g: &Gfx, osd: &mut Osd, direct: bool, why: &str, at: i64) -> Vod {
         if direct {
-            Vod::Server(at, why.to_string())
+            Vod::Server(at, "The TV’s player could not play the file", why.to_string())
         } else {
             self.vod_fail(g, osd, why, at)
         }
@@ -293,7 +302,7 @@ impl Player {
                 }
                 t
             }
-            Source::Server => Tracks {
+            Source::Server(_) => Tracks {
                 audio: it
                     .audio
                     .iter()
@@ -376,7 +385,7 @@ impl Player {
                         .chain(it.subs.iter().filter(|s| s.external).map(|s| cand(s.index, Some(s))))
                         .collect(),
                 ),
-                Source::Server => (
+                Source::Server(_) => (
                     it.audio.iter().map(|a| cand(a.index, Some(a))).collect(),
                     it.subs.iter().map(|s| cand(s.index, Some(s))).collect(),
                 ),
@@ -384,7 +393,7 @@ impl Player {
             let want = film::pick::audio(&langs, &audio_cands, it.default_audio);
             choice.audio = match src {
                 Source::File(d) => d.info.plan(want).ok().map(i64::from),
-                Source::Server => want,
+                Source::Server(_) => want,
             };
             let audio_lang = audio_cands
                 .iter()
@@ -437,7 +446,7 @@ impl Player {
                     .map_or(lossless::Kind::Other, |a| a.kind);
                 lossless::arm(kind)
             }
-            Source::Server => lossless::arm(lossless::Kind::Other),
+            Source::Server(_) => lossless::arm(lossless::Kind::Other),
         };
         let run = match src {
             Source::File(d) => {
@@ -445,7 +454,7 @@ impl Player {
                 let sub = choice.sub.filter(|s| !s.server).map(|s| s.index as i32);
                 d.start(start * 100, audio, sub, lossless_mode)
             }
-            Source::Server => {
+            Source::Server(_) => {
                 let (url, skip) = film::hls_url(it, start, choice.audio);
                 hls_run(&url, skip as f64 / TICKS as f64)
             }
@@ -461,13 +470,17 @@ impl Player {
                     audio,
                     dv,
                 }) => break (v, audio, dv),
-                Some(Feed::End(e)) if direct => return Vod::Server(start, e),
+                Some(Feed::End(e)) if direct => return Vod::Server(start, "The file could not be read", e),
                 Some(Feed::End(e)) => return self.vod_fail(g, osd, &e, start),
                 _ => {}
             }
             if t.elapsed() > Duration::from_secs(60) {
                 return if direct {
-                    Vod::Server(start, "the file gave no picture in a minute".into())
+                    Vod::Server(
+                        start,
+                        "The file gave no picture",
+                        "the file gave no picture in a minute".into(),
+                    )
                 } else {
                     self.vod_fail(g, osd, "The server did not start the video within a minute.", start)
                 };
@@ -786,12 +799,16 @@ impl Player {
                                     Source::File(d) => {
                                         d.info.audio.iter().any(|a| i64::from(a.stream) == i && a.playable())
                                     }
-                                    Source::Server => true,
+                                    Source::Server(_) => true,
                                 };
                                 return if can {
                                     Vod::Seek(pos)
                                 } else {
-                                    Vod::Server(pos, "the TV cannot decode that audio track".into())
+                                    Vod::Server(
+                                        pos,
+                                        "The selected audio track is not supported",
+                                        "the TV cannot decode that audio track".into(),
+                                    )
                                 };
                             }
                             _ => {}
@@ -983,7 +1000,7 @@ impl Player {
                         }
                         Some(Feed::End(e)) if direct && !clock.running() => {
                             smp.retire();
-                            return Vod::Server(pos, e);
+                            return Vod::Server(pos, "The file could not be read", e);
                         }
                         Some(Feed::End(e)) => {
                             smp.retire();
@@ -1084,7 +1101,7 @@ impl Player {
             if !clock.running() && !paused && t.elapsed() > Duration::from_secs(40) {
                 smp.retire();
                 return if direct {
-                    Vod::Server(pos, "the file gave no pictures".into())
+                    Vod::Server(pos, "The file gave no picture", "the file gave no pictures".into())
                 } else {
                     self.vod_fail(g, osd, "The server sent no pictures.", start)
                 };
@@ -1281,7 +1298,7 @@ fn info_lines(
         .or(tracks.audio.first())
         .map_or("None".to_string(), |a| a.name.clone());
     let route = match (src, mode) {
-        (Source::Server, _) => "as the server sends it",
+        (Source::Server(_), _) => "as the server sends it",
         (_, lossless::Mode::TrueHd) => "unconverted to the receiver (TrueHD as MAT)",
         (_, lossless::Mode::Dts) => "unconverted to the receiver (DTS)",
         (_, lossless::Mode::DtsCore) => "the DTS core, unconverted to the receiver",
@@ -1298,14 +1315,15 @@ fn info_lines(
         0 => String::new(),
         d => format!("   ·   {:+.1} s", d as f64 / 1000.0),
     };
-    vec![
-        (
-            "Playing".into(),
-            match src {
-                Source::File(_) => "the file as it is (Direct Play)".into(),
-                Source::Server => "converted by the server".into(),
-            },
-        ),
+    let (delivery, reason) = match src {
+        Source::File(_) => ("the file as it is (Direct Play)", None),
+        Source::Server(reason) => ("converted by the server", Some(*reason)),
+    };
+    let mut lines = vec![("Playing".into(), delivery.into())];
+    if let Some(reason) = reason {
+        lines.push(("Why".into(), reason.into()));
+    }
+    lines.extend([
         (
             "Picture".into(),
             format!("{codec}   ·   {}x{}{range}", size >> 16, size & 0xffff),
@@ -1314,5 +1332,6 @@ fn info_lines(
         ("Sent".into(), route.into()),
         ("Subtitles".into(), format!("{sub}{timing}")),
         ("Buffered".into(), format!("{:.1} s ahead", ahead_s.max(0.0))),
-    ]
+    ]);
+    lines
 }

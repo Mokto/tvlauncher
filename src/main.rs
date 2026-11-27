@@ -276,7 +276,7 @@ pub(crate) fn start(root: &str, shot: bool) -> Option<(*mut Opaque, *mut Opaque)
     Some((win, ren))
 }
 
-/// A key press for `--shot`: R/L/U/D move, O is OK, M the options menu, B back, digits and a dot type.
+/// A key press for `--shot`: R/L/U/D move, O is OK, M the options menu, B back, lowercase letters and digits type.
 fn key_event(k: char) -> Event {
     let sym = match k {
         'R' => K_RIGHT,
@@ -285,7 +285,7 @@ fn key_event(k: char) -> Event {
         'D' => K_DOWN,
         'O' | 'H' => K_RETURN,
         'M' => K_M,
-        '0'..='9' | '.' | ':' => k as i32,
+        'a'..='z' | '0'..='9' | ' ' | '.' | ':' => k as i32,
         _ => K_ESCAPE,
     };
     let mut e = Event::new(KEYDOWN);
