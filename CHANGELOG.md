@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/Mokto/tvlauncher/compare/v0.5.0...v0.5.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* keep the FFmpeg source tarball in the CI cache and fail release without it ([#29](https://github.com/Mokto/tvlauncher/issues/29)) ([ca37183](https://github.com/Mokto/tvlauncher/commit/ca37183d68c02031659844b34be21ca69dfc8079))
+* turn the search bar into a plain heading and wrap result captions ([#27](https://github.com/Mokto/tvlauncher/issues/27)) ([a3e76c0](https://github.com/Mokto/tvlauncher/commit/a3e76c075e490abec963b436b774bf99f65ccd6e))
+
 ## [0.5.0](https://github.com/Mokto/tvlauncher/compare/v0.4.0...v0.5.0) (2026-11-28)
 
 
