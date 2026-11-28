@@ -89,7 +89,7 @@ release: arm $(FFMPEG_ARM) $(LIBASS_ARM) $(EARC_DIR)/earc_route-4.4.ko $(EARC_SR
 	tar -C build/libass-src -cJf dist/libass-sources.tar.xz .
 	cp $(HBR_FILES) dist/$(PKG)/hbr/
 	cp $(EARC_SRC) dist/$(PKG)/
-	cp build/ffmpeg-*.tar.xz dist/ 2>/dev/null || true
+	cp build/ffmpeg-*.tar.xz dist/
 	tar -C dist -czf dist/$(PKG).tar.gz $(PKG)
 	cd dist && shasum -a 256 $(PKG).tar.gz > $(PKG).tar.gz.sha256 && cat $(PKG).tar.gz.sha256
 
