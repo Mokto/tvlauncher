@@ -144,7 +144,7 @@ impl Prompt {
     }
 
     pub(crate) fn search(g: &Gfx) -> Self {
-        Self::make(g, "", "", "Search films and shows", "", false, Layout::Search)
+        Self::make(g, "", "", "", "", false, Layout::Search)
     }
 
     pub(crate) fn text(&self) -> &str {
@@ -223,6 +223,9 @@ impl Prompt {
     }
 
     fn field(&mut self, g: &Gfx) {
+        if self.search {
+            return;
+        }
         if self.pin.is_some() {
             self.field = if self.text.is_empty() {
                 g.text(g.f_sub, &self.hint, 0)
@@ -239,15 +242,12 @@ impl Prompt {
         // Long addresses show their end, where the typing is.
         let tail: String = {
             let c: Vec<char> = shown.chars().collect();
-            c[c.len().saturating_sub(if self.search { 28 } else { 56 })..]
-                .iter()
-                .collect()
+            c[c.len().saturating_sub(56)..].iter().collect()
         };
-        let font = if self.search { g.f_title } else { g.f_menu };
         self.field = if self.text.is_empty() {
-            g.text(font, &self.hint, 0)
+            g.text(g.f_menu, &self.hint, 0)
         } else {
-            g.text(font, &format!("{tail}_"), 0)
+            g.text(g.f_menu, &format!("{tail}_"), 0)
         };
     }
 
@@ -382,18 +382,6 @@ impl Prompt {
         g.put(self.field.as_ref(), px + 80.0, fy + (84.0 - fh) / 2.0, c, 1.0);
         let gw = 10.0 * KEY_W + 9.0 * KEY_GAP;
         self.draw_keys(g, (px + (PANEL_W - gw) / 2.0, fy + 110.0), (KEY_W, KEY_H), true);
-    }
-
-    pub(crate) fn draw_search_text(&self, g: &Gfx, x: f32, cy: f32, a: f32) {
-        if let Some(t) = &self.field {
-            g.put(
-                Some(t),
-                x,
-                cy - t.h as f32 / 2.0,
-                if self.text.is_empty() { DIM } else { TEXT },
-                a,
-            );
-        }
     }
 
     pub(crate) fn at_right_edge(&self) -> bool {

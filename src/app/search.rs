@@ -3,11 +3,16 @@ use crate::icons::Icon;
 
 const COLS: usize = 4;
 const VISIBLE: usize = 2 * COLS;
-const POSTER: (f32, f32) = (196.0, 294.0);
+const POSTER: (f32, f32) = (192.0, 288.0);
+const COL_STEP: f32 = 222.0;
+const ROW_STEP: f32 = 378.0;
+const CAPTION_WIDTH: f32 = COL_STEP - 12.0;
+const CAPTION_HEIGHT: f32 = ROW_STEP - POSTER.1 - 12.0;
 
 pub(super) struct Search {
     from_tab: String,
     keyboard: Prompt,
+    query_heading: Option<Tex>,
     heading: Option<Tex>,
     query: String,
     dirty: bool,
@@ -16,7 +21,7 @@ pub(super) struct Search {
     sel: Option<usize>,
     first: usize,
     origin: (f32, f32),
-    pub(super) expand: f32,
+    expand: f32,
 }
 
 struct Hit {
@@ -99,6 +104,19 @@ impl Search {
         }
     }
 
+    pub(super) fn animate(&mut self, dt: f32) -> bool {
+        self.expand = (self.expand + dt / 0.18).min(1.0);
+        let mut anim = self.expand < 1.0 || self.sel.is_some_and(|i| !self.cards.contains_key(&i));
+        for (&i, card) in &mut self.cards {
+            anim |= ease(&mut card.focus, f32::from(self.sel == Some(i)), dt, 36.0);
+        }
+        anim
+    }
+
+    pub(super) fn expanded(&self) -> bool {
+        self.expand == 1.0
+    }
+
     pub(super) fn draw(&mut self, g: &Gfx) {
         let p = self.expand;
         let t = 1.0 - (1.0 - p).powi(3);
@@ -113,19 +131,15 @@ impl Search {
             },
         );
         let mix = |a, b| a + (b - a) * t;
-        let x = mix(self.origin.0, MARGIN);
-        let y = mix(self.origin.1 - 32.0, 68.0);
-        let w = mix(64.0, W - 2.0 * MARGIN);
-        let h = mix(64.0, 102.0);
-        g.rounded(x, y, w, h, mix(32.0, 22.0), WHITE, 1.0 - 0.78 * t);
-        g.rounded(x + 2.0, y + 2.0, w - 4.0, h - 4.0, mix(30.0, 20.0), PANEL, t);
-        let cy = y + h / 2.0;
-        let ix = x + mix(13.0, 28.0);
-        let ink = if p < 0.15 { BLACK } else { TEXT };
+        let ix = mix(self.origin.0 + 13.0, MARGIN);
+        let cy = mix(self.origin.1, 119.0);
+        if p < 1.0 {
+            g.rounded(ix - 13.0, cy - 32.0, 64.0 + 48.0 * t, 64.0, 32.0, WHITE, 1.0 - t);
+        }
+        let ink = if t < 0.45 { BLACK } else { TEXT };
         g.icon(Icon::Search, ix, cy - 19.0, 38.0, ink, 1.0);
-        let label_alpha = ((t - 0.6) / 0.4).max(0.0);
-        if label_alpha > 0.0 {
-            self.keyboard.draw_search_text(g, x + 92.0, cy, label_alpha);
+        if let Some(title) = &self.query_heading {
+            g.put(Some(title), ix + mix(42.0, 62.0), cy - title.h as f32 / 2.0, TEXT, t);
         }
         if p < 1.0 {
             return;
@@ -134,36 +148,39 @@ impl Search {
         g.put(self.heading.as_ref(), rx, 220.0, TEXT, 1.0);
         self.keyboard
             .draw_keys(g, (MARGIN, 288.0), (68.0, 76.0), self.sel.is_none());
-        self.cards
-            .retain(|&i, _| (self.first..self.first + VISIBLE).contains(&i));
-        for (n, hit) in self.hits.iter().skip(self.first).take(VISIBLE).enumerate() {
-            let i = self.first + n;
-            let x = rx + (n % COLS) as f32 * 222.0;
-            let y = 288.0 + (n / COLS) as f32 * 378.0;
+        let visible = self.first..(self.first + VISIBLE).min(self.hits.len());
+        self.cards.retain(|&i, _| visible.contains(&i));
+        let focused = self.sel.filter(|i| visible.contains(i));
+        for i in visible.filter(|&i| focused != Some(i)).chain(focused) {
+            let hit = &self.hits[i];
+            let n = i - self.first;
+            let x = rx + (n % COLS) as f32 * COL_STEP;
+            let y = 288.0 + (n / COLS) as f32 * ROW_STEP;
             let card = self.cards.entry(i).or_insert_with(|| {
                 let mut card = Item::new(hit.id.clone(), String::new(), Kind::Watch, Some(hit.name.clone()));
                 card.cover = true;
                 card.color = PANEL;
                 card.icons.extend(hit.poster.iter().map(|(_, path)| path.clone()));
-                card.label = g.text(g.f_small, &jellyfin::clip(&hit.name, 24), POSTER.0 as u32 - 8);
-                card.hero = g.text(g.f_small, if hit.plex { "Plex" } else { "Jellyfin" }, 0);
+                card.label = g.text(g.f_small, &hit.name, POSTER.0 as u32 - 12);
                 card
             });
-            let on = self.sel == Some(i);
-            if on {
-                g.rounded(x - 5.0, y - 5.0, POSTER.0 + 10.0, POSTER.1 + 10.0, 14.0, WHITE, 1.0);
+            g.card(card, POSTER, x, y - 11.0 * card.focus, 1.0, 0.0);
+            if let Some(label) = card.label.as_ref().filter(|_| card.icon.is_some()) {
+                let (w, h) = (label.w as f32, label.h as f32);
+                // ponytail: unusually long captions shrink to fit; the title page has room for a larger label.
+                let scale = (CAPTION_WIDTH / w).min(CAPTION_HEIGHT / h).min(1.0);
+                g.tint(label, TEXT, 1.0);
+                g.copy(
+                    label,
+                    None,
+                    FRect {
+                        x,
+                        y: y + POSTER.1 + 9.0,
+                        w: w * scale,
+                        h: h * scale,
+                    },
+                );
             }
-            g.card(card, POSTER, x, y, 1.0, 0.0);
-            let label_y = y + POSTER.1 + 9.0;
-            let label = card.label.as_ref().filter(|t| card.icon.is_some() && t.h <= 64);
-            g.put(label, x, label_y, TEXT, 1.0);
-            g.put(
-                card.hero.as_ref(),
-                x,
-                label_y + label.map_or(0.0, |t| t.h as f32),
-                DIM,
-                1.0,
-            );
         }
     }
 }
@@ -173,6 +190,7 @@ impl App {
         self.search = Some(Search {
             from_tab: self.tab.clone(),
             keyboard: Prompt::search(&self.g),
+            query_heading: self.g.text(self.g.f_title, "Search films and shows", 0),
             heading: None,
             query: String::new(),
             dirty: true,
@@ -198,6 +216,12 @@ impl App {
         let query = s.keyboard.text().trim();
         let changed = query != s.query;
         if changed {
+            let title = if query.is_empty() {
+                "Search films and shows".into()
+            } else {
+                format!("Results for “{}”", jellyfin::clip(query, 32))
+            };
+            s.query_heading = self.g.text(self.g.f_title, &title, 0);
             s.query = query.to_string();
             s.sel = None;
             s.first = 0;

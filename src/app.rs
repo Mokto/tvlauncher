@@ -1990,8 +1990,7 @@ impl App {
             }
         }
         if let Some(s) = self.search.as_mut().filter(|_| matches!(self.mode, Mode::Search)) {
-            s.expand = (s.expand + dt / 0.18).min(1.0);
-            anim |= s.expand < 1.0;
+            anim |= s.animate(dt);
         }
         self.animating = anim || self.ok_down.is_some();
         if self.hint_options.is_none() {
@@ -2038,7 +2037,7 @@ impl App {
         if let Some(s) = self
             .search
             .as_mut()
-            .filter(|s| matches!(self.mode, Mode::Search) && s.expand == 1.0)
+            .filter(|s| matches!(self.mode, Mode::Search) && s.expanded())
         {
             return s.draw(g);
         }
