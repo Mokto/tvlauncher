@@ -32,7 +32,7 @@ Each film, series or collection library of the signed-in user gets a tab after H
 
 ### Search
 
-Press Up from the first row, then move Right to the magnifying glass beside Settings. With only one visible tab, Up goes directly to Search when a library is available. Enter a movie or show title on the on-screen keyboard and select **Done**. Results come from the active profile’s visible cached libraries, so searching doesn’t contact either server. Results identify their source and library; copies on different servers stay separate. Press OK to open a result, Back to return to the same results, or select **Edit search** to change the query. If more than 32 titles match, narrow the search.
+Press Up from the first row and move Left to the magnifying glass, always the first tab before Home. Press OK to expand the search field. Poster results update with each letter on the on-screen keyboard. Choose **Results**, or move Right from the edge of the keyboard, to browse the posters. OK opens a title; Back returns to the same results, then to the keyboard. Search matches the active profile’s visible cached libraries even offline. Missing posters load in the background if the server is available. Copies with the same TMDB movie or series ID appear once; titles without a shared ID stay separate to avoid merging remakes or unrelated shows. If more than 64 titles match, narrow the search.
 
 ## Profiles
 

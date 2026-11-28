@@ -68,6 +68,24 @@ const KEYS: [&[(&str, u32)]; 6] = [
     ],
     &[("Shift", 2), ("Space", 2), ("http://", 2), ("Delete", 2), ("Done", 2)],
 ];
+const SEARCH_KEYS: [&[(&str, u32)]; 5] = [
+    KEYS[0],
+    KEYS[1],
+    KEYS[2],
+    &[
+        ("z", 1),
+        ("x", 1),
+        ("c", 1),
+        ("v", 1),
+        ("b", 1),
+        ("n", 1),
+        ("m", 1),
+        ("æ", 1),
+        ("ø", 1),
+        ("å", 1),
+    ],
+    &[("Space", 4), ("Delete", 3), ("Results", 3)],
+];
 const PIN_KEYS: [&[(&str, u32)]; 4] = [
     &[("1", 1), ("2", 1), ("3", 1)],
     &[("4", 1), ("5", 1), ("6", 1)],
@@ -95,6 +113,12 @@ pub enum Typed {
     Done(String),
 }
 
+enum Layout {
+    Text,
+    Pin(usize, usize),
+    Search,
+}
+
 pub struct Prompt {
     title: Option<Tex>,
     body: Option<Tex>,
@@ -102,6 +126,7 @@ pub struct Prompt {
     text: String,
     /// Shown as stars.
     secret: bool,
+    search: bool,
     pin: Option<(usize, usize)>,
     shift: bool,
     sel: (usize, usize),
@@ -111,26 +136,30 @@ pub struct Prompt {
 
 impl Prompt {
     pub fn new(g: &Gfx, title: &str, body: &str, hint: &str, text: &str, secret: bool) -> Prompt {
-        Self::make(g, title, body, hint, text, secret, None)
+        Self::make(g, title, body, hint, text, secret, Layout::Text)
     }
 
     pub fn pin(g: &Gfx, title: &str, body: &str, hint: &str, avatar: usize, digits: usize) -> Self {
-        Self::make(g, title, body, hint, "", true, Some((avatar, digits)))
+        Self::make(g, title, body, hint, "", true, Layout::Pin(avatar, digits))
+    }
+
+    pub(crate) fn search(g: &Gfx) -> Self {
+        Self::make(g, "", "", "Search films and shows", "", false, Layout::Search)
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
 
     pub fn is_pin(&self) -> bool {
         self.pin.is_some()
     }
 
-    fn make(
-        g: &Gfx,
-        title: &str,
-        body: &str,
-        hint: &str,
-        text: &str,
-        secret: bool,
-        keypad: Option<(usize, usize)>,
-    ) -> Self {
+    fn make(g: &Gfx, title: &str, body: &str, hint: &str, text: &str, secret: bool, layout: Layout) -> Self {
+        let keypad = match layout {
+            Layout::Pin(avatar, digits) => Some((avatar, digits)),
+            _ => None,
+        };
         let pin = keypad.is_some();
         let mut p = Prompt {
             title: (!title.is_empty())
@@ -144,6 +173,7 @@ impl Prompt {
             hint: hint.to_string(),
             text: text.to_string(),
             secret,
+            search: matches!(layout, Layout::Search),
             pin: keypad,
             shift: false,
             sel: (usize::from(!pin), 0),
@@ -158,6 +188,8 @@ impl Prompt {
     fn layout(&self) -> &'static [&'static [(&'static str, u32)]] {
         if self.pin.is_some() {
             &PIN_KEYS
+        } else if self.search {
+            &SEARCH_KEYS
         } else {
             &KEYS
         }
@@ -207,18 +239,21 @@ impl Prompt {
         // Long addresses show their end, where the typing is.
         let tail: String = {
             let c: Vec<char> = shown.chars().collect();
-            c[c.len().saturating_sub(56)..].iter().collect()
+            c[c.len().saturating_sub(if self.search { 28 } else { 56 })..]
+                .iter()
+                .collect()
         };
+        let font = if self.search { g.f_title } else { g.f_menu };
         self.field = if self.text.is_empty() {
-            g.text(g.f_menu, &self.hint, 0)
+            g.text(font, &self.hint, 0)
         } else {
-            g.text(g.f_menu, &format!("{tail}_"), 0)
+            g.text(font, &format!("{tail}_"), 0)
         };
     }
 
     fn press(&mut self, g: &Gfx, key: &str) -> Typed {
         match key {
-            "Done" => return Typed::Done(self.text.trim().to_string()),
+            "Done" | "Results" => return Typed::Done(self.text.trim().to_string()),
             "Delete" => drop(self.text.pop()),
             "Space" => self.text.push(' '),
             "Shift" => {
@@ -251,8 +286,8 @@ impl Prompt {
         }
         let typed = u32::try_from(sym)
             .ok()
-            .filter(|c| (32..127).contains(c))
-            .and_then(char::from_u32);
+            .and_then(char::from_u32)
+            .filter(|c| (' '..='~').contains(c) || (self.search && c.is_alphanumeric()));
         if let Some(c) = typed {
             if self.text.len() < 400 && (self.pin.is_none() || c.is_ascii_digit()) {
                 self.text.push(c);
@@ -346,26 +381,51 @@ impl Prompt {
         let c = if self.text.is_empty() { DIM } else { TEXT };
         g.put(self.field.as_ref(), px + 80.0, fy + (84.0 - fh) / 2.0, c, 1.0);
         let gw = 10.0 * KEY_W + 9.0 * KEY_GAP;
+        self.draw_keys(g, (px + (PANEL_W - gw) / 2.0, fy + 110.0), (KEY_W, KEY_H), true);
+    }
+
+    pub(crate) fn draw_search_text(&self, g: &Gfx, x: f32, cy: f32, a: f32) {
+        if let Some(t) = &self.field {
+            g.put(
+                Some(t),
+                x,
+                cy - t.h as f32 / 2.0,
+                if self.text.is_empty() { DIM } else { TEXT },
+                a,
+            );
+        }
+    }
+
+    pub(crate) fn at_right_edge(&self) -> bool {
+        self.sel.1 + 1 == self.layout()[self.sel.0].len()
+    }
+
+    pub(crate) fn draw_keys(&self, g: &Gfx, origin: (f32, f32), size: (f32, f32), active: bool) {
+        let (kw, kh) = size;
         for (r, row) in self.layout().iter().enumerate() {
-            let y = fy + 110.0 + r as f32 * (KEY_H + KEY_GAP);
-            let mut x = px + (PANEL_W - gw) / 2.0;
+            let y = origin.1 + r as f32 * (kh + KEY_GAP);
+            let mut x = origin.0;
             for (i, (k, span)) in row.iter().enumerate() {
-                let w = *span as f32 * KEY_W + (*span as f32 - 1.0) * KEY_GAP;
-                let on = self.sel == (r, i);
+                let w = *span as f32 * kw + (*span as f32 - 1.0) * KEY_GAP;
+                let on = active && self.sel == (r, i);
                 let lit = *k == "Shift" && self.shift;
                 let fill = if on {
                     WHITE
                 } else if lit {
                     DIM
                 } else {
-                    BG
+                    if self.search {
+                        PANEL
+                    } else {
+                        BG
+                    }
                 };
-                g.rounded(x, y, w, KEY_H, 16.0, fill, 1.0);
+                g.rounded(x, y, w, kh, if self.search { 12.0 } else { 16.0 }, fill, 1.0);
                 if let Some(t) = &self.keys[r][i] {
                     g.put(
                         Some(t),
                         x + (w - t.w as f32) / 2.0,
-                        y + (KEY_H - t.h as f32) / 2.0,
+                        y + (kh - t.h as f32) / 2.0,
                         if on { BLACK } else { TEXT },
                         1.0,
                     );
