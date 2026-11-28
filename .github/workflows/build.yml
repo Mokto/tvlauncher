@@ -70,7 +70,9 @@ jobs:
         id: ffmpeg
         uses: actions/cache@v4
         with:
-          path: build/ffmpeg-arm
+          path: |
+            build/ffmpeg-arm
+            build/ffmpeg-*.tar.xz
           key: ffmpeg-arm-${{ hashFiles('tools/build-ffmpeg.sh') }}
 
       - name: FFmpeg for the TV (build)
