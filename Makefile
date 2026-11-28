@@ -40,10 +40,26 @@ $(LIBASS_ARM):
 libass-host:
 	sh tools/build-libass.sh host
 
-# The kernel module that lets the film player send TrueHD and full-rate DTS-HD to a receiver (vendor/earc_route).
-HBR_FILES = vendor/earc_route/out/earc_route-4.4.ko vendor/earc_route/earc-route-load.sh hbr/hbr.sh
+# The kernel module that lets the film player send TrueHD and full-rate DTS-HD to a receiver: a release of
+# https://github.com/Mokto/earc_route (GPL-2.0-only), pinned by SHA-256, with its source for the package.
+EARC_VER     = 0.1.0
+EARC_TGZ_SHA = 1c32b01fb30a9d365b51ed0b540c83a6dae045ffae49642176391d9bd03559f5
+EARC_SRC_SHA = 39de8a35e416cb7cc663b6cbf97370743540d6cf1f6f8936752fb2e01c614eb6
+EARC_URL     = https://github.com/Mokto/earc_route/releases/download/v$(EARC_VER)
+EARC_DIR     = build/earc-route-hbr-$(EARC_VER)
+EARC_SRC     = build/earc_route-$(EARC_VER)-source.tar.gz
+$(EARC_DIR)/earc_route-4.4.ko:
+	mkdir -p build
+	curl -fL --retry 3 --retry-all-errors -o build/earc-route-hbr.tar.gz $(EARC_URL)/earc-route-hbr-$(EARC_VER).tar.gz
+	echo "$(EARC_TGZ_SHA)  build/earc-route-hbr.tar.gz" | shasum -a 256 -c -
+	tar -C build -xzf build/earc-route-hbr.tar.gz
+$(EARC_SRC):
+	mkdir -p build
+	curl -fL --retry 3 --retry-all-errors -o $@ $(EARC_URL)/earc_route-$(EARC_VER)-source.tar.gz
+	echo "$(EARC_SRC_SHA)  $@" | shasum -a 256 -c -
+HBR_FILES = $(EARC_DIR)/* hbr/hbr.sh
 
-deploy: arm $(FFMPEG_ARM) $(LIBASS_ARM)
+deploy: arm $(FFMPEG_ARM) $(LIBASS_ARM) $(EARC_DIR)/earc_route-4.4.ko
 	ssh $(TV) 'mkdir -p $(DEST)/lib $(DEST)/hbr && rm -f $(DEST)/tvlauncher.new'
 	scp $(ARM_BIN) $(TV):$(DEST)/tvlauncher.new
 	scp takeover.sh debloat.sh boot.sh $(TV):$(DEST)/
@@ -66,13 +82,13 @@ off: ; ssh $(TV) sh $(DEST)/takeover.sh off
 # A package for people without the toolchain: the prebuilt binary, the scripts and install.sh.
 VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 PKG     = tvlauncher-$(VERSION)-webos-arm
-release: arm $(FFMPEG_ARM) $(LIBASS_ARM)
+release: arm $(FFMPEG_ARM) $(LIBASS_ARM) $(EARC_DIR)/earc_route-4.4.ko $(EARC_SRC)
 	rm -rf dist/$(PKG) && mkdir -p dist/$(PKG)/lib dist/$(PKG)/hbr
 	cp $(ARM_BIN) takeover.sh debloat.sh boot.sh install.sh LICENSE README.md THIRD-PARTY-NOTICES.md dist/$(PKG)/
 	cp build/ffmpeg-arm/*.so.* $(LIBASS_ARM) dist/$(PKG)/lib/
 	tar -C build/libass-src -cJf dist/libass-sources.tar.xz .
 	cp $(HBR_FILES) dist/$(PKG)/hbr/
-	cp -R vendor/earc_route dist/$(PKG)/earc_route-source
+	cp $(EARC_SRC) dist/$(PKG)/
 	cp build/ffmpeg-*.tar.xz dist/ 2>/dev/null || true
 	tar -C dist -czf dist/$(PKG).tar.gz $(PKG)
 	cd dist && shasum -a 256 $(PKG).tar.gz > $(PKG).tar.gz.sha256 && cat $(PKG).tar.gz.sha256

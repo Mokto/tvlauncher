@@ -58,13 +58,14 @@ and [PLX Native](https://github.com/GLinnik21/plx-native) by GLinnik21 (both GPL
 
 ## earc_route (kernel module for HBR audio)
 
-`hbr/earc_route-4.4.ko` is the **GPL-2.0-only** Linux kernel module `earc_route` of Native Jelly's pull request 46, from
-[dts_restore_plus](https://github.com/josippapez/dts_restore_plus) `e42c98e` plus Native Jelly's hooks, which in turn
-derives from Glasshouse's native-route and lg-g5-dts (see `vendor/earc_route/NOTICE`). It is a separate program: the
-launcher never links it, and it only loads when the owner installs it from Settings (`hbr/hbr.sh`). The complete
-corresponding source, the build scripts, the patch, `LICENSE` and `NOTICE` are in `vendor/earc_route/` of the repository
-and in `earc_route-source/` of the package. It is built for webOS 6 kernel 4.4.84; the loader and the module refuse
-anything else. It contains no LG code.
+`hbr/earc_route-4.4.ko` is the **GPL-2.0-only** Linux kernel module `earc_route`, from
+[Mokto/earc_route](https://github.com/Mokto/earc_route) (a release pinned by SHA-256 in the `Makefile`). It is
+[dts_restore_plus](https://github.com/josippapez/dts_restore_plus) `e42c98e` plus the HBR hooks first written for Native
+Jelly's pull request 46, which in turn derives from Glasshouse's native-route and lg-g5-dts (see `NOTICE` in `hbr/`). It is
+a separate program: the launcher never links it, and it only loads when the owner installs it from Settings (`hbr/hbr.sh`,
+which runs the release's `earc-route-hbr.sh`). The complete corresponding source, the build scripts, `LICENSE` and `NOTICE`
+are in `earc_route-<version>-source.tar.gz` in the package. It is built for webOS 6 kernel 4.4.84; the loader and the module
+refuse anything else. It contains no LG code.
 
 ## Luma (idea only)
 

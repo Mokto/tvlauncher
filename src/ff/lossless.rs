@@ -16,7 +16,7 @@
 //! IV bursts ([`Packer`]), or TrueHD as MAT bursts cut into carrier chunks ([`Mat`]). [`es_swap`] points each LG write
 //! at the next queued chunk, so the receiver gets the bitstream while LG keeps timing, A/V sync, pause and seek as
 //! for a DD+ title. With the HBR lease ([`set_on`]) LG runs the link at 8 channels x 192 kHz and every chunk is four
-//! times larger, which TrueHD and full-rate DTS-HD need (`vendor/earc_route`, a kernel module).
+//! times larger, which TrueHD and full-rate DTS-HD need (`hbr/`, the earc_route kernel module).
 //!
 //! The older route, [`dts_core_packet`] + [`dts_iec61937`], sends the DTS core alone as IEC 61937 bursts declared
 //! `PCM`, which any receiver on optical or ARC takes.
@@ -33,7 +33,7 @@ pub const CHUNK: usize = 24576;
 const BURST: usize = 8192;
 /// HBR (8 ch x 192 kHz, 4x the stereo carrier): a 32768-byte burst per DTS-HD frame (repetition
 /// period 8192, subtype 4) and 98304 bytes per LG write. Needs the earc_route kernel module
-/// (`vendor/earc_route`), whose hooks widen LG's eARC link to 8 channels while this process holds
+/// (the earc_route release in `hbr/`), whose hooks widen LG's eARC link to 8 channels while this process holds
 /// its lease.
 const HBR: usize = 4;
 /// A silent 48 kHz stereo E-AC-3 frame (1536 samples, 96 kb/s), made with
