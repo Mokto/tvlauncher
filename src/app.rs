@@ -118,14 +118,11 @@ enum Opt {
     ProfilePin(usize),
     RemovePin(usize),
     ClearPin(usize),
-    SearchEdit,
-    SearchHit(String, String),
     Close,
 }
 
 /// What a text prompt is asking for; the Xtream login takes three in a row.
 enum Ask {
-    Search,
     M3u,
     XtServer,
     XtUser(String),
@@ -303,6 +300,7 @@ pub struct App {
     /// The focus is on the tabs at the top.
     tabs_f: bool,
     search_f: bool,
+    search_origin: (f32, f32),
     search: Option<search::Search>,
     tab_tex: HashMap<String, Option<Tex>>,
     /// Made when the first channel is played, and kept (see `player::Player`).
@@ -422,6 +420,7 @@ impl App {
             tab: String::new(),
             tabs_f: false,
             search_f: false,
+            search_origin: (MARGIN, 76.0),
             search: None,
             tab_tex: HashMap::new(),
             player: None,
@@ -1222,6 +1221,9 @@ impl App {
         }
         lib.pages.insert(view.to_string(), page);
         lib.asked.clear();
+        if let Some(s) = &mut self.search {
+            s.invalidate();
+        }
     }
 
     /// How a title page of library `view` reaches its server.
@@ -1820,6 +1822,9 @@ impl App {
                             .ne(views.iter().map(|v| (&v.id, &v.name)));
                         lib.pages.retain(|id, _| views.iter().any(|v| v.id == *id));
                         lib.views = views;
+                        if let Some(s) = &mut self.search {
+                            s.invalidate();
+                        }
                     }
                     library::Got::Refreshed => {
                         settings_changed |= self.device_settings.is_some();
@@ -1846,11 +1851,6 @@ impl App {
             self.show_settings();
         }
         let tabs = self.tabs();
-        if (self.tabs_f && tabs.len() < 2) || (self.search_f && !self.can_search()) {
-            self.tabs_f = false;
-            self.search_f = false;
-            self.focus_top();
-        }
         if !tabs.iter().any(|(k, _)| *k == self.tab) {
             self.tab = self.landing_tab();
             if self.detail.take().is_some() {
@@ -1882,8 +1882,12 @@ impl App {
             None => {}
         }
         let tab = self.tab.clone();
+        self.update_search();
         for lib in &mut self.libs {
             while let Ok(path) = lib.saved.try_recv() {
+                if let Some(s) = &mut self.search {
+                    s.saved(&path);
+                }
                 if let Some(p) = lib.pages.get_mut(&tab) {
                     p.saved(&path);
                 }
@@ -1891,7 +1895,9 @@ impl App {
                     d.saved(&path);
                 }
             }
-            if let Some(p) = lib.pages.get(&tab) {
+            if let Some(s) = self.search.as_ref().filter(|_| matches!(self.mode, Mode::Search)) {
+                s.pictures(lib);
+            } else if let Some(p) = lib.pages.get(&tab) {
                 let asked = match &self.detail {
                     Some(d) => d.wanted_key(),
                     None => format!("{tab}/{}", p.title().map_or("", |t| t.id.as_str())),
@@ -1983,6 +1989,10 @@ impl App {
                 );
             }
         }
+        if let Some(s) = self.search.as_mut().filter(|_| matches!(self.mode, Mode::Search)) {
+            s.expand = (s.expand + dt / 0.18).min(1.0);
+            anim |= s.expand < 1.0;
+        }
         self.animating = anim || self.ok_down.is_some();
         if self.hint_options.is_none() {
             self.hint_options = self.g.text(self.g.f_label, "Hold OK for app options", 0);
@@ -2010,6 +2020,7 @@ impl App {
                 },
             );
             self.draw_dialog();
+            let g = &self.g;
             if let Some(t) = &self.settings_context {
                 let w = t.w as f32 + 48.0;
                 g.rounded(W - MARGIN - w, 50.0, w, 62.0, 31.0, PANEL, 1.0);
@@ -2023,6 +2034,13 @@ impl App {
         unsafe {
             SDL_SetRenderDrawColor(g.ren, BG.r, BG.g, BG.b, 255);
             SDL_RenderClear(g.ren);
+        }
+        if let Some(s) = self
+            .search
+            .as_mut()
+            .filter(|s| matches!(self.mode, Mode::Search) && s.expand == 1.0)
+        {
+            return s.draw(g);
         }
         let glow = Color {
             r: self.glow[0] as u8,
@@ -2308,41 +2326,41 @@ impl App {
                 },
             );
         }
-        let search = self.can_search();
-        let sx = if self.manager() { cx - 84.0 } else { cx };
-        if search {
-            if self.search_f {
-                g.rounded(sx - 36.0, cy - 36.0, 72.0, 72.0, 36.0, WHITE, 1.0);
-            }
-            g.icon(
-                crate::icons::Icon::Search,
-                sx - 22.0,
-                cy - 22.0,
-                44.0,
-                if self.search_f { BLACK } else { DIM },
-                1.0,
-            );
-        }
-        if tabs.len() < 2 {
-            return;
-        }
         for (_, name) in &tabs {
             if !self.tab_tex.contains_key(name) {
                 self.tab_tex
-                    .insert(name.clone(), g.text(g.f_row, &jellyfin::clip(name, 36), 0));
+                    .insert(name.clone(), g.text(g.f_row, &jellyfin::clip(name, 28), 420));
             }
         }
         let texs: Vec<Option<&Tex>> = tabs.iter().map(|(_, n)| self.tab_tex[n].as_ref()).collect();
         let widths: Vec<f32> = texs.iter().map(|t| t.map_or(0.0, |t| t.w as f32) + 64.0).collect();
         let left = MARGIN + profile_width + 24.0;
-        let right = if search { sx } else { cx } - 56.0;
-        let total = widths.iter().sum::<f32>() + 16.0 * (widths.len() - 1) as f32;
-        let selected = tabs.iter().position(|(key, _)| *key == self.tab).unwrap_or(0);
+        let right = cx - 56.0;
+        let total = widths.iter().map(|w| w + 16.0).sum::<f32>() + 64.0;
+        let sx = ((W - total) / 2.0).max(left);
+        self.search_origin = (sx, cy);
+        if self.search_f {
+            g.rounded(sx, cy - 32.0, 64.0, 64.0, 32.0, WHITE, 1.0);
+        }
+        g.icon(
+            crate::icons::Icon::Search,
+            sx + 13.0,
+            cy - 19.0,
+            38.0,
+            if self.search_f { BLACK } else { DIM },
+            1.0,
+        );
+        if tabs.is_empty() {
+            return;
+        }
+        let left = sx + 80.0;
+        let selected = if self.search_f {
+            0
+        } else {
+            tabs.iter().position(|(key, _)| *key == self.tab).unwrap_or(0)
+        };
         let before = widths[..selected].iter().map(|w| w + 16.0).sum::<f32>();
-        let mut x = ((W - total) / 2.0)
-            .max(left)
-            .min(right - before - widths[selected])
-            .max(left - before);
+        let mut x = left.min(right - before - widths[selected]).max(left - before);
         for (i, t) in texs.into_iter().enumerate() {
             if i != selected && (x < left || x + widths[i] > right) {
                 x += widths[i] + 16.0;
@@ -2375,14 +2393,14 @@ impl App {
     }
 
     /// The menu, settings, prompt or sign-in over a tab other than Home.
-    fn draw_dialog(&self) {
+    fn draw_dialog(&mut self) {
         let g = &self.g;
         match &self.mode {
             Mode::Picker(p) => p.draw(g),
             Mode::Menu(m) => draw_menu(g, m),
             Mode::Search => {
-                if let Some(s) = &self.search {
-                    draw_menu(g, &s.menu);
+                if let Some(s) = &mut self.search {
+                    s.draw(g);
                 }
             }
             Mode::Settings(p) => p.draw(g),
@@ -2422,18 +2440,9 @@ impl App {
     }
 
     fn focus_top(&mut self) {
-        if self.tabs().len() > 1 {
-            self.tabs_f = true;
-        } else if self.can_search() {
-            self.search_f = true;
-        } else if self.manager() {
-            self.cog = true;
-        } else if self.profiles.len() > 1 {
-            self.profile_f = true;
-        }
+        self.tabs_f = true;
     }
 
-    /// The keys while the focus is on the top bar: Left and Right go through the tabs and on to the cog.
     fn top_key(&mut self, dx: i32, dy: i32, ok: bool) {
         if self.profile_f {
             if ok {
@@ -2442,21 +2451,21 @@ impl App {
                 self.profile_f = false;
             } else if dx > 0 {
                 self.profile_f = false;
-                self.focus_top();
+                self.search_f = true;
             }
             return;
         }
         if self.search_f {
             if ok {
-                self.ask_search();
+                self.open_search();
             } else if dy > 0 {
                 self.search_f = false;
-            } else if dx > 0 && self.manager() {
-                self.search_f = false;
-                self.cog = true;
-            } else if dx < 0 && self.tabs().len() > 1 {
+            } else if dx > 0 {
                 self.search_f = false;
                 self.tabs_f = true;
+                if let Some((key, _)) = self.tabs().into_iter().next() {
+                    self.select_tab(key);
+                }
             } else if dx < 0 && self.profiles.len() > 1 {
                 self.search_f = false;
                 self.profile_f = true;
@@ -2470,15 +2479,7 @@ impl App {
                 self.cog = false;
             } else if dx < 0 {
                 self.cog = false;
-                if self.can_search() {
-                    self.search_f = true;
-                } else if self.tabs().len() > 1 {
-                    self.tabs_f = true;
-                } else if self.profiles.len() > 1 {
-                    self.profile_f = true;
-                } else {
-                    self.cog = true;
-                }
+                self.tabs_f = true;
             }
             return;
         }
@@ -2489,20 +2490,21 @@ impl App {
         let tabs = self.tabs();
         let to = tabs.iter().position(|(k, _)| *k == self.tab).unwrap_or(0) as i32 + dx;
         if to >= tabs.len() as i32 {
-            if self.can_search() {
-                self.tabs_f = false;
-                self.search_f = true;
-            } else if self.manager() {
+            if self.manager() {
                 self.tabs_f = false;
                 self.cog = true;
             }
         } else if to < 0 {
-            if self.profiles.len() > 1 {
-                self.tabs_f = false;
-                self.profile_f = true;
-            }
-        } else {
-            self.tab = tabs[to as usize].0.clone();
+            self.tabs_f = false;
+            self.search_f = true;
+        } else if dx != 0 {
+            self.select_tab(tabs[to as usize].0.clone());
+        }
+    }
+
+    fn select_tab(&mut self, key: String) {
+        if self.tab != key {
+            self.tab = key;
             if let Some(lib) = self.libs.iter().find(|l| l.pages.contains_key(&self.tab)) {
                 let _ = lib.refresh.send(false);
             }
@@ -3121,7 +3123,6 @@ impl App {
             }
         };
         match ask {
-            Ask::Search => return self.search_results(text),
             Ask::NewProfile(_) | Ask::ProfileName(_) | Ask::ProfilePin(_) | Ask::ConfirmPin(..) | Ask::Unlock(_) => {
                 return self.answer_account(ask, text)
             }
@@ -3360,7 +3361,7 @@ impl App {
                     self.nav(dx, dy);
                 }
             }
-            Mode::Search => self.search_key(dy, ok, back),
+            Mode::Search => self.search_key(sym, dx, dy, ok, back),
             Mode::Picker(_) => self.picker_key(dx, dy, ok, back),
             Mode::Menu(m) => {
                 if back || options {
@@ -3387,8 +3388,6 @@ impl App {
                 Typed::Cancel => {
                     if let Ask::Unlock(i) = *ask {
                         self.choose_profile(i, "");
-                    } else if matches!(ask, Ask::Search) && self.search.is_some() {
-                        self.return_to_search();
                     } else {
                         self.close_dialog();
                     }

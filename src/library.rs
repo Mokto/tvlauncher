@@ -728,6 +728,12 @@ impl Page {
         title_pic(pre, if backdrop { 'b' } else { 'p' }, &t.id, t.key.as_deref(), tag)
     }
 
+    pub fn poster(&self, t: &Title) -> Option<(Option<String>, String)> {
+        let path = Self::path(self.pre, t, false)?;
+        let url = t.poster.as_deref().and_then(|tag| self.src.url(&t.id, false, tag));
+        Some((url, path))
+    }
+
     /// Whether the page lists the title `id`.
     pub fn has(&self, id: &str) -> bool {
         self.titles.iter().any(|t| t.id == id)
